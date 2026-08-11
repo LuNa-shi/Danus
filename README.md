@@ -9,7 +9,7 @@
 </p>
 
 Danus orchestrates mathematical reasoning agents with fact-graph memory. A main
-agent (Claude Code) steers a swarm of autonomous codex workers that prove; a
+agent (codex) steers a swarm of autonomous codex workers that prove; a
 cold-start verifier is the sole authority on correctness: a result becomes real
 only once it passes. Verified results accumulate in a content-addressed fact
 graph — the system's only source of truth — and a strategy loop (a strong
@@ -83,7 +83,7 @@ danus/                 the engine (installable Python package)
   write_paper/         write-paper MCP service (fact graph → publishable LaTeX paper)
   human_summary/       human-summary MCP service (fact graph → progress-report PDF)
 agents/                codex agent contracts (main/worker/verifier) + worker & verify skills
-.claude/skills/        main-agent skills: elaboration · consult · human-summary · initialize · write-paper
+.agents/skills/         main-agent skills: elaboration · consult · human-summary · initialize · write-paper
 bin/ scripts/ config/  runtime layer (wrappers, bootstrap/services/doctor, env templates)
 docs/                  human docs: getting started · concepts · operating guide · security & trust · …
 examples/              unattended-ops examples + a toy project
@@ -103,12 +103,12 @@ cp config/codex.env.example config/codex.env      # BYO OpenAI-compatible endpoi
 bash scripts/doctor.sh
 bash scripts/services.sh up verify
 
-# 4. connect Claude Code rooted at this repo dir; on first run it runs `initialize`.
-#    --dangerously-skip-permissions lets the main agent operate autonomously (no
-#    per-action permission prompts). That is the intended mode, but it means the
-#    agent acts with your shell privileges — run Danus on an isolated, disposable
-#    host, and read docs/security-and-trust.md first.
-claude --dangerously-skip-permissions
+# 4. connect codex rooted at this repo dir; on first run it runs `initialize`.
+#    --dangerously-bypass-approvals-and-sandbox lets the main agent operate
+#    autonomously (no per-action approval prompts). That is the intended mode, but
+#    it means the agent acts with your shell privileges — run Danus on an isolated,
+#    disposable host, and read docs/security-and-trust.md first.
+codex --dangerously-bypass-approvals-and-sandbox
 ```
 
 Everything runs on your own keys (BYO). Workers and the verifier run on your codex

@@ -27,7 +27,7 @@ is genuinely new state to reason over:
 Do **not** re-consult when nothing material has changed since the last
 `master_guidance`. A sensible cadence is **at most once every ~2 hours** — a
 consult itself takes minutes, and you want real state to reason over, not churn.
-Drive cadence off main-agent events (or your own `/loop`), never a blind timer.
+Drive cadence off main-agent events (a worker finished a round, real new state), never a blind timer.
 
 **Spend discipline.** Each API consult costs money and accrues to the project's
 running total. Prefer `--effort high` (the workhorse); reserve `xhigh` for genuine

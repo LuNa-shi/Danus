@@ -7,7 +7,7 @@
 > entry points). Each script also carries an "EXAMPLE, NOT CORE" banner so it is
 > never mistaken for the control path.
 
-Danus has exactly one unattended mode: **run Claude Code as a
+Danus has exactly one unattended mode: **run codex as a
 resident main agent** (`ops/main-agent-tmux.sh`). The **strategic judgment** —
 elaborate → consult GPT → record `master_guidance` → dispatch workers — lives in
 that main agent and its skills (`elaboration`, `consult`), *not* in shell.
@@ -21,10 +21,10 @@ prose follows `OPERATOR.md`; the scripts themselves only emit English mechanics.
 ## `ops/` — unattended-operation scripts
 
 ### `main-agent-tmux.sh`
-Starts Claude Code detached in a tmux session, in the repo root, so it inherits
-`CLAUDE.md`, the skills, and `.mcp.json`. `.mcp.json` is what wires the gateway
-MCP server (`python -m danus.gateway` via `bin/danus-mcp`); this launcher does
-**not** wire MCP itself.
+Starts codex detached in a tmux session, in the repo root, so it inherits
+`AGENTS.md`, the skills (`.agents/skills`), and `.codex/config.toml`. `.codex/config.toml`
+is what wires the gateway MCP server (`python -m danus.gateway` via `bin/danus-mcp`);
+this launcher does **not** wire MCP itself.
 
 ```bash
 bash examples/ops/main-agent-tmux.sh

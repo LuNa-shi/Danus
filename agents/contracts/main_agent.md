@@ -92,8 +92,8 @@ Below, "the project" means whichever one this beat is for.
   its own cadence (roughly **~2h between consults, ~1h between human summaries**),
   and only when there is genuinely **new state** — a worker finished a round, a
   real finding / dead end / verified fact, the swarm is stuck — never on no-change.
-  The CLI and the `.claude/skills` (`/loop`) pace the beats; there is **no resident
-  cron** — you keep time while your session is active.
+  You pace the beats yourself (the CLI + the main-agent skills); there is **no
+  resident cron** — you keep time while your session is active.
 - **Prepare an elaboration first.** Before each consult, distill the project's
   current state — read from global memory + the fact graph (**not** worker local
   memory) — into one high-signal synthesis following the `elaboration` skill

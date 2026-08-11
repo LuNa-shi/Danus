@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Danus services — start/stop/inspect the long-running services so they PERSIST
-# beyond the session that launched them (a Claude Code session, an ssh shell…).
+# beyond the session that launched them (a codex session, an ssh shell…).
 #
 # Why setsid: a plain `… &` background job started from a transient shell gets
 # reaped when that shell exits. `setsid` puts the service in its OWN session
 # (reparented to init), with stdio detached — so it keeps running after the
-# Claude Code session ends / the laptop disconnects.
+# codex session ends / the laptop disconnects.
 #
 #   bash scripts/services.sh up   verify
 #   bash scripts/services.sh up   dashboard <project>

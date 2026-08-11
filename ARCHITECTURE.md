@@ -6,7 +6,7 @@ strategy-steered research system, and renders verified results into papers and
 human progress reports. This is the as-built map: the layered model, the folder
 layout, the invariants, and the pinned cross-module contracts.
 
-For the main agent's operating contract, see `CLAUDE.md`
+For the main agent's operating contract, see `AGENTS.md`
 (→ `agents/contracts/main_agent.md`).
 
 ---
@@ -39,7 +39,7 @@ output: write-paper (publication) · human-summary (progress report) — each re
 Danus/
 ├─ ARCHITECTURE.md              this file (map + invariants + interface contract)
 ├─ README.md   pyproject.toml   top-level intro + the installable `danus` package
-├─ .gitignore  .mcp.json        MCP wiring: the `danus` gateway + the `write-paper` and `human-summary` services
+├─ .gitignore  .codex/          MCP wiring (`config.toml`): the `danus` gateway + the `write-paper` and `human-summary` services
 ├─ config/                      env templates (BYO key; only *.env.example committed)
 ├─ danus/                       THE ENGINE (installable Python package)
 │  ├─ core/                     ⑤ truth: schema · factgraph · global/local memory · bm25 · glossary
@@ -59,7 +59,7 @@ Danus/
 │     ├─ worker/                9 proving skills (inherited from Rethlas)
 │     ├─ verify/                3 verify skills
 │     └─ write-paper/           paper role prompts + house style (embedded by the write-paper MCP)
-├─ .claude/skills/              MAIN-AGENT SKILLS (Claude Code auto-discovers)
+├─ .agents/skills/              MAIN-AGENT SKILLS (codex auto-discovers; → .claude/skills/)
 │  ├─ elaboration/  consult/  human-summary/  initialize/
 │  └─ write-paper/              the recipe SKILL.md + driver/ scripts + templates/
 ├─ bin/                         thin wrappers: danus · danus-mcp · write-paper-mcp · human-summary-mcp · codex · consult
@@ -121,7 +121,7 @@ Danus/
 | contract | pinned shape | ends |
 |---|---|---|
 | MCP tool set + role gating | 6 tools; `roles.py` `ROLE_TOOLS` (main has NO `fact_submit`; verifier read-only) | `danus.gateway` ↔ worker/main/verifier agents |
-| MCP launch | `python -m danus.gateway` + `DANUS_ROLE` env | `danus.verify` launcher · worker `.codex/config.toml` · `.mcp.json` (main) → `danus.gateway` |
+| MCP launch | `python -m danus.gateway` + `DANUS_ROLE` env | `danus.verify` launcher · worker `.codex/config.toml` · `.codex/config.toml` (main) → `danus.gateway` |
 | verify HTTP | `POST /verify {statement,proof}` → `{verification_report,verdict,repair_hints}`; verdict ⟺ no critical_errors & no gaps | `danus.gateway.fact_submit` ↔ `danus.verify` |
 | fact id inputs | `problem_id + sorted(predecessors) + sorted(glossary) + normalized(statement,proof)`; **external_refs EXCLUDED** | `danus.core` ↔ everyone (write-paper reads `external_refs`) |
 | global-memory kinds | the 11 `GLOBAL_KINDS` (incl. `master_guidance`/`elaboration`/`verification`) | `danus.core` ↔ agents · strategy · consult |
