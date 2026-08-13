@@ -165,7 +165,10 @@ def test_logout_revokes_session_and_csrf_is_required(tmp_path: Path):
         csrf = _login(client)
         assert client.post("/api/auth/logout", json={}, headers={"Origin": "https://testserver"}).status_code == 403
         assert client.post("/api/auth/logout", json={}, headers={"Origin": "https://testserver", "X-CSRF-Token": csrf}).status_code == 200
-        assert client.get("/api/projects").status_code == 401
+        denied_response = client.get("/api/projects")
+        assert denied_response.status_code == 401
+        assert denied_response.headers["x-content-type-options"] == "nosniff"
+        assert denied_response.headers["cache-control"] == "no-store"
 
 
 def test_runtime_start_failure_is_persisted_without_success_claim(tmp_path: Path):

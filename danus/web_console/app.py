@@ -38,6 +38,16 @@ def _runtime_name(name: str) -> str:
 
 def create_app(*, settings: AppSettings, runtime: Any | None = None) -> FastAPI:
     app = FastAPI(title="Danus Web Console", version="0.1.0")
+
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("Cache-Control", "no-store")
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'; base-uri 'none'")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        return response
+
     store = ConsoleStore(settings.database_path)
     runtime = runtime or DanusRuntimeAdapter()
     app.state.console_store = store
