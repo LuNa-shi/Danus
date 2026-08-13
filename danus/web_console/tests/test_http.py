@@ -191,3 +191,22 @@ def test_runtime_start_failure_is_persisted_without_success_claim(tmp_path: Path
         with sqlite3.connect(tmp_path / "console.sqlite3") as db:
             assert db.execute("SELECT status FROM runs").fetchone()[0] == "failed"
         assert runtime.cleared_deadlines == ["A"]
+
+
+def test_real_runtime_adapter_keeps_two_project_contexts_isolated(tmp_path: Path):
+    from danus.web_console.runtime import DanusRuntimeAdapter
+    from danus.orchestration import cli
+    original_spawn = cli.spawn_loop
+    cli.spawn_loop = lambda worker_dir: 999_999_999
+    try:
+        adapter = DanusRuntimeAdapter(tmp_path / "agents")
+        a = adapter.create_project("A", "alpha problem", "high:1")
+        b = adapter.create_project("B", "beta problem", "high:1")
+        assert (tmp_path / "agents" / "A" / "PROBLEM.md").read_text() == "alpha problem\n"
+        assert (tmp_path / "agents" / "B" / "PROBLEM.md").read_text() == "beta problem\n"
+        assert set(project["project"] for project in adapter.list_projects()) == {"A", "B"}
+        assert a["project_dir"] != b["project_dir"]
+        assert adapter.status_project("A")["workers"][0]["worker"] == "high"
+        assert adapter.status_project("B")["workers"][0]["worker"] == "high"
+    finally:
+        cli.spawn_loop = original_spawn

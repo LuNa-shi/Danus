@@ -48,6 +48,14 @@ class DanusRuntimeAdapter:
     def list_projects(self) -> list[dict[str, Any]]:
         return self._call(cli.do_list)
 
+    def delete_project(self, runtime_name: str) -> None:
+        project = self._project_dir(runtime_name)
+        if any(item for item in self.status_project(runtime_name).get("workers", []) if item.get("alive")):
+            raise RuntimeOperationError("project is still running")
+        # Deletion is deliberately not exposed until the full destructive
+        # lifecycle slice adds confirmation and symlink-safe removal.
+        raise RuntimeOperationError(f"runtime deletion not implemented for {project.name}")
+
     def create_project(self, runtime_name: str, problem: str, roles: str, model: str | None = None) -> dict[str, Any]:
         validate_runtime_name(runtime_name)
         if not isinstance(problem, str) or not problem.strip():

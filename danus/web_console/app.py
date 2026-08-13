@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import secrets
 import threading
 import time
@@ -180,7 +181,14 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None) -> FastAPI:
                 raise ValueError("problem must be non-empty")
             project_id = uuid.uuid4().hex
             result = runtime.create_project(name, problem, roles, model)
-            store.add_project({"id": project_id, "name": name, "runtime_name": name, "problem": problem, "created_at": time.time()})
+            try:
+                store.add_project({"id": project_id, "name": name, "runtime_name": name, "problem": problem, "created_at": time.time()})
+            except sqlite3.IntegrityError:
+                store.audit("project_create", "failure", details=json.dumps({"error": "project name already exists"}))
+                return _error(409, "project name already exists")
+            except Exception:
+                store.audit("project_create", "failure", details=json.dumps({"error": "metadata persistence failed"}))
+                return _error(500, "project metadata could not be persisted")
             store.audit("project_create", "success", project_id)
             return JSONResponse({"id": project_id, "name": name, "problem": problem, "runtime_name": name, "workers": result.get("workers", [])}, status_code=201)
         except (KeyError, TypeError, ValueError) as exc:
