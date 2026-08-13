@@ -86,13 +86,13 @@ def _read_status(wl: L.WorkerLayout) -> Dict:
 # assign                                                                       #
 # --------------------------------------------------------------------------- #
 
-def do_assign(target: str, task: str) -> Dict:
+def do_assign(target: str, task: str, root: Optional[Path] = None) -> Dict:
     """Overwrite (replace, NOT append) a worker's TASK.md, ensuring a trailing
     newline. Rejects a bare project, a nonexistent worker, and an empty task."""
     project, worker = L.resolve_target(target)
     if not worker:
         raise SystemExit("assign needs a specific worker: <project>/<worker>")
-    wl = L.WorkerLayout(L.worker_dir(project, worker))
+    wl = L.WorkerLayout(L.worker_dir(project, worker, root))
     if not wl.dir.is_dir():
         raise SystemExit(f"no such worker: {project}/{worker}")
     if not task.strip():
@@ -185,8 +185,8 @@ def _start_one(wl: L.WorkerLayout) -> str:
         lock.close()
 
 
-def do_start(target: str, stagger: float = 0.2) -> List[Dict]:
-    dirs = L.target_worker_dirs(target)
+def do_start(target: str, stagger: float = 0.2, root: Optional[Path] = None) -> List[Dict]:
+    dirs = L.target_worker_dirs(target, root)
     if not dirs:
         raise SystemExit(f"no workers for target {target!r}")
     out = []
@@ -228,8 +228,8 @@ def worker_status(wl: L.WorkerLayout) -> Dict:
     }
 
 
-def do_status(target: str) -> List[Dict]:
-    dirs = L.target_worker_dirs(target)
+def do_status(target: str, root: Optional[Path] = None) -> List[Dict]:
+    dirs = L.target_worker_dirs(target, root)
     if not dirs:
         raise SystemExit(f"no workers for target {target!r}")
     return [worker_status(L.WorkerLayout(d)) for d in dirs]
@@ -239,20 +239,20 @@ def do_status(target: str) -> List[Dict]:
 # list                                                                         #
 # --------------------------------------------------------------------------- #
 
-def do_list() -> List[Dict]:
+def do_list(root: Optional[Path] = None) -> List[Dict]:
     """One row per project: roster + how many workers are live + model."""
     out: List[Dict] = []
-    for project in L.list_projects():
+    for project in L.list_projects(root):
         meta = {}
-        mp = L.project_dir(project) / "project.json"
+        mp = L.project_dir(project, root) / "project.json"
         if mp.exists():
             try:
                 meta = json.loads(mp.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 meta = {}
-        workers = L.list_workers(project)
+        workers = L.list_workers(project, root)
         live = sum(1 for w in workers
-                   if _alive(_read_pid(L.WorkerLayout(L.worker_dir(project, w)))))
+                   if _alive(_read_pid(L.WorkerLayout(L.worker_dir(project, w, root)))))
         out.append({"project": project, "workers": len(workers), "live": live,
                     "model": meta.get("model", "—")})
     return out
@@ -309,8 +309,8 @@ def _stop_one(wl: L.WorkerLayout, force: bool) -> str:
     return "killed"
 
 
-def do_stop(target: str, force: bool = False) -> List[Dict]:
-    dirs = L.target_worker_dirs(target)
+def do_stop(target: str, force: bool = False, root: Optional[Path] = None) -> List[Dict]:
+    dirs = L.target_worker_dirs(target, root)
     if not dirs:
         raise SystemExit(f"no workers for target {target!r}")
     return [{"worker": d.name, "result": _stop_one(L.WorkerLayout(d), force)} for d in dirs]

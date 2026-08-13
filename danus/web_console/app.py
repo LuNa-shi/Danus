@@ -1,0 +1,302 @@
+"""Authenticated Web Console HTTP boundary (V1 first vertical slice)."""
+from __future__ import annotations
+
+import json
+import secrets
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+from .runtime import DanusRuntimeAdapter, RuntimeErrorBase, validate_runtime_name
+from .security import digest_token, new_token, verify_password
+from .store import ConsoleStore
+
+
+@dataclass
+class AppSettings:
+    database_path: Path
+    password_hash: str
+    cookie_name: str = "danus_console_session"
+    cookie_secure: bool = True
+    session_ttl_seconds: int = 12 * 3600
+    allowed_origins: set[str] = field(default_factory=set)
+
+
+def _error(status: int, detail: str) -> JSONResponse:
+    return JSONResponse({"detail": detail}, status_code=status)
+
+def _runtime_name(name: str) -> str:
+    # Keep runtime names path-safe and stable; DB ids are opaque to clients.
+    validate_runtime_name(name)
+    return name
+
+def create_app(*, settings: AppSettings, runtime: Any | None = None) -> FastAPI:
+    app = FastAPI(title="Danus Web Console", version="0.1.0")
+    store = ConsoleStore(settings.database_path)
+    runtime = runtime or DanusRuntimeAdapter()
+    project_locks: dict[str, threading.Lock] = {}
+    locks_guard = threading.Lock()
+    failed: dict[str, tuple[int, float]] = {}
+
+    def lock_for(project_id: str) -> threading.Lock:
+        with locks_guard:
+            return project_locks.setdefault(project_id, threading.Lock())
+
+    def session(request: Request) -> dict[str, Any] | None:
+        token = request.cookies.get(settings.cookie_name)
+        if not token:
+            return None
+        return store.session(digest_token(token), time.time())
+
+    def protected(request: Request) -> dict[str, Any] | None:
+        current = session(request)
+        if current is None:
+            return None
+        return current
+
+    def csrf_ok(request: Request, current: dict[str, Any]) -> bool:
+        origin = request.headers.get("origin")
+        if settings.allowed_origins and origin not in settings.allowed_origins:
+            return False
+        supplied = request.headers.get("x-csrf-token")
+        return bool(supplied) and secrets.compare_digest(digest_token(supplied), current["csrf_digest"])
+
+    def auth_required(request: Request) -> dict[str, Any] | JSONResponse:
+        current = protected(request)
+        return current if current is not None else _error(401, "authentication required")
+
+    def project_or_404(project_id: str) -> dict[str, Any] | JSONResponse:
+        project = store.project(project_id)
+        return project if project is not None else _error(404, "project not found")
+
+    @app.post("/api/auth/login")
+    async def login(request: Request):
+        try:
+            payload = await request.json()
+        except Exception:
+            return _error(401, "invalid credentials")
+        password = payload.get("password") if isinstance(payload, dict) else None
+        now = time.time()
+        key = request.client.host if request.client else "unknown"
+        count, until = failed.get(key, (0, 0.0))
+        if until > now:
+            return _error(429, "too many login attempts")
+        if not isinstance(password, str) or not verify_password(password, settings.password_hash):
+            count += 1
+            failed[key] = (count, now + min(300.0, 2.0 ** min(count, 8)))
+            store.audit("login", "failure", details=json.dumps({"source": "public"}))
+            return _error(401, "invalid credentials")
+        failed.pop(key, None)
+        token, csrf = new_token(), new_token()
+        now = time.time()
+        store.add_session({
+            "id": uuid.uuid4().hex, "token_digest": digest_token(token),
+            "csrf_digest": digest_token(csrf), "created_at": now, "last_seen": now,
+            "expires_at": now + settings.session_ttl_seconds,
+        })
+        store.audit("login", "success")
+        response = JSONResponse({"authenticated": True, "csrf_token": csrf})
+        response.set_cookie(settings.cookie_name, token, max_age=settings.session_ttl_seconds,
+                            secure=settings.cookie_secure, httponly=True, samesite="strict", path="/")
+        return response
+
+    @app.post("/api/auth/logout")
+    async def logout(request: Request):
+        current = session(request)
+        if current is None:
+            return _error(401, "authentication required")
+        if not csrf_ok(request, current):
+            return _error(403, "csrf validation failed")
+        store.revoke_session(current["id"], time.time())
+        store.audit("logout", "success")
+        response = JSONResponse({"authenticated": False})
+        response.delete_cookie(settings.cookie_name, path="/")
+        return response
+
+    @app.get("/api/auth/session")
+    async def auth_session(request: Request):
+        current = session(request)
+        if current is None:
+            return _error(401, "authentication required")
+        return {"authenticated": True, "expires_at": current["expires_at"]}
+
+    @app.get("/api/auth/me")
+    async def me(request: Request):
+        current = session(request)
+        if current is None:
+            return _error(401, "authentication required")
+        return {"authenticated": True}
+
+    @app.get("/api/projects")
+    async def list_projects(request: Request):
+        if isinstance((auth := auth_required(request)), JSONResponse):
+            return auth
+        rows = []
+        for project in store.projects():
+            try:
+                projection = runtime.status_project(project["runtime_name"])
+            except RuntimeErrorBase:
+                projection = {"workers": [], "error": "runtime unavailable"}
+            rows.append({"id": project["id"], "name": project["name"], "problem": project["problem"], "runtime_name": project["runtime_name"], "workers": projection.get("workers", [])})
+        return rows
+
+    @app.post("/api/projects")
+    async def create_project(request: Request):
+        current = auth_required(request)
+        if isinstance(current, JSONResponse):
+            return current
+        if not csrf_ok(request, current):
+            return _error(403, "csrf validation failed")
+        try:
+            payload = await request.json()
+            name = _runtime_name(payload["name"])
+            problem = payload["problem"]
+            roles = payload.get("roles", "high:3,xhigh:4")
+            model = payload.get("model")
+            if not isinstance(problem, str) or not problem.strip():
+                raise ValueError("problem must be non-empty")
+            project_id = uuid.uuid4().hex
+            result = runtime.create_project(name, problem, roles, model)
+            store.add_project({"id": project_id, "name": name, "runtime_name": name, "problem": problem, "created_at": time.time()})
+            store.audit("project_create", "success", project_id)
+            return JSONResponse({"id": project_id, "name": name, "problem": problem, "runtime_name": name, "workers": result.get("workers", [])}, status_code=201)
+        except (KeyError, TypeError, ValueError) as exc:
+            return _error(400, str(exc))
+        except RuntimeErrorBase as exc:
+            store.audit("project_create", "failure", details=json.dumps({"error": str(exc)}))
+            return _error(409, "project creation failed")
+
+    @app.get("/api/projects/{project_id}")
+    async def get_project(project_id: str, request: Request):
+        if isinstance((auth := auth_required(request)), JSONResponse):
+            return auth
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse):
+            return project
+        return {"id": project["id"], "name": project["name"], "problem": project["problem"], "runtime_name": project["runtime_name"]}
+
+    @app.post("/api/projects/{project_id}/runs")
+    async def start_run(project_id: str, request: Request):
+        current = auth_required(request)
+        if isinstance(current, JSONResponse):
+            return current
+        if not csrf_ok(request, current):
+            return _error(403, "csrf validation failed")
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse):
+            return project
+        try:
+            payload = await request.json()
+            duration = int(payload["duration_seconds"])
+            if duration <= 0 or duration > 7 * 24 * 3600:
+                raise ValueError("duration_seconds out of range")
+        except (KeyError, TypeError, ValueError):
+            return _error(400, "invalid duration_seconds")
+        with lock_for(project_id):
+            active = store.active_run(project_id)
+            if active is not None:
+                if time.time() >= active["deadline"]:
+                    store.update_run(active["id"], status="expired", stopped_at=time.time(), outcome="deadline")
+                    try:
+                        runtime.stop_project(project["runtime_name"])
+                    except RuntimeErrorBase:
+                        pass
+                else:
+                    return _error(409, "project already has an active run")
+            started, deadline = time.time(), time.time() + duration
+            run = {"id": uuid.uuid4().hex, "project_id": project_id, "duration_seconds": duration, "started_at": started, "deadline": deadline, "status": "starting"}
+            try:
+                runtime.write_deadline(project["runtime_name"], deadline)
+                result = runtime.start_project(project["runtime_name"])
+                store.add_run({**run, "status": "running"})
+                store.audit("run_start", "success", project_id)
+                return JSONResponse({**run, "status": "running", "workers": result.get("workers", [])}, status_code=201)
+            except RuntimeErrorBase as exc:
+                # Persist a failed control-plane outcome rather than claiming
+                # that a deadline write/start request created a live run.
+                store.add_run({**run, "status": "failed"})
+                store.update_run(run["id"], status="failed", stopped_at=time.time(), outcome=str(exc)[:200])
+                store.audit("run_start", "failure", project_id)
+                return _error(502, "project run could not be started")
+
+    @app.get("/api/projects/{project_id}/runs/{run_id}")
+    async def get_run(project_id: str, run_id: str, request: Request):
+        if isinstance((auth := auth_required(request)), JSONResponse):
+            return auth
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse):
+            return project
+        run = store.run(run_id)
+        if run is None or run["project_id"] != project_id:
+            return _error(404, "run not found")
+        try:
+            projection = runtime.status_project(project["runtime_name"])
+        except RuntimeErrorBase:
+            projection = {"workers": [], "error": "runtime unavailable"}
+        return {**run, "workers": projection.get("workers", [])}
+
+    @app.post("/api/projects/{project_id}/runs/{run_id}/stop")
+    async def stop_run(project_id: str, run_id: str, request: Request):
+        current = auth_required(request)
+        if isinstance(current, JSONResponse):
+            return current
+        if not csrf_ok(request, current):
+            return _error(403, "csrf validation failed")
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse):
+            return project
+        run = store.run(run_id)
+        if run is None or run["project_id"] != project_id:
+            return _error(404, "run not found")
+        with lock_for(project_id):
+            try:
+                result = runtime.stop_project(project["runtime_name"])
+                store.update_run(run_id, status="stopped", stopped_at=time.time(), outcome="graceful_stop")
+                store.audit("run_stop", "success", project_id)
+                return {"run_id": run_id, "status": "stopped", "workers": result.get("workers", [])}
+            except RuntimeErrorBase:
+                store.update_run(run_id, status="failed", stopped_at=time.time(), outcome="stop_failed")
+                store.audit("run_stop", "failure", project_id)
+                return _error(502, "project stop could not be completed")
+
+    @app.get("/api/projects/{project_id}/runtime")
+    async def runtime_status(project_id: str, request: Request):
+        if isinstance((auth := auth_required(request)), JSONResponse):
+            return auth
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse):
+            return project
+        try:
+            return runtime.status_project(project["runtime_name"])
+        except RuntimeErrorBase:
+            return _error(502, "runtime projection unavailable")
+
+    @app.post("/api/projects/{project_id}/stop")
+    async def stop_project(project_id: str, request: Request):
+        current = auth_required(request)
+        if isinstance(current, JSONResponse):
+            return current
+        if not csrf_ok(request, current):
+            return _error(403, "csrf validation failed")
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse):
+            return project
+        with lock_for(project_id):
+            try:
+                result = runtime.stop_project(project["runtime_name"])
+                active = store.active_run(project_id)
+                if active:
+                    store.update_run(active["id"], status="stopped", stopped_at=time.time(), outcome="graceful_stop")
+                store.audit("run_stop", "success", project_id)
+                return {"status": "stopped", "workers": result.get("workers", [])}
+            except RuntimeErrorBase:
+                store.audit("run_stop", "failure", project_id)
+                return _error(502, "project stop could not be completed")
+
+    return app

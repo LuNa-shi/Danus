@@ -114,23 +114,23 @@ def write_codex_config(wl: "L.WorkerLayout") -> None:
 # --------------------------------------------------------------------------- #
 
 def do_new(project: str, roles: str = "high:3,xhigh:4",
-           model: Optional[str] = None) -> Dict:
+           model: Optional[str] = None, root: Optional[Path] = None) -> Dict:
     """Scaffold a project dir + one worker home per role. Refuses to clobber an
     existing project dir (no silent overwrite of a live fact graph). Returns
     ``{"project_dir", "workers"}``."""
-    pdir = L.project_dir(project)
+    pdir = L.project_dir(project, root)
     if pdir.exists():
         raise SystemExit(f"project already exists: {pdir} (pick another name or remove it)")
     role_pairs = L.parse_roles(roles)
     model = model or _default_model()
 
-    L.workers_dir(project).mkdir(parents=True, exist_ok=True)
+    L.workers_dir(project, root).mkdir(parents=True, exist_ok=True)
     (pdir / "global_memory").mkdir(exist_ok=True)
     (pdir / "fact_graph").mkdir(exist_ok=True)
 
     created: List[str] = []
     for worker, base in role_pairs:
-        wl = L.WorkerLayout(L.worker_dir(project, worker))
+        wl = L.WorkerLayout(L.worker_dir(project, worker, root))
         wl.local_memory.mkdir(parents=True, exist_ok=True)
         wl.logs.mkdir(exist_ok=True)
 

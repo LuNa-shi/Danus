@@ -66,9 +66,11 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def agents_root() -> Path:
-    """Where projects live. Override with ``DANUS_AGENTS_ROOT``; defaults to
-    ``runtime/projects`` under the current working directory."""
+def agents_root(root: Optional[Path] = None) -> Path:
+    """Where projects live. An explicit root is preferred by embedded callers;
+    otherwise resolve ``DANUS_AGENTS_ROOT`` at call time."""
+    if root is not None:
+        return Path(root).resolve()
     env = os.environ.get("DANUS_AGENTS_ROOT")
     if env:
         return Path(env).resolve()
@@ -97,28 +99,28 @@ def worker_skills_dir() -> Path:
 # project / worker dirs                                                        #
 # --------------------------------------------------------------------------- #
 
-def project_dir(project: str) -> Path:
-    return agents_root() / project
+def project_dir(project: str, root: Optional[Path] = None) -> Path:
+    return agents_root(root) / project
 
 
-def workers_dir(project: str) -> Path:
-    return project_dir(project) / "workers"
+def workers_dir(project: str, root: Optional[Path] = None) -> Path:
+    return project_dir(project, root) / "workers"
 
 
-def worker_dir(project: str, worker: str) -> Path:
-    return workers_dir(project) / worker
+def worker_dir(project: str, worker: str, root: Optional[Path] = None) -> Path:
+    return workers_dir(project, root) / worker
 
 
-def list_workers(project: str) -> List[str]:
-    wd = workers_dir(project)
+def list_workers(project: str, root: Optional[Path] = None) -> List[str]:
+    wd = workers_dir(project, root)
     if not wd.is_dir():
         return []
     return sorted(p.name for p in wd.iterdir() if p.is_dir())
 
 
-def list_projects() -> List[str]:
-    """Every project under the agents root (a dir holding a ``workers/`` subdir)."""
-    root = agents_root()
+def list_projects(root: Optional[Path] = None) -> List[str]:
+    """Every project under the selected agents root."""
+    root = agents_root(root)
     if not root.is_dir():
         return []
     return sorted(p.name for p in root.iterdir() if (p / "workers").is_dir())
@@ -198,12 +200,12 @@ def resolve_target(target: str) -> Tuple[str, Optional[str]]:
     return target, None
 
 
-def target_worker_dirs(target: str) -> List[Path]:
-    """Worker dirs addressed by ``target`` — one (proj/worker) or all (proj)."""
+def target_worker_dirs(target: str, root: Optional[Path] = None) -> List[Path]:
+    """Worker dirs addressed by ``target`` under an explicit or configured root."""
     project, worker = resolve_target(target)
     if worker:
-        return [worker_dir(project, worker)]
-    return [worker_dir(project, w) for w in list_workers(project)]
+        return [worker_dir(project, worker, root)]
+    return [worker_dir(project, w, root) for w in list_workers(project, root)]
 
 
 # --------------------------------------------------------------------------- #

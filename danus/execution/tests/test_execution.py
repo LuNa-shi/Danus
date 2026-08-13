@@ -119,6 +119,14 @@ def test_do_new_scaffolds_project(tmp: Path):
             assert json.loads(wl.status.read_text())["state"] == "created"
 
 
+def test_do_new_supports_explicit_root(tmp: Path):
+    with _project_env(tmp):
+        explicit = tmp / "explicit"
+        r = scaffold.do_new("P", roles="high:1", root=explicit)
+        assert Path(r["project_dir"]) == explicit / "P"
+        assert (explicit / "P" / "workers" / "high" / "TASK.md").exists()
+
+
 def test_do_new_refuses_existing(tmp: Path):
     with _project_env(tmp):
         scaffold.do_new("P", roles="high:1")
@@ -196,7 +204,8 @@ _NO_TMP = {test_parse_roles_default_roster, test_parse_roles_rejects_bad_specs,
 def main() -> None:
     for t in [test_parse_roles_default_roster, test_parse_roles_rejects_bad_specs,
               test_worker_layout_paths, test_resolve_and_target,
-              test_do_new_scaffolds_project, test_do_new_refuses_existing,
+              test_do_new_scaffolds_project, test_do_new_supports_explicit_root,
+              test_do_new_refuses_existing,
               test_do_new_verify_url_from_env, test_parse_last_fact_id,
               test_deadline_passed, test_write_status_atomic_and_stamps,
               test_read_role_defaults_and_overrides]:

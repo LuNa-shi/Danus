@@ -1,0 +1,185 @@
+"""Authenticated Web Console HTTP seam tests for the first vertical slice."""
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+from starlette.testclient import TestClient
+
+from danus.web_console.app import AppSettings, create_app
+from danus.web_console.security import hash_password
+
+
+class FakeRuntime:
+    def __init__(self, root: Path):
+        self.root = root
+        self.created = []
+        self.started = []
+        self.stopped = []
+        self.statuses = {}
+        self.deadlines = {}
+
+    def write_deadline(self, runtime_name, deadline):
+        self.deadlines[runtime_name] = deadline
+
+    def create_project(self, runtime_name, problem, roles, model=None):
+        self.created.append((runtime_name, problem, roles, model))
+        project = self.root / runtime_name
+        project.mkdir(parents=True, exist_ok=True)
+        (project / "PROBLEM.md").write_text(problem + "\n", encoding="utf-8")
+        self.statuses[runtime_name] = []
+        return {"runtime_name": runtime_name, "project_dir": str(project), "workers": []}
+
+    def start_project(self, runtime_name):
+        self.started.append(runtime_name)
+        self.statuses[runtime_name] = [{"worker": "high", "alive": True, "state": "running", "round": 1}]
+        return {"workers": self.statuses[runtime_name]}
+
+    def stop_project(self, runtime_name):
+        self.stopped.append(runtime_name)
+        self.statuses[runtime_name] = [{"worker": "high", "alive": False, "state": "stopped", "round": 1}]
+        return {"workers": self.statuses[runtime_name]}
+
+    def status_project(self, runtime_name):
+        return {"workers": self.statuses.get(runtime_name, [])}
+
+
+def _app(tmp_path: Path):
+    runtime = FakeRuntime(tmp_path / "projects")
+    settings = AppSettings(
+        database_path=tmp_path / "console.sqlite3",
+        password_hash=hash_password("correct horse battery staple"),
+        cookie_secure=True,
+        allowed_origins={"https://testserver"},
+    )
+    return create_app(settings=settings, runtime=runtime), runtime
+
+
+def _login(client: TestClient):
+    response = client.post(
+        "/api/auth/login",
+        json={"password": "correct horse battery staple"},
+        headers={"Origin": "https://testserver"},
+    )
+    assert response.status_code == 200
+    assert "secure" in response.headers["set-cookie"].lower()
+    assert "httponly" in response.headers["set-cookie"].lower()
+    assert "samesite=strict" in response.headers["set-cookie"].lower()
+    return response.json()["csrf_token"]
+
+
+def test_authentication_cookie_csrf_and_project_boundary(tmp_path: Path):
+    # Exercise denial on one app instance; the successful flow uses an isolated
+    # instance so the deliberately failed attempt cannot trigger throttling.
+    bad_app, _ = _app(tmp_path / "bad")
+    with TestClient(bad_app, base_url="https://testserver") as bad_client:
+        assert bad_client.get("/api/projects").status_code == 401
+        bad = bad_client.post("/api/auth/login", json={"password": "wrong"})
+        assert bad.status_code == 401 and bad.json() == {"detail": "invalid credentials"}
+    app, runtime = _app(tmp_path / "good")
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client)
+        assert client.get("/api/auth/me").json()["authenticated"] is True
+        assert client.get("/api/auth/session").json()["authenticated"] is True
+
+        denied = client.post("/api/projects", json={"name": "A", "problem": "alpha"})
+        assert denied.status_code == 403
+        created = client.post(
+            "/api/projects",
+            json={"name": "A", "problem": "alpha", "roles": "high:1"},
+            headers={"X-CSRF-Token": csrf, "Origin": "https://testserver"},
+        )
+        assert created.status_code == 201
+        project = created.json()
+        assert project["name"] == "A"
+        project_id = project["id"]
+        assert runtime.created[0][1] == "alpha"
+
+        listed = client.get("/api/projects")
+        assert listed.status_code == 200 and listed.json()[0]["id"] == project_id
+        assert client.get(f"/api/projects/{project_id}").json()["name"] == "A"
+
+        cross_site = client.post(
+            "/api/projects",
+            json={"name": "B", "problem": "beta"},
+            headers={"X-CSRF-Token": csrf, "Origin": "https://evil.example"},
+        )
+        assert cross_site.status_code == 403
+        assert len(runtime.created) == 1
+
+
+def test_project_run_deadline_and_graceful_stop_are_scoped(tmp_path: Path):
+    app, runtime = _app(tmp_path)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client)
+        a = client.post(
+            "/api/projects", json={"name": "A", "problem": "alpha", "roles": "high:1"},
+            headers={"X-CSRF-Token": csrf, "Origin": "https://testserver"},
+        ).json()
+        b = client.post(
+            "/api/projects", json={"name": "B", "problem": "beta", "roles": "high:1"},
+            headers={"X-CSRF-Token": csrf, "Origin": "https://testserver"},
+        ).json()
+        start = client.post(
+            f"/api/projects/{a['id']}/runs", json={"duration_seconds": 43200},
+            headers={"X-CSRF-Token": csrf, "Origin": "https://testserver"},
+        )
+        assert start.status_code == 201
+        run = start.json()
+        assert run["status"] == "running"
+        assert 43190 <= run["deadline"] - time.time() <= 43210
+        assert runtime.started == [a["runtime_name"]]
+        assert runtime.started != [b["runtime_name"]]
+
+        stopped = client.post(
+            f"/api/projects/{a['id']}/stop", json={},
+            headers={"X-CSRF-Token": csrf, "Origin": "https://testserver"},
+        )
+        assert stopped.status_code == 200
+        assert stopped.json()["status"] == "stopped"
+        assert runtime.stopped == [a["runtime_name"]]
+        assert runtime.stopped != [b["runtime_name"]]
+        assert client.get(f"/api/projects/{b['id']}/runtime").json()["workers"] == []
+
+
+def test_run_lookup_is_project_scoped(tmp_path: Path):
+    app, runtime = _app(tmp_path)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client)
+        headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        a = client.post("/api/projects", json={"name": "A", "problem": "alpha", "roles": "high:1"}, headers=headers).json()
+        b = client.post("/api/projects", json={"name": "B", "problem": "beta", "roles": "high:1"}, headers=headers).json()
+        run = client.post(f"/api/projects/{a['id']}/runs", json={"duration_seconds": 60}, headers=headers).json()
+        assert client.get(f"/api/projects/{a['id']}/runs/{run['id']}").status_code == 200
+        assert client.get(f"/api/projects/{b['id']}/runs/{run['id']}").status_code == 404
+        assert client.post(f"/api/projects/{b['id']}/runs/{run['id']}/stop", json={}, headers=headers).status_code == 404
+
+
+def test_logout_revokes_session_and_csrf_is_required(tmp_path: Path):
+    app, _ = _app(tmp_path)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client)
+        assert client.post("/api/auth/logout", json={}, headers={"Origin": "https://testserver"}).status_code == 403
+        assert client.post("/api/auth/logout", json={}, headers={"Origin": "https://testserver", "X-CSRF-Token": csrf}).status_code == 200
+        assert client.get("/api/projects").status_code == 401
+
+
+def test_runtime_start_failure_is_persisted_without_success_claim(tmp_path: Path):
+    class FailingRuntime(FakeRuntime):
+        def start_project(self, runtime_name):
+            from danus.web_console.runtime import RuntimeOperationError
+            raise RuntimeOperationError("worker launch failed")
+
+    runtime = FailingRuntime(tmp_path / "projects")
+    settings = AppSettings(database_path=tmp_path / "console.sqlite3", password_hash=hash_password("correct horse battery staple"), cookie_secure=True, allowed_origins={"https://testserver"})
+    app = create_app(settings=settings, runtime=runtime)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client)
+        headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
+        response = client.post(f"/api/projects/{project['id']}/runs", json={"duration_seconds": 60}, headers=headers)
+        assert response.status_code == 502
+        assert response.json() == {"detail": "project run could not be started"}
+        import sqlite3
+        with sqlite3.connect(tmp_path / "console.sqlite3") as db:
+            assert db.execute("SELECT status FROM runs").fetchone()[0] == "failed"
