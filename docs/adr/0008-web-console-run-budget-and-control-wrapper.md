@@ -1,0 +1,7 @@
+# Add a thin Web Console run-control layer for budgets and interruption
+
+**Status: Accepted for V1**
+
+The Danus Main Agent is the Claude Code orchestrator; Danus Workers are the autonomous codex proof agents. The Web Console should not add another LLM “core code” or become a second research orchestrator. It should add a thin, project-scoped Control Plane that persists Project Run configuration, launches/resumes the Main Agent Process in the Project Context Directory, starts/stops the existing Worker swarm, and records run outcomes. A user-selected wall-clock Run Budget (for example, 12 hours) becomes an enforced Run Deadline for that Project Run. Manual stop remains available before the deadline. Existing Danus strategy authority stays in the Main Agent; the Control Plane only enforces lifecycle and resource boundaries.
+
+V1 should expose the Run Budget and essential Danus startup options in the project start form (at minimum the research problem, worker roster, and duration). Provider credentials, executable paths, and low-level environment variables remain server-side configuration. An optional monetary/API budget should not be presented as the primary guarantee: Claude Code’s `--max-budget-usd` is a per-print API spending cap, while Danus’s existing project deadline is a wall-clock control and consult spend is separately ledgered. V1 should enforce time first and expose money only when the configured backend can report and enforce it reliably.
