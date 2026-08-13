@@ -15,6 +15,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from .runtime import DanusRuntimeAdapter, RuntimeErrorBase, validate_runtime_name
+from .files import FileValidationError, file_type, material_root, metadata, normalize_filename, promote_pending, remove_blob, stream_to_pending, validate_bytes
 from .security import digest_token, new_token, verify_password
 from .store import ConsoleStore
 
@@ -27,6 +28,7 @@ class AppSettings:
     cookie_secure: bool = True
     session_ttl_seconds: int = 12 * 3600
     allowed_origins: set[str] = field(default_factory=set)
+    max_file_bytes: int = 25 * 1024 * 1024
 
 
 def _error(status: int, detail: str) -> JSONResponse:
@@ -333,5 +335,98 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None) -> FastAPI:
             except RuntimeErrorBase:
                 store.audit("run_stop", "failure", project_id)
                 return _error(502, "project stop could not be completed")
+
+    @app.get("/api/projects/{project_id}/files")
+    async def list_files(project_id: str, request: Request):
+        if isinstance((auth := auth_required(request)), JSONResponse):
+            return auth
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse):
+            return project
+        return [metadata(row) for row in store.files(project_id)]
+
+    @app.post("/api/projects/{project_id}/files")
+    async def upload_file(project_id: str, request: Request):
+        current = auth_required(request)
+        if isinstance(current, JSONResponse):
+            return current
+        if not csrf_ok(request, current):
+            return _error(403, "csrf validation failed")
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse):
+            return project
+        form = await request.form()
+        upload = form.get("file")
+        if upload is None or not hasattr(upload, "filename") or not hasattr(upload, "file"):
+            return _error(400, "file is required")
+        try:
+            logical_name = normalize_filename(upload.filename)
+            content_type, kind = file_type(logical_name)
+            materials = material_root(Path(runtime.project_context_dir(project["runtime_name"])))
+            pending, sha256, size = stream_to_pending(upload, materials, settings.max_file_bytes)
+            data = pending.read_bytes()
+            validate_bytes(kind, data)
+            storage_name, stored = promote_pending(pending, materials, sha256)
+            existing_hash = store.file_by_hash(project_id, sha256)
+            if existing_hash is not None:
+                if stored:
+                    remove_blob(materials, storage_name)
+                store.audit("file_upload", "reuse", project_id)
+                return JSONResponse(metadata(existing_hash), status_code=200)
+            existing = store.current_file(project_id, logical_name)
+            file_id = uuid.uuid4().hex
+            version = store.next_version(project_id, logical_name)
+            row = {"id": file_id, "project_id": project_id, "logical_name": logical_name, "content_type": content_type, "kind": kind, "size": size, "sha256": sha256, "storage_name": storage_name, "version": version, "is_current": 0 if existing else 1, "processing_status": "available", "read_status": "not_read", "uploaded_at": time.time()}
+            store.add_file(row)
+            if existing:
+                conflict_id = uuid.uuid4().hex
+                store.add_conflict({"id": conflict_id, "project_id": project_id, "logical_name": logical_name, "incoming_file_id": file_id, "current_file_id": existing["id"], "created_at": time.time(), "status": "pending"})
+                store.audit("file_upload", "conflict", project_id)
+                return JSONResponse({"conflict_id": conflict_id, "current": metadata(existing), "incoming": metadata(row), "choices": ["replace", "new_version", "cancel"]}, status_code=409)
+            store.audit("file_upload", "success", project_id)
+            return JSONResponse(metadata(row), status_code=201)
+        except FileValidationError as exc:
+            return _error(400, str(exc))
+
+    @app.post("/api/projects/{project_id}/file-conflicts/{conflict_id}")
+    async def resolve_file_conflict(project_id: str, conflict_id: str, request: Request):
+        current = auth_required(request)
+        if isinstance(current, JSONResponse):
+            return current
+        if not csrf_ok(request, current):
+            return _error(403, "csrf validation failed")
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse):
+            return project
+        conflict = store.conflict(conflict_id, project_id)
+        if conflict is None or conflict["status"] != "pending":
+            return _error(404, "file conflict not found")
+        payload = await request.json()
+        choice = payload.get("choice") if isinstance(payload, dict) else None
+        incoming = store.file(conflict["incoming_file_id"], project_id)
+        existing = store.file(conflict["current_file_id"], project_id)
+        if incoming is None or existing is None:
+            return _error(409, "file conflict is no longer available")
+        materials = material_root(Path(runtime.project_context_dir(project["runtime_name"])))
+        incoming_blob = materials / incoming["storage_name"]
+        if choice == "cancel":
+            remove_blob(materials, incoming["storage_name"])
+            store.update_conflict(conflict_id, "cancelled")
+            store.delete_file(incoming["id"], project_id)
+            store.audit("file_conflict", "cancel", project_id)
+            return JSONResponse({"status": "cancelled"}, status_code=200)
+        if choice == "new_version":
+            store.set_current(project_id, conflict["logical_name"], incoming["id"])
+            store.update_conflict(conflict_id, "new_version")
+            store.audit("file_conflict", "new_version", project_id)
+            return JSONResponse(metadata(store.file(incoming["id"], project_id)), status_code=200)
+        if choice == "replace":
+            remove_blob(materials, existing["storage_name"])
+            store.set_current(project_id, conflict["logical_name"], incoming["id"])
+            store.update_conflict(conflict_id, "replaced")
+            store.update_file_status(existing["id"], is_current=0, processing_status="replaced")
+            store.audit("file_conflict", "replace", project_id)
+            return JSONResponse(metadata(store.file(incoming["id"], project_id)), status_code=200)
+        return _error(400, "choice must be replace, new_version, or cancel")
 
     return app

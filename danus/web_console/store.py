@@ -29,6 +29,21 @@ class ConsoleStore:
                     id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, runtime_name TEXT NOT NULL UNIQUE,
                     problem TEXT NOT NULL, created_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS files (
+                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    logical_name TEXT NOT NULL, content_type TEXT NOT NULL, kind TEXT NOT NULL,
+                    size INTEGER NOT NULL, sha256 TEXT NOT NULL, storage_name TEXT NOT NULL,
+                    version INTEGER NOT NULL, is_current INTEGER NOT NULL,
+                    processing_status TEXT NOT NULL, read_status TEXT NOT NULL,
+                    uploaded_at REAL NOT NULL,
+                    UNIQUE(project_id, logical_name, version),
+                    UNIQUE(project_id, sha256)
+                );
+                CREATE TABLE IF NOT EXISTS file_conflicts (
+                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    logical_name TEXT NOT NULL, incoming_file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    current_file_id TEXT NOT NULL REFERENCES files(id), created_at REAL NOT NULL, status TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS sessions (
                     id TEXT PRIMARY KEY, token_digest TEXT NOT NULL UNIQUE, csrf_digest TEXT NOT NULL,
                     created_at REAL NOT NULL, last_seen REAL NOT NULL, expires_at REAL NOT NULL, revoked_at REAL
@@ -71,6 +86,72 @@ class ConsoleStore:
     def delete_project(self, project_id: str) -> None:
         with self._lock, self._connect() as conn:
             conn.execute("DELETE FROM projects WHERE id=?", (project_id,))
+
+    def add_file(self, file: dict[str, Any]) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO files(id,project_id,logical_name,content_type,kind,size,sha256,storage_name,version,is_current,processing_status,read_status,uploaded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                tuple(file[k] for k in ("id", "project_id", "logical_name", "content_type", "kind", "size", "sha256", "storage_name", "version", "is_current", "processing_status", "read_status", "uploaded_at")),
+            )
+
+    def files(self, project_id: str, logical_name: str | None = None) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            if logical_name is None:
+                rows = conn.execute("SELECT * FROM files WHERE project_id=? ORDER BY logical_name, version", (project_id,))
+            else:
+                rows = conn.execute("SELECT * FROM files WHERE project_id=? AND logical_name=? ORDER BY version", (project_id, logical_name))
+            return [dict(row) for row in rows]
+
+    def file(self, file_id: str, project_id: str) -> dict[str, Any] | None:
+        with self._lock, self._connect() as conn:
+            return self._dict(conn.execute("SELECT * FROM files WHERE id=? AND project_id=?", (file_id, project_id)).fetchone())
+
+    def file_by_hash(self, project_id: str, sha256: str) -> dict[str, Any] | None:
+        with self._lock, self._connect() as conn:
+            return self._dict(conn.execute("SELECT * FROM files WHERE project_id=? AND sha256=?", (project_id, sha256)).fetchone())
+
+    def current_file(self, project_id: str, logical_name: str) -> dict[str, Any] | None:
+        with self._lock, self._connect() as conn:
+            return self._dict(conn.execute("SELECT * FROM files WHERE project_id=? AND logical_name=? AND is_current=1", (project_id, logical_name)).fetchone())
+
+    def next_version(self, project_id: str, logical_name: str) -> int:
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT COALESCE(MAX(version),0)+1 AS v FROM files WHERE project_id=? AND logical_name=?", (project_id, logical_name)).fetchone()
+            return int(row["v"])
+
+    def set_current(self, project_id: str, logical_name: str, file_id: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("UPDATE files SET is_current=0 WHERE project_id=? AND logical_name=?", (project_id, logical_name))
+            conn.execute("UPDATE files SET is_current=1 WHERE id=? AND project_id=?", (file_id, project_id))
+
+    def add_conflict(self, conflict: dict[str, Any]) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("INSERT INTO file_conflicts(id,project_id,logical_name,incoming_file_id,current_file_id,created_at,status) VALUES(?,?,?,?,?,?,?)", tuple(conflict[k] for k in ("id", "project_id", "logical_name", "incoming_file_id", "current_file_id", "created_at", "status")))
+
+    def conflict(self, conflict_id: str, project_id: str) -> dict[str, Any] | None:
+        with self._lock, self._connect() as conn:
+            return self._dict(conn.execute("SELECT * FROM file_conflicts WHERE id=? AND project_id=?", (conflict_id, project_id)).fetchone())
+
+    def update_conflict(self, conflict_id: str, status: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("UPDATE file_conflicts SET status=? WHERE id=?", (status, conflict_id))
+
+    def delete_file(self, file_id: str, project_id: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM files WHERE id=? AND project_id=?", (file_id, project_id))
+
+    def update_file_status(self, file_id: str, *, is_current: int | None = None, processing_status: str | None = None) -> None:
+        fields = []
+        values: list[Any] = []
+        if is_current is not None:
+            fields.append("is_current=?"); values.append(is_current)
+        if processing_status is not None:
+            fields.append("processing_status=?"); values.append(processing_status)
+        if not fields:
+            return
+        values.append(file_id)
+        with self._lock, self._connect() as conn:
+            conn.execute(f"UPDATE files SET {', '.join(fields)} WHERE id=?", values)
 
     def add_session(self, session: dict[str, Any]) -> None:
         with self._lock, self._connect() as conn:

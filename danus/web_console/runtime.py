@@ -88,6 +88,9 @@ class DanusRuntimeAdapter:
         self._project_dir(runtime_name)
         return {"workers": self._call(cli.do_status, runtime_name)}
 
+    def project_context_dir(self, runtime_name: str) -> Path:
+        return self._project_dir(runtime_name)
+
     def write_deadline(self, runtime_name: str, deadline: float) -> None:
         project = self._project_dir(runtime_name)
         if deadline <= time.time():

@@ -20,6 +20,11 @@ class FakeRuntime:
         self.deadlines = {}
         self.cleared_deadlines = []
 
+    def project_context_dir(self, runtime_name):
+        project = self.root / runtime_name
+        project.mkdir(parents=True, exist_ok=True)
+        return project
+
     def clear_deadline(self, runtime_name):
         self.cleared_deadlines.append(runtime_name)
 
@@ -210,3 +215,52 @@ def test_real_runtime_adapter_keeps_two_project_contexts_isolated(tmp_path: Path
         assert adapter.status_project("B")["workers"][0]["worker"] == "high"
     finally:
         cli.spawn_loop = original_spawn
+
+
+def test_project_file_library_dedup_conflict_replace_version_and_cancel(tmp_path: Path):
+    app, runtime = _app(tmp_path)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client)
+        headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
+        pid = project["id"]
+        def upload(name, body):
+            return client.post(f"/api/projects/{pid}/files", files={"file": (name, body)}, headers=headers)
+        first = upload("notes.md", b"one")
+        assert first.status_code == 201 and first.json()["sha256"]
+        same = upload("notes.md", b"one")
+        assert same.status_code == 200 and same.json()["id"] == first.json()["id"]
+        conflict = upload("notes.md", b"two")
+        assert conflict.status_code == 409
+        conflict_data = conflict.json()
+        replaced = client.post(f"/api/projects/{pid}/file-conflicts/{conflict_data['conflict_id']}", json={"choice": "replace"}, headers=headers)
+        assert replaced.status_code == 200 and replaced.json()["current"] is True
+        files = client.get(f"/api/projects/{pid}/files").json()
+        assert len(files) == 2 and sum(f["current"] for f in files) == 1
+        conflict2 = upload("notes.md", b"three")
+        assert conflict2.status_code == 409
+        versioned = client.post(f"/api/projects/{pid}/file-conflicts/{conflict2.json()['conflict_id']}", json={"choice": "new_version"}, headers=headers)
+        assert versioned.status_code == 200
+        files = client.get(f"/api/projects/{pid}/files").json()
+        assert len(files) == 3 and sum(f["current"] for f in files) == 1
+        conflict3 = upload("notes.md", b"four")
+        assert conflict3.status_code == 409
+        cancelled = client.post(f"/api/projects/{pid}/file-conflicts/{conflict3.json()['conflict_id']}", json={"choice": "cancel"}, headers=headers)
+        assert cancelled.status_code == 200
+        assert len(client.get(f"/api/projects/{pid}/files").json()) == 3
+        assert runtime.started == []
+
+
+def test_project_file_allowlist_and_isolation(tmp_path: Path):
+    app, _ = _app(tmp_path)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client)
+        headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        a = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
+        b = client.post("/api/projects", json={"name": "B", "problem": "beta"}, headers=headers).json()
+        bad = client.post(f"/api/projects/{a['id']}/files", files={"file": ("run.sh", b"echo nope")}, headers=headers)
+        assert bad.status_code == 400
+        good = client.post(f"/api/projects/{a['id']}/files", files={"file": ("paper.tex", b"\\section{A}")}, headers=headers)
+        assert good.status_code == 201
+        assert client.get(f"/api/projects/{b['id']}/files").json() == []
+        assert client.get(f"/api/projects/{b['id']}/files/{good.json()['id']}").status_code == 404
