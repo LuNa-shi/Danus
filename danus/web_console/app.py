@@ -216,6 +216,32 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None, main_agent:
             store.audit("project_create", "failure", details=json.dumps({"error": str(exc)}))
             return _error(409, "project creation failed")
 
+    @app.delete("/api/projects/{project_id}")
+    async def delete_project(project_id: str, request: Request):
+        current = auth_required(request)
+        if isinstance(current, JSONResponse):
+            return current
+        if not csrf_ok(request, current):
+            return _error(403, "csrf validation failed")
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse):
+            return project
+        payload = await request.json()
+        if not isinstance(payload, dict) or payload.get("confirm_name") != project["name"]:
+            return _error(400, "destructive confirmation does not match project name")
+        with lock_for(project_id):
+            try:
+                projection = runtime.status_project(project["runtime_name"])
+                if any(worker.get("alive") for worker in projection.get("workers", [])):
+                    return _error(409, "project must be stopped before deletion")
+                result = runtime.delete_project(project["runtime_name"])
+                store.delete_project(project_id)
+                store.audit("project_delete", "success", project_id)
+                return JSONResponse({"deleted": True, **result}, status_code=200)
+            except RuntimeErrorBase:
+                store.audit("project_delete", "failure", project_id)
+                return _error(502, "project deletion failed")
+
     @app.get("/api/projects/{project_id}")
     async def get_project(project_id: str, request: Request):
         if isinstance((auth := auth_required(request)), JSONResponse):

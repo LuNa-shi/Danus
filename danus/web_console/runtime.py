@@ -132,6 +132,21 @@ class DanusRuntimeAdapter:
     def reports_projection(self, runtime_name: str) -> dict[str, Any]:
         return {"files": self._safe_relative_files(runtime_name, "reports")}
 
+    def delete_project(self, runtime_name: str) -> dict[str, Any]:
+        """Delete a stopped project tree without following symlinks."""
+        root = self._project_dir(runtime_name)
+        projection = self.status_project(runtime_name)
+        if any(worker.get("alive") for worker in projection.get("workers", [])):
+            raise RuntimeOperationError("project is still running")
+        if root.parent != self.agents_root or root == self.agents_root:
+            raise RuntimeOperationError("invalid project root")
+        import shutil
+        # Refuse symlinked project roots; remove only this exact server-owned tree.
+        if root.is_symlink():
+            raise RuntimeOperationError("project root must not be a symlink")
+        shutil.rmtree(root)
+        return {"deleted": runtime_name}
+
     def outputs_projection(self, runtime_name: str) -> dict[str, Any]:
         return {"files": self._safe_relative_files(runtime_name, "outputs")}
     def project_context_dir(self, runtime_name: str) -> Path:

@@ -100,6 +100,9 @@ class ConsoleStore:
         with self._lock, self._connect() as conn:
             conn.execute("DELETE FROM projects WHERE id=?", (project_id,))
 
+    def has_active_run(self, project_id: str) -> bool:
+        return self.active_run(project_id) is not None
+
     def add_file(self, file: dict[str, Any]) -> None:
         with self._lock, self._connect() as conn:
             conn.execute(

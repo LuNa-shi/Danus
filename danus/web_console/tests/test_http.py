@@ -64,6 +64,10 @@ class FakeRuntime:
     def outputs_projection(self, runtime_name):
         return {"files": []}
 
+    def delete_project(self, runtime_name):
+        self.statuses.pop(runtime_name, None)
+        return {"deleted": runtime_name}
+
 
 def _app(tmp_path: Path):
     runtime = FakeRuntime(tmp_path / "projects")
@@ -336,3 +340,19 @@ def test_deadline_rejects_new_main_agent_work(tmp_path: Path):
             db.execute("UPDATE runs SET deadline=?", (0,)); db.commit()
         response = client.post(f"/api/projects/{project['id']}/messages", json={"text": "late", "attachment_ids": []}, headers=headers)
         assert response.status_code == 409
+
+
+def test_project_deletion_requires_stop_confirmation_and_isolation(tmp_path: Path):
+    app, runtime = _app(tmp_path)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        a = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
+        b = client.post("/api/projects", json={"name": "B", "problem": "beta"}, headers=headers).json()
+        assert client.request("DELETE", f"/api/projects/{a['id']}", json={"confirm_name": "wrong"}, headers=headers).status_code == 400
+        client.post(f"/api/projects/{a['id']}/runs", json={"duration_seconds": 60}, headers=headers)
+        assert client.request("DELETE", f"/api/projects/{a['id']}", json={"confirm_name": "A"}, headers=headers).status_code == 409
+        client.post(f"/api/projects/{a['id']}/stop", json={}, headers=headers)
+        deleted = client.request("DELETE", f"/api/projects/{a['id']}", json={"confirm_name": "A"}, headers=headers)
+        assert deleted.status_code == 200
+        assert client.get(f"/api/projects/{a['id']}").status_code == 404
+        assert client.get(f"/api/projects/{b['id']}").status_code == 200
