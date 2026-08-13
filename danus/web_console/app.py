@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 
 from .runtime import DanusRuntimeAdapter, RuntimeErrorBase, validate_runtime_name
 from .files import FileValidationError, file_type, material_root, metadata, normalize_filename, promote_pending, remove_blob, stream_to_pending, validate_bytes
+from .main_agent import MainAgentError, MainAgentAdapter
 from .security import digest_token, new_token, verify_password
 from .store import ConsoleStore
 
@@ -39,7 +40,7 @@ def _runtime_name(name: str) -> str:
     validate_runtime_name(name)
     return name
 
-def create_app(*, settings: AppSettings, runtime: Any | None = None) -> FastAPI:
+def create_app(*, settings: AppSettings, runtime: Any | None = None, main_agent: Any | None = None) -> FastAPI:
     app = FastAPI(title="Danus Web Console", version="0.1.0")
 
     @app.middleware("http")
@@ -53,7 +54,9 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None) -> FastAPI:
 
     store = ConsoleStore(settings.database_path)
     runtime = runtime or DanusRuntimeAdapter()
+    main_agent = main_agent or MainAgentAdapter()
     app.state.console_store = store
+    app.state.main_agent_adapter = main_agent
     app.state.runtime_adapter = runtime
     project_locks: dict[str, threading.Lock] = {}
     locks_guard = threading.Lock()
@@ -428,5 +431,53 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None) -> FastAPI:
             store.audit("file_conflict", "replace", project_id)
             return JSONResponse(metadata(store.file(incoming["id"], project_id)), status_code=200)
         return _error(400, "choice must be replace, new_version, or cancel")
+
+    @app.get("/api/projects/{project_id}/messages")
+    async def list_messages(project_id: str, request: Request):
+        if isinstance((auth := auth_required(request)), JSONResponse):
+            return auth
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse):
+            return project
+        return store.messages(project_id)
+
+    @app.post("/api/projects/{project_id}/messages")
+    async def send_message(project_id: str, request: Request):
+        current = auth_required(request)
+        if isinstance(current, JSONResponse):
+            return current
+        if not csrf_ok(request, current):
+            return _error(403, "csrf validation failed")
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse):
+            return project
+        payload = await request.json()
+        text = payload.get("text") if isinstance(payload, dict) else None
+        attachment_ids = payload.get("attachment_ids", []) if isinstance(payload, dict) else []
+        if not isinstance(text, str) or not text.strip() or not isinstance(attachment_ids, list):
+            return _error(400, "text and attachment_ids are required")
+        attachments = []
+        for file_id in attachment_ids:
+            row = store.file(str(file_id), project_id)
+            if row is None:
+                return _error(404, "attachment not found")
+            attachments.append(metadata(row) | {"path": str(material_root(Path(runtime.project_context_dir(project["runtime_name"]))) / row["storage_name"])})
+        message_id = uuid.uuid4().hex
+        now = time.time()
+        store.add_message({"id": message_id, "project_id": project_id, "role": "user", "text": text, "status": "submitted", "created_at": now, "error": None})
+        store.upsert_agent_session(project_id, (store.agent_session(project_id) or {}).get("claude_session_id"), "active", now)
+        try:
+            manifest = [metadata(row) for row in store.files(project_id)]
+            result = main_agent.send(context_dir=runtime.project_context_dir(project["runtime_name"]), session_id=(store.agent_session(project_id) or {}).get("claude_session_id"), message=text, manifest=manifest, project_state={"project_id": project_id, "name": project["name"], "problem": project["problem"]}, attachments=attachments)
+            store.upsert_agent_session(project_id, result["session_id"], "inactive", time.time())
+            reply_id = uuid.uuid4().hex
+            store.add_message({"id": reply_id, "project_id": project_id, "role": "assistant", "text": result["reply"], "status": "completed", "created_at": time.time(), "error": None})
+            store.audit("message", "success", project_id)
+            return JSONResponse({"message_id": message_id, "reply_id": reply_id, **result}, status_code=201)
+        except MainAgentError as exc:
+            store.upsert_agent_session(project_id, (store.agent_session(project_id) or {}).get("claude_session_id"), "inactive", time.time())
+            store.audit("message", "failure", project_id)
+            store.add_message({"id": uuid.uuid4().hex, "project_id": project_id, "role": "assistant", "text": "", "status": "failed", "created_at": time.time(), "error": str(exc)[:200]})
+            return _error(502, "main agent message failed")
 
     return app

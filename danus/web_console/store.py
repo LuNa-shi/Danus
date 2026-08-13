@@ -44,6 +44,19 @@ class ConsoleStore:
                     logical_name TEXT NOT NULL, incoming_file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
                     current_file_id TEXT NOT NULL REFERENCES files(id), created_at REAL NOT NULL, status TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS main_agent_sessions (
+                    project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                    claude_session_id TEXT, status TEXT NOT NULL, updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS messages (
+                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL, text TEXT NOT NULL, status TEXT NOT NULL, created_at REAL NOT NULL,
+                    error TEXT
+                );
+                CREATE TABLE IF NOT EXISTS message_attachments (
+                    message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                    file_id TEXT NOT NULL REFERENCES files(id), PRIMARY KEY(message_id, file_id)
+                );
                 CREATE TABLE IF NOT EXISTS sessions (
                     id TEXT PRIMARY KEY, token_digest TEXT NOT NULL UNIQUE, csrf_digest TEXT NOT NULL,
                     created_at REAL NOT NULL, last_seen REAL NOT NULL, expires_at REAL NOT NULL, revoked_at REAL
@@ -152,6 +165,22 @@ class ConsoleStore:
         values.append(file_id)
         with self._lock, self._connect() as conn:
             conn.execute(f"UPDATE files SET {', '.join(fields)} WHERE id=?", values)
+
+    def agent_session(self, project_id: str) -> dict[str, Any] | None:
+        with self._lock, self._connect() as conn:
+            return self._dict(conn.execute("SELECT * FROM main_agent_sessions WHERE project_id=?", (project_id,)).fetchone())
+
+    def upsert_agent_session(self, project_id: str, claude_session_id: str | None, status: str, updated_at: float) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("INSERT INTO main_agent_sessions(project_id,claude_session_id,status,updated_at) VALUES(?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET claude_session_id=excluded.claude_session_id,status=excluded.status,updated_at=excluded.updated_at", (project_id, claude_session_id, status, updated_at))
+
+    def add_message(self, message: dict[str, Any]) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("INSERT INTO messages(id,project_id,role,text,status,created_at,error) VALUES(?,?,?,?,?,?,?)", tuple(message[k] for k in ("id", "project_id", "role", "text", "status", "created_at", "error")))
+
+    def messages(self, project_id: str) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            return [dict(row) for row in conn.execute("SELECT * FROM messages WHERE project_id=? ORDER BY created_at,id", (project_id,))]
 
     def add_session(self, session: dict[str, Any]) -> None:
         with self._lock, self._connect() as conn:

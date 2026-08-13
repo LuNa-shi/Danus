@@ -264,3 +264,30 @@ def test_project_file_allowlist_and_isolation(tmp_path: Path):
         assert good.status_code == 201
         assert client.get(f"/api/projects/{b['id']}/files").json() == []
         assert client.get(f"/api/projects/{b['id']}/files/{good.json()['id']}").status_code == 404
+
+
+def test_main_agent_session_resume_attachment_and_project_isolation(tmp_path: Path):
+    class FakeMainAgent:
+        def __init__(self): self.calls = []
+        def send(self, **kwargs):
+            self.calls.append(kwargs)
+            sid = kwargs["session_id"] or "session-A"
+            return {"session_id": sid, "reply": "reply:" + kwargs["message"], "status": "completed", "seconds": 0.1, "read_status": "not_read"}
+    main = FakeMainAgent()
+    runtime = FakeRuntime(tmp_path / "projects")
+    settings = AppSettings(database_path=tmp_path / "console.sqlite3", password_hash=hash_password("correct horse battery staple"), cookie_secure=True, allowed_origins={"https://testserver"})
+    app = create_app(settings=settings, runtime=runtime, main_agent=main)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        a = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
+        b = client.post("/api/projects", json={"name": "B", "problem": "beta"}, headers=headers).json()
+        uploaded = client.post(f"/api/projects/{a['id']}/files", files={"file": ("source.md", b"source")}, headers=headers).json()
+        first = client.post(f"/api/projects/{a['id']}/messages", json={"text": "hello", "attachment_ids": [uploaded["id"]]}, headers=headers)
+        assert first.status_code == 201 and first.json()["session_id"] == "session-A"
+        second = client.post(f"/api/projects/{a['id']}/messages", json={"text": "continue", "attachment_ids": []}, headers=headers)
+        assert second.status_code == 201 and second.json()["session_id"] == "session-A"
+        assert main.calls[0]["context_dir"] == tmp_path / "projects" / "A"
+        assert main.calls[0]["attachments"][0]["path"].startswith(str(tmp_path / "projects" / "A"))
+        foreign = client.post(f"/api/projects/{b['id']}/messages", json={"text": "no", "attachment_ids": [uploaded["id"]]}, headers=headers)
+        assert foreign.status_code == 404
+        assert len(client.get(f"/api/projects/{b['id']}/messages").json()) == 0
