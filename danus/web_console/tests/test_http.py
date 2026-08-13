@@ -190,3 +190,4 @@ def test_runtime_start_failure_is_persisted_without_success_claim(tmp_path: Path
         import sqlite3
         with sqlite3.connect(tmp_path / "console.sqlite3") as db:
             assert db.execute("SELECT status FROM runs").fetchone()[0] == "failed"
+        assert runtime.cleared_deadlines == ["A"]

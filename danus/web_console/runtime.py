@@ -85,3 +85,7 @@ class DanusRuntimeAdapter:
         if deadline <= time.time():
             raise ValueError("deadline must be in the future")
         atomic_write(project / L.DEADLINE_FILE, f"{deadline:.6f}\n")
+
+    def clear_deadline(self, runtime_name: str) -> None:
+        project = self._project_dir(runtime_name)
+        (project / L.DEADLINE_FILE).unlink(missing_ok=True)

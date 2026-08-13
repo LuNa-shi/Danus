@@ -235,6 +235,12 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None) -> FastAPI:
                 store.audit("run_start", "success", project_id)
                 return JSONResponse({"run_id": run["id"], "status": "start_requested", "deadline": deadline}, status_code=202)
             except RuntimeErrorBase as exc:
+                # A failed launch must not leave a deadline that can constrain
+                # a later independent restart.
+                try:
+                    runtime.clear_deadline(project["runtime_name"])
+                except (AttributeError, RuntimeErrorBase):
+                    pass
                 # Persist a failed control-plane outcome rather than claiming
                 # that a deadline write/start request created a live run.
                 store.add_run({**run, "status": "failed"})
