@@ -95,6 +95,20 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None, main_agent:
         project = store.project(project_id)
         return project if project is not None else _error(404, "project not found")
 
+    def reconcile_run(project_id: str, project: dict[str, Any], projection: dict[str, Any]) -> dict[str, Any]:
+        active = store.active_run(project_id)
+        if active is not None:
+            workers = projection.get("workers", [])
+            if active["status"] == "stopping" and workers and not any(worker.get("alive") for worker in workers):
+                store.update_run(active["id"], status="stopped", stopped_at=time.time(), outcome="graceful_stop")
+            elif active["status"] in ("starting", "running") and time.time() >= active["deadline"]:
+                store.update_run(active["id"], status="expired", stopped_at=time.time(), outcome="deadline")
+                try:
+                    runtime.stop_project(project["runtime_name"])
+                except RuntimeErrorBase:
+                    pass
+        return projection
+
     @app.post("/api/auth/login")
     async def login(request: Request):
         try:
@@ -309,7 +323,7 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None, main_agent:
         if isinstance(project, JSONResponse):
             return project
         try:
-            projection = runtime.status_project(project["runtime_name"])
+            projection = reconcile_run(project_id, project, runtime.status_project(project["runtime_name"]))
             active = store.active_run(project_id)
             if active is not None:
                 projection = {**projection, "run": {"id": active["id"], "status": active["status"], "deadline": active["deadline"]}}
@@ -440,7 +454,7 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None, main_agent:
         if isinstance(project, JSONResponse):
             return project
         try:
-            return runtime.status_project(project["runtime_name"])
+            return reconcile_run(project_id, project, runtime.status_project(project["runtime_name"]))
         except RuntimeErrorBase:
             return _error(502, "runtime projection unavailable")
 
@@ -516,6 +530,15 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None, main_agent:
         attachment_ids = payload.get("attachment_ids", []) if isinstance(payload, dict) else []
         if not isinstance(text, str) or not text.strip() or not isinstance(attachment_ids, list):
             return _error(400, "text and attachment_ids are required")
+        active_run = store.active_run(project_id)
+        if active_run is not None and time.time() >= active_run["deadline"]:
+            try:
+                runtime.stop_project(project["runtime_name"])
+            except RuntimeErrorBase:
+                pass
+            store.update_run(active_run["id"], status="expired", stopped_at=time.time(), outcome="deadline")
+            store.audit("message", "rejected_deadline", project_id)
+            return _error(409, "project run deadline reached")
         attachments = []
         for file_id in attachment_ids:
             row = store.file(str(file_id), project_id)

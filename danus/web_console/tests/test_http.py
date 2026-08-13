@@ -315,3 +315,24 @@ def test_read_only_projections_are_authenticated_and_project_scoped(tmp_path: Pa
             assert client.get(f"/api/projects/{pid}/{endpoint}").status_code == 200
             assert client.get(f"/api/projects/foreign/{endpoint}").status_code == 404
         assert client.get("/api/projects/foreign/logs").status_code == 404
+
+
+def test_deadline_rejects_new_main_agent_work(tmp_path: Path):
+    class FakeClockRuntime(FakeRuntime):
+        def __init__(self, root):
+            super().__init__(root); self.deadline = None
+        def write_deadline(self, runtime_name, deadline): self.deadline = deadline
+    class Main:
+        def send(self, **kwargs): raise AssertionError("must not activate after deadline")
+    runtime = FakeClockRuntime(tmp_path / "projects")
+    settings = AppSettings(database_path=tmp_path / "console.sqlite3", password_hash=hash_password("correct horse battery staple"), cookie_secure=True, allowed_origins={"https://testserver"})
+    app = create_app(settings=settings, runtime=runtime, main_agent=Main())
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
+        run = client.post(f"/api/projects/{project['id']}/runs", json={"duration_seconds": 1}, headers=headers).json()
+        import sqlite3
+        with sqlite3.connect(tmp_path / "console.sqlite3") as db:
+            db.execute("UPDATE runs SET deadline=?", (0,)); db.commit()
+        response = client.post(f"/api/projects/{project['id']}/messages", json={"text": "late", "attachment_ids": []}, headers=headers)
+        assert response.status_code == 409
