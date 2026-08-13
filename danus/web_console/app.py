@@ -432,6 +432,66 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None, main_agent:
             return JSONResponse(metadata(store.file(incoming["id"], project_id)), status_code=200)
         return _error(400, "choice must be replace, new_version, or cancel")
 
+    @app.get("/api/projects/{project_id}/workers")
+    async def worker_projection(project_id: str, request: Request):
+        if isinstance((auth := auth_required(request)), JSONResponse):
+            return auth
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse):
+            return project
+        try:
+            return runtime.status_project(project["runtime_name"])
+        except RuntimeErrorBase:
+            return _error(502, "runtime projection unavailable")
+
+    @app.get("/api/projects/{project_id}/logs")
+    async def logs_projection(project_id: str, request: Request):
+        if isinstance((auth := auth_required(request)), JSONResponse):
+            return auth
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse):
+            return project
+        try:
+            return runtime.logs_projection(project["runtime_name"], worker=request.query_params.get("worker"), tail=min(int(request.query_params.get("tail", "200")), 1000))
+        except (RuntimeErrorBase, ValueError):
+            return _error(502, "logs projection unavailable")
+
+    @app.get("/api/projects/{project_id}/fact-graph")
+    async def fact_graph_projection(project_id: str, request: Request):
+        if isinstance((auth := auth_required(request)), JSONResponse):
+            return auth
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse):
+            return project
+        try:
+            return runtime.fact_graph_projection(project["runtime_name"])
+        except RuntimeErrorBase:
+            return _error(502, "fact graph projection unavailable")
+
+    @app.get("/api/projects/{project_id}/reports")
+    async def reports_projection(project_id: str, request: Request):
+        if isinstance((auth := auth_required(request)), JSONResponse):
+            return auth
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse):
+            return project
+        try:
+            return runtime.reports_projection(project["runtime_name"])
+        except RuntimeErrorBase:
+            return _error(502, "reports projection unavailable")
+
+    @app.get("/api/projects/{project_id}/outputs")
+    async def outputs_projection(project_id: str, request: Request):
+        if isinstance((auth := auth_required(request)), JSONResponse):
+            return auth
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse):
+            return project
+        try:
+            return runtime.outputs_projection(project["runtime_name"])
+        except RuntimeErrorBase:
+            return _error(502, "outputs projection unavailable")
+
     @app.get("/api/projects/{project_id}/messages")
     async def list_messages(project_id: str, request: Request):
         if isinstance((auth := auth_required(request)), JSONResponse):

@@ -52,6 +52,18 @@ class FakeRuntime:
     def status_project(self, runtime_name):
         return {"workers": self.statuses.get(runtime_name, [])}
 
+    def logs_projection(self, runtime_name, worker=None, tail=200):
+        return {"entries": [{"worker": worker or "high", "name": "loop.log", "lines": ["status"]}]}
+
+    def fact_graph_projection(self, runtime_name):
+        return {"nodes": [], "edges": [], "max_depth": 0}
+
+    def reports_projection(self, runtime_name):
+        return {"files": []}
+
+    def outputs_projection(self, runtime_name):
+        return {"files": []}
+
 
 def _app(tmp_path: Path):
     runtime = FakeRuntime(tmp_path / "projects")
@@ -291,3 +303,15 @@ def test_main_agent_session_resume_attachment_and_project_isolation(tmp_path: Pa
         foreign = client.post(f"/api/projects/{b['id']}/messages", json={"text": "no", "attachment_ids": [uploaded["id"]]}, headers=headers)
         assert foreign.status_code == 404
         assert len(client.get(f"/api/projects/{b['id']}/messages").json()) == 0
+
+
+def test_read_only_projections_are_authenticated_and_project_scoped(tmp_path: Path):
+    app, runtime = _app(tmp_path)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
+        pid = project["id"]
+        for endpoint in ("workers", "logs", "fact-graph", "reports", "outputs"):
+            assert client.get(f"/api/projects/{pid}/{endpoint}").status_code == 200
+            assert client.get(f"/api/projects/foreign/{endpoint}").status_code == 404
+        assert client.get("/api/projects/foreign/logs").status_code == 404

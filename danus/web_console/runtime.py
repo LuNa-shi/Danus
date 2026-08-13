@@ -88,6 +88,52 @@ class DanusRuntimeAdapter:
         self._project_dir(runtime_name)
         return {"workers": self._call(cli.do_status, runtime_name)}
 
+    def _safe_relative_files(self, runtime_name: str, relative: str, *, limit: int = 1000) -> list[dict[str, Any]]:
+        root = self._project_dir(runtime_name)
+        target = (root / relative).resolve()
+        if root not in target.parents and target != root:
+            raise RuntimeOperationError("projection path escapes project")
+        if not target.is_dir():
+            return []
+        rows = []
+        for path in sorted(target.rglob("*")):
+            if len(rows) >= limit:
+                break
+            if not path.is_file() or path.is_symlink():
+                continue
+            try:
+                rows.append({"name": str(path.relative_to(root)), "size": path.stat().st_size})
+            except OSError:
+                continue
+        return rows
+
+    def logs_projection(self, runtime_name: str, worker: str | None = None, tail: int = 200) -> dict[str, Any]:
+        root = self._project_dir(runtime_name)
+        workers = [worker] if worker else L.list_workers(runtime_name, self.agents_root)
+        entries = []
+        for name in workers:
+            if not name or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name):
+                continue
+            log_dir = (root / "workers" / name / "logs").resolve()
+            if log_dir.parent.parent != root or not log_dir.is_dir():
+                continue
+            for path in sorted(log_dir.glob("*.log")):
+                try:
+                    text = path.read_text(encoding="utf-8", errors="replace").splitlines()[-tail:]
+                    entries.append({"worker": name, "name": path.name, "lines": text})
+                except OSError:
+                    continue
+        return {"entries": entries}
+
+    def fact_graph_projection(self, runtime_name: str) -> dict[str, Any]:
+        from danus.observability.app import build_factgraph
+        return build_factgraph(self._project_dir(runtime_name))
+
+    def reports_projection(self, runtime_name: str) -> dict[str, Any]:
+        return {"files": self._safe_relative_files(runtime_name, "reports")}
+
+    def outputs_projection(self, runtime_name: str) -> dict[str, Any]:
+        return {"files": self._safe_relative_files(runtime_name, "outputs")}
     def project_context_dir(self, runtime_name: str) -> Path:
         return self._project_dir(runtime_name)
 
