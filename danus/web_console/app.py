@@ -589,4 +589,15 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None, main_agent:
             store.add_message({"id": uuid.uuid4().hex, "project_id": project_id, "role": "assistant", "text": "", "status": "failed", "created_at": time.time(), "error": str(exc)[:200]})
             return _error(502, "main agent message failed")
 
+    from fastapi.staticfiles import StaticFiles
+    app.mount("/static", StaticFiles(directory=Path(__file__).with_name("static")), name="static")
+    @app.get("/health")
+    async def health():
+        return {"service": "danus-web-console", "status": "ok"}
+
+    @app.get("/")
+    async def index():
+        from fastapi.responses import FileResponse
+        return FileResponse(Path(__file__).with_name("static") / "index.html")
+
     return app
