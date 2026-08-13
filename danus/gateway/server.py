@@ -24,6 +24,7 @@ is testable and reconfigurable:
                       unset falls back to the read-only verifier set — fail-closed)
   DANUS_VERIFY_URL    verify-service endpoint for fact_submit
   DANUS_PROBLEM_ID    problem id stamped on written facts (default: project name)
+  DANUS_PROJECT_SCOPE  optional single-project name enforced for main-agent sessions
 """
 
 from __future__ import annotations
@@ -70,6 +71,9 @@ def _project(project: Optional[str] = None) -> Path:
     agents_root = os.environ.get("DANUS_AGENTS_ROOT", "")
     project_dir = os.environ.get("DANUS_PROJECT_DIR", "")
     if project:
+        scope = os.environ.get("DANUS_PROJECT_SCOPE", "")
+        if scope and project != scope:
+            raise RuntimeError("project is outside the Main Agent scope")
         if not agents_root:
             raise RuntimeError("DANUS_AGENTS_ROOT is not set; cannot resolve a project by name")
         if not _PROJECT_NAME_RE.match(project):

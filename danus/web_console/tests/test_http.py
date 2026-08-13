@@ -105,7 +105,9 @@ def test_authentication_cookie_csrf_and_project_boundary(tmp_path: Path):
     with TestClient(app, base_url="https://testserver") as client:
         csrf = _login(client)
         assert client.get("/api/auth/me").json()["authenticated"] is True
-        assert client.get("/api/auth/session").json()["authenticated"] is True
+        session_info = client.get("/api/auth/session").json()
+        assert session_info["authenticated"] is True
+        csrf = session_info["csrf_token"]
 
         denied = client.post("/api/projects", json={"name": "A", "problem": "alpha"})
         assert denied.status_code == 403
@@ -165,6 +167,21 @@ def test_project_run_deadline_and_graceful_stop_are_scoped(tmp_path: Path):
         assert runtime.stopped == [a["runtime_name"]]
         assert runtime.stopped != [b["runtime_name"]]
         assert client.get(f"/api/projects/{b['id']}/runtime").json()["workers"] == []
+
+
+def test_runtime_poll_reconciles_graceful_stop_to_terminal_run(tmp_path: Path):
+    app, runtime = _app(tmp_path)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client)
+        headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post("/api/projects", json={"name": "A", "problem": "alpha", "roles": "high:1"}, headers=headers).json()
+        started = client.post(f"/api/projects/{project['id']}/runs", json={"duration_seconds": 3600}, headers=headers).json()
+        assert client.get(f"/api/projects/{project['id']}/runs/{started['run_id']}").json()["status"] == "running"
+        assert client.post(f"/api/projects/{project['id']}/runs/{started['run_id']}/stop", json={}, headers=headers).status_code == 202
+        terminal = client.get(f"/api/projects/{project['id']}/runs/{started['run_id']}").json()
+        assert terminal["status"] == "stopped"
+        assert terminal["outcome"] == "graceful_stop"
+        assert terminal["stopped_at"] is not None
 
 
 def test_run_lookup_is_project_scoped(tmp_path: Path):
@@ -267,6 +284,30 @@ def test_project_file_library_dedup_conflict_replace_version_and_cancel(tmp_path
         assert runtime.started == []
 
 
+def test_cancelled_or_replaced_hash_can_be_uploaded_again(tmp_path: Path):
+    app, _ = _app(tmp_path)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json(); pid = project["id"]
+        def upload(body): return client.post(f"/api/projects/{pid}/files", files={"file": ("notes.md", body)}, headers=headers)
+        first = upload(b"one").json(); conflict = upload(b"two").json()
+        assert client.post(f"/api/projects/{pid}/file-conflicts/{conflict['conflict_id']}", json={"choice":"cancel"}, headers=headers).status_code == 200
+        retry = upload(b"two")
+        assert retry.status_code == 409
+        assert client.post(f"/api/projects/{pid}/file-conflicts/{retry.json()['conflict_id']}", json={"choice":"new_version"}, headers=headers).status_code == 200
+
+
+def test_restart_after_stop_does_not_require_projection_poll(tmp_path: Path):
+    app, runtime = _app(tmp_path)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post("/api/projects", json={"name":"A", "problem":"alpha"}, headers=headers).json()
+        first = client.post(f"/api/projects/{project['id']}/runs", json={"duration_seconds":3600}, headers=headers).json()
+        assert client.post(f"/api/projects/{project['id']}/runs/{first['run_id']}/stop", json={}, headers=headers).status_code == 202
+        second = client.post(f"/api/projects/{project['id']}/runs", json={"duration_seconds":3600}, headers=headers)
+        assert second.status_code == 202
+
+
 def test_project_file_allowlist_and_isolation(tmp_path: Path):
     app, _ = _app(tmp_path)
     with TestClient(app, base_url="https://testserver") as client:
@@ -304,9 +345,30 @@ def test_main_agent_session_resume_attachment_and_project_isolation(tmp_path: Pa
         assert second.status_code == 201 and second.json()["session_id"] == "session-A"
         assert main.calls[0]["context_dir"] == tmp_path / "projects" / "A"
         assert main.calls[0]["attachments"][0]["path"].startswith(str(tmp_path / "projects" / "A"))
+        listed_messages = client.get(f"/api/projects/{a['id']}/messages").json()
+        assert listed_messages[0]["attachment_ids"] == [uploaded["id"]]
+        assert client.get(f"/api/projects/{a['id']}/files").json()[0]["read_status"] == "not_read"
+        assert client.get(f"/api/projects/{a['id']}/messages").json()[0]["status"] == "completed"
         foreign = client.post(f"/api/projects/{b['id']}/messages", json={"text": "no", "attachment_ids": [uploaded["id"]]}, headers=headers)
         assert foreign.status_code == 404
         assert len(client.get(f"/api/projects/{b['id']}/messages").json()) == 0
+
+
+def test_malformed_main_agent_result_marks_message_failed(tmp_path: Path):
+    class BrokenMain:
+        backend = "codex"
+        def send(self, **kwargs): return {"reply": "ok"}
+    app, runtime = _app(tmp_path)
+    # Reuse app construction with broken adapter and the same settings shape.
+    settings = AppSettings(database_path=tmp_path / "broken.sqlite3", password_hash=hash_password("correct horse battery staple"), cookie_secure=True, allowed_origins={"https://testserver"})
+    app = create_app(settings=settings, runtime=FakeRuntime(tmp_path / "broken-projects"), main_agent=BrokenMain())
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post("/api/projects", json={"name":"A", "problem":"alpha"}, headers=headers).json()
+        response = client.post(f"/api/projects/{project['id']}/messages", json={"text":"hello", "attachment_ids":[]}, headers=headers)
+        assert response.status_code == 502
+        messages = client.get(f"/api/projects/{project['id']}/messages").json()
+        assert messages[0]["status"] == "failed"
 
 
 def test_read_only_projections_are_authenticated_and_project_scoped(tmp_path: Path):

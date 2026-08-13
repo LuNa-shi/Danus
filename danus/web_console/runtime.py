@@ -40,21 +40,18 @@ class DanusRuntimeAdapter:
 
     def _project_dir(self, runtime_name: str) -> Path:
         validate_runtime_name(runtime_name)
-        project = (self.agents_root / runtime_name).resolve()
+        candidate = self.agents_root / runtime_name
+        # Check the directory entry before resolving it: a symlinked project root
+        # must never become a trusted context or deletion target.
+        if candidate.is_symlink():
+            raise RuntimeOperationError("project root must not be a symlink")
+        project = candidate.resolve()
         if project.parent != self.agents_root or not project.is_dir():
             raise RuntimeNotFound(runtime_name)
         return project
 
     def list_projects(self) -> list[dict[str, Any]]:
         return self._call(cli.do_list)
-
-    def delete_project(self, runtime_name: str) -> None:
-        project = self._project_dir(runtime_name)
-        if any(item for item in self.status_project(runtime_name).get("workers", []) if item.get("alive")):
-            raise RuntimeOperationError("project is still running")
-        # Deletion is deliberately not exposed until the full destructive
-        # lifecycle slice adds confirmation and symlink-safe removal.
-        raise RuntimeOperationError(f"runtime deletion not implemented for {project.name}")
 
     def create_project(self, runtime_name: str, problem: str, roles: str, model: str | None = None) -> dict[str, Any]:
         validate_runtime_name(runtime_name)
@@ -67,14 +64,17 @@ class DanusRuntimeAdapter:
                 raise RuntimeOperationError("runtime returned project outside configured root")
             atomic_write(project / "PROBLEM.md", problem if problem.endswith("\n") else problem + "\n")
             return result
-        except (SystemExit, ValueError) as exc:
+        except (SystemExit, ValueError, OSError) as exc:
             raise RuntimeOperationError(str(exc)) from exc
 
     def _call(self, fn, *args, **kwargs):
         try:
             return fn(*args, root=self.agents_root, **kwargs)
         except SystemExit as exc:
-            raise RuntimeOperationError(str(exc)) from exc
+            message = str(exc)
+            if "no workers for target" in message and fn in (cli.do_status, cli.do_start, cli.do_stop):
+                return []
+            raise RuntimeOperationError(message) from exc
 
     def start_project(self, runtime_name: str) -> dict[str, Any]:
         self._project_dir(runtime_name)
@@ -115,7 +115,7 @@ class DanusRuntimeAdapter:
             if not name or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name):
                 continue
             log_dir = (root / "workers" / name / "logs").resolve()
-            if log_dir.parent.parent != root or not log_dir.is_dir():
+            if log_dir.parent.parent.parent != root or not log_dir.is_dir():
                 continue
             for path in sorted(log_dir.glob("*.log")):
                 try:
@@ -144,7 +144,10 @@ class DanusRuntimeAdapter:
         # Refuse symlinked project roots; remove only this exact server-owned tree.
         if root.is_symlink():
             raise RuntimeOperationError("project root must not be a symlink")
-        shutil.rmtree(root)
+        try:
+            shutil.rmtree(root)
+        except OSError as exc:
+            raise RuntimeOperationError("project deletion failed") from exc
         return {"deleted": runtime_name}
 
     def outputs_projection(self, runtime_name: str) -> dict[str, Any]:
@@ -156,8 +159,14 @@ class DanusRuntimeAdapter:
         project = self._project_dir(runtime_name)
         if deadline <= time.time():
             raise ValueError("deadline must be in the future")
-        atomic_write(project / L.DEADLINE_FILE, f"{deadline:.6f}\n")
+        try:
+            atomic_write(project / L.DEADLINE_FILE, f"{deadline:.6f}\n")
+        except OSError as exc:
+            raise RuntimeOperationError("deadline could not be written") from exc
 
     def clear_deadline(self, runtime_name: str) -> None:
         project = self._project_dir(runtime_name)
-        (project / L.DEADLINE_FILE).unlink(missing_ok=True)
+        try:
+            (project / L.DEADLINE_FILE).unlink(missing_ok=True)
+        except OSError as exc:
+            raise RuntimeOperationError("deadline could not be cleared") from exc

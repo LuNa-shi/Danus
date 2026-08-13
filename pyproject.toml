@@ -39,10 +39,11 @@ verify = ["fastapi", "uvicorn", "pydantic"]         # danus.verify  — cold-sta
 observability = ["fastapi", "uvicorn", "pydantic"]  # danus.observability — read-only dashboard
 web-console = ["fastapi", "uvicorn", "pydantic", "python-multipart"]      # danus.web_console — authenticated control plane
 strategy = ["openai", "anthropic"]                  # danus.strategy — API consult transports
-dev = ["pytest", "mcp", "fastapi", "uvicorn", "pydantic", "openai", "anthropic"]  # full test suite (all modules)
+dev = ["pytest", "mcp", "fastapi", "uvicorn", "pydantic", "python-multipart", "openai", "anthropic"]  # full test suite (all modules)
 
 [tool.setuptools.packages.find]
 include = ["danus*"]
 
 [tool.setuptools.package-data]
 "danus.core" = ["*.json"]
+"danus.web_console" = ["static/*.html", "static/*.js", "static/*.css"]

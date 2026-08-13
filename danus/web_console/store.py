@@ -46,7 +46,7 @@ class ConsoleStore:
                 );
                 CREATE TABLE IF NOT EXISTS main_agent_sessions (
                     project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
-                    claude_session_id TEXT, status TEXT NOT NULL, updated_at REAL NOT NULL
+                    session_id TEXT, backend TEXT NOT NULL DEFAULT 'codex', status TEXT NOT NULL, updated_at REAL NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS messages (
                     id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -76,6 +76,12 @@ class ConsoleStore:
                 CREATE INDEX IF NOT EXISTS idx_runs_project_status ON runs(project_id, status);
                 """
             )
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(main_agent_sessions)")}
+            if "session_id" not in columns:
+                conn.execute("ALTER TABLE main_agent_sessions ADD COLUMN session_id TEXT")
+                conn.execute("ALTER TABLE main_agent_sessions ADD COLUMN backend TEXT NOT NULL DEFAULT 'codex'")
+                if "claude_session_id" in columns:
+                    conn.execute("UPDATE main_agent_sessions SET session_id=claude_session_id WHERE session_id IS NULL")
 
     @staticmethod
     def _dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -113,9 +119,9 @@ class ConsoleStore:
     def files(self, project_id: str, logical_name: str | None = None) -> list[dict[str, Any]]:
         with self._lock, self._connect() as conn:
             if logical_name is None:
-                rows = conn.execute("SELECT * FROM files WHERE project_id=? ORDER BY logical_name, version", (project_id,))
+                rows = conn.execute("SELECT * FROM files WHERE project_id=? AND processing_status != 'cancelled' ORDER BY logical_name, version", (project_id,))
             else:
-                rows = conn.execute("SELECT * FROM files WHERE project_id=? AND logical_name=? ORDER BY version", (project_id, logical_name))
+                rows = conn.execute("SELECT * FROM files WHERE project_id=? AND logical_name=? AND processing_status != 'cancelled' ORDER BY version", (project_id, logical_name))
             return [dict(row) for row in rows]
 
     def file(self, file_id: str, project_id: str) -> dict[str, Any] | None:
@@ -124,11 +130,19 @@ class ConsoleStore:
 
     def file_by_hash(self, project_id: str, sha256: str) -> dict[str, Any] | None:
         with self._lock, self._connect() as conn:
-            return self._dict(conn.execute("SELECT * FROM files WHERE project_id=? AND sha256=?", (project_id, sha256)).fetchone())
+            return self._dict(conn.execute("SELECT * FROM files WHERE project_id=? AND sha256=? AND processing_status IN ('available','pending')", (project_id, sha256)).fetchone())
+
+    def file_tombstone_by_hash(self, project_id: str, sha256: str) -> dict[str, Any] | None:
+        with self._lock, self._connect() as conn:
+            return self._dict(conn.execute("SELECT * FROM files WHERE project_id=? AND sha256=? AND processing_status IN ('cancelled','replaced')", (project_id, sha256)).fetchone())
+
+    def purge_file_tombstone(self, file_id: str, project_id: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM files WHERE id=? AND project_id=? AND processing_status IN ('cancelled','replaced') AND NOT EXISTS (SELECT 1 FROM message_attachments WHERE file_id=files.id)", (file_id, project_id))
 
     def current_file(self, project_id: str, logical_name: str) -> dict[str, Any] | None:
         with self._lock, self._connect() as conn:
-            return self._dict(conn.execute("SELECT * FROM files WHERE project_id=? AND logical_name=? AND is_current=1", (project_id, logical_name)).fetchone())
+            return self._dict(conn.execute("SELECT * FROM files WHERE project_id=? AND logical_name=? AND is_current=1 AND processing_status != 'cancelled'", (project_id, logical_name)).fetchone())
 
     def next_version(self, project_id: str, logical_name: str) -> int:
         with self._lock, self._connect() as conn:
@@ -156,13 +170,15 @@ class ConsoleStore:
         with self._lock, self._connect() as conn:
             conn.execute("DELETE FROM files WHERE id=? AND project_id=?", (file_id, project_id))
 
-    def update_file_status(self, file_id: str, *, is_current: int | None = None, processing_status: str | None = None) -> None:
+    def update_file_status(self, file_id: str, *, is_current: int | None = None, processing_status: str | None = None, read_status: str | None = None) -> None:
         fields = []
         values: list[Any] = []
         if is_current is not None:
             fields.append("is_current=?"); values.append(is_current)
         if processing_status is not None:
             fields.append("processing_status=?"); values.append(processing_status)
+        if read_status is not None:
+            fields.append("read_status=?"); values.append(read_status)
         if not fields:
             return
         values.append(file_id)
@@ -173,17 +189,28 @@ class ConsoleStore:
         with self._lock, self._connect() as conn:
             return self._dict(conn.execute("SELECT * FROM main_agent_sessions WHERE project_id=?", (project_id,)).fetchone())
 
-    def upsert_agent_session(self, project_id: str, claude_session_id: str | None, status: str, updated_at: float) -> None:
+    def upsert_agent_session(self, project_id: str, session_id: str | None, status: str, updated_at: float, *, backend: str = "codex") -> None:
+        if backend not in {"codex", "claude"}:
+            raise ValueError("invalid Main Agent backend")
         with self._lock, self._connect() as conn:
-            conn.execute("INSERT INTO main_agent_sessions(project_id,claude_session_id,status,updated_at) VALUES(?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET claude_session_id=excluded.claude_session_id,status=excluded.status,updated_at=excluded.updated_at", (project_id, claude_session_id, status, updated_at))
+            conn.execute("INSERT INTO main_agent_sessions(project_id,session_id,backend,status,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET session_id=excluded.session_id,backend=excluded.backend,status=excluded.status,updated_at=excluded.updated_at", (project_id, session_id, backend, status, updated_at))
 
-    def add_message(self, message: dict[str, Any]) -> None:
+    def update_message(self, message_id: str, *, status: str, error: str | None = None) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("UPDATE messages SET status=?, error=? WHERE id=?", (status, error, message_id))
+
+    def add_message(self, message: dict[str, Any], attachment_ids: list[str] | None = None) -> None:
         with self._lock, self._connect() as conn:
             conn.execute("INSERT INTO messages(id,project_id,role,text,status,created_at,error) VALUES(?,?,?,?,?,?,?)", tuple(message[k] for k in ("id", "project_id", "role", "text", "status", "created_at", "error")))
+            for file_id in attachment_ids or []:
+                conn.execute("INSERT INTO message_attachments(message_id,file_id) VALUES(?,?)", (message["id"], file_id))
 
     def messages(self, project_id: str) -> list[dict[str, Any]]:
         with self._lock, self._connect() as conn:
-            return [dict(row) for row in conn.execute("SELECT * FROM messages WHERE project_id=? ORDER BY created_at,id", (project_id,))]
+            rows = [dict(row) for row in conn.execute("SELECT * FROM messages WHERE project_id=? ORDER BY created_at,id", (project_id,))]
+            for row in rows:
+                row["attachment_ids"] = [r["file_id"] for r in conn.execute("SELECT file_id FROM message_attachments WHERE message_id=? ORDER BY file_id", (row["id"],))]
+            return rows
 
     def add_session(self, session: dict[str, Any]) -> None:
         with self._lock, self._connect() as conn:
@@ -202,6 +229,10 @@ class ConsoleStore:
                 return None
             conn.execute("UPDATE sessions SET last_seen=? WHERE id=?", (now, row["id"]))
             return dict(row)
+
+    def rotate_csrf(self, session_id: str, csrf_digest: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("UPDATE sessions SET csrf_digest=? WHERE id=? AND revoked_at IS NULL", (csrf_digest, session_id))
 
     def revoke_session(self, session_id: str, now: float) -> None:
         with self._lock, self._connect() as conn:

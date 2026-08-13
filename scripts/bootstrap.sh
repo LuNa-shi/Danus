@@ -9,7 +9,7 @@
 # toolchain is self-contained (no system-wide installs). Provisions:
 #   1) Node 22            -> runtime/node22            (official tarball)
 #   2) Python venv + deps -> runtime/venv             (mcp/fastapi/uvicorn/pydantic/openai/anthropic
-#                                                      + the danus package itself, editable)
+#                                                      + python-multipart + the danus package itself, editable)
 #   3) codex CLI          -> runtime/codex-npm        (npm @openai/codex)
 #   4) node skill deps    -> human-summary/node_modules (markdown-it/katex, soft)
 #   5) writes runtime/runtime.env (machine paths read by scripts/env.sh)
@@ -50,7 +50,7 @@ export PATH="$NODE_DIR/bin:$PATH"
 # + imports the deps, and REBUILD it from a fresh base python if not.
 VENV="$RT/venv"
 export PIP_DISABLE_PIP_VERSION_CHECK=1
-DEPS='from danus._mcp import FastMCP; import fastapi,uvicorn,pydantic,openai,anthropic'
+DEPS='from danus._mcp import FastMCP; import fastapi,uvicorn,pydantic,openai,anthropic,multipart'
 if "$VENV/bin/python" -c "$DEPS" 2>/dev/null; then
   log "venv present + healthy"
 else
@@ -58,11 +58,11 @@ else
   PYBASE="$(command -v python3)"; [ -n "$PYBASE" ] || { log "FATAL: no python3 on PATH to build the venv"; exit 1; }
   log "creating venv ($PYBASE) -> $VENV"
   "$PYBASE" -m venv "$VENV"
-  log "installing python deps (mcp/fastapi/uvicorn/pydantic/openai/anthropic)"
+  log "installing python deps (mcp/fastapi/uvicorn/pydantic/openai/anthropic/python-multipart)"
   $NICE "$VENV/bin/pip" install --quiet --no-cache-dir --upgrade pip >/dev/null 2>&1 || true
   $NICE "$VENV/bin/pip" install --quiet --no-cache-dir \
     "mcp>=1.0.0" "fastapi>=0.110.0" "uvicorn>=0.30.0" "pydantic>=2.0" "openai>=2.40" \
-    "anthropic>=0.92" \
+    "anthropic>=0.92" "python-multipart>=0.0.9" \
     || { log "FATAL: pip install failed"; exit 1; }
   "$VENV/bin/python" -c "$DEPS" || { log "FATAL: venv still missing deps after install"; exit 1; }
 fi
