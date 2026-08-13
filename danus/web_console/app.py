@@ -40,6 +40,8 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None) -> FastAPI:
     app = FastAPI(title="Danus Web Console", version="0.1.0")
     store = ConsoleStore(settings.database_path)
     runtime = runtime or DanusRuntimeAdapter()
+    app.state.console_store = store
+    app.state.runtime_adapter = runtime
     project_locks: dict[str, threading.Lock] = {}
     locks_guard = threading.Lock()
     failed: dict[str, tuple[int, float]] = {}
@@ -62,7 +64,9 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None) -> FastAPI:
 
     def csrf_ok(request: Request, current: dict[str, Any]) -> bool:
         origin = request.headers.get("origin")
-        if settings.allowed_origins and origin not in settings.allowed_origins:
+        # State-changing browser requests must identify the trusted origin.
+        # Deployments with no configured allowlist fail closed.
+        if not settings.allowed_origins or origin not in settings.allowed_origins:
             return False
         supplied = request.headers.get("x-csrf-token")
         return bool(supplied) and secrets.compare_digest(digest_token(supplied), current["csrf_digest"])
@@ -82,6 +86,9 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None) -> FastAPI:
         except Exception:
             return _error(401, "invalid credentials")
         password = payload.get("password") if isinstance(payload, dict) else None
+        origin = request.headers.get("origin")
+        if settings.allowed_origins and origin is not None and origin not in settings.allowed_origins:
+            return _error(403, "origin not allowed")
         now = time.time()
         key = request.client.host if request.client else "unknown"
         count, until = failed.get(key, (0, 0.0))
@@ -214,9 +221,9 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None) -> FastAPI:
             try:
                 runtime.write_deadline(project["runtime_name"], deadline)
                 result = runtime.start_project(project["runtime_name"])
-                store.add_run({**run, "status": "running"})
+                store.add_run({**run, "status": "starting"})
                 store.audit("run_start", "success", project_id)
-                return JSONResponse({**run, "status": "running", "workers": result.get("workers", [])}, status_code=201)
+                return JSONResponse({"run_id": run["id"], "status": "start_requested", "deadline": deadline}, status_code=202)
             except RuntimeErrorBase as exc:
                 # Persist a failed control-plane outcome rather than claiming
                 # that a deadline write/start request created a live run.
@@ -257,9 +264,9 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None) -> FastAPI:
         with lock_for(project_id):
             try:
                 result = runtime.stop_project(project["runtime_name"])
-                store.update_run(run_id, status="stopped", stopped_at=time.time(), outcome="graceful_stop")
+                store.update_run(run_id, status="stopping", outcome="graceful_stop_requested")
                 store.audit("run_stop", "success", project_id)
-                return {"run_id": run_id, "status": "stopped", "workers": result.get("workers", [])}
+                return JSONResponse({"run_id": run_id, "status": "stop_requested"}, status_code=202)
             except RuntimeErrorBase:
                 store.update_run(run_id, status="failed", stopped_at=time.time(), outcome="stop_failed")
                 store.audit("run_stop", "failure", project_id)
@@ -273,7 +280,11 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None) -> FastAPI:
         if isinstance(project, JSONResponse):
             return project
         try:
-            return runtime.status_project(project["runtime_name"])
+            projection = runtime.status_project(project["runtime_name"])
+            active = store.active_run(project_id)
+            if active is not None:
+                projection = {**projection, "run": {"id": active["id"], "status": active["status"], "deadline": active["deadline"]}}
+            return projection
         except RuntimeErrorBase:
             return _error(502, "runtime projection unavailable")
 
@@ -292,9 +303,9 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None) -> FastAPI:
                 result = runtime.stop_project(project["runtime_name"])
                 active = store.active_run(project_id)
                 if active:
-                    store.update_run(active["id"], status="stopped", stopped_at=time.time(), outcome="graceful_stop")
+                    store.update_run(active["id"], status="stopping", outcome="graceful_stop_requested")
                 store.audit("run_stop", "success", project_id)
-                return {"status": "stopped", "workers": result.get("workers", [])}
+                return JSONResponse({"status": "stop_requested"}, status_code=202)
             except RuntimeErrorBase:
                 store.audit("run_stop", "failure", project_id)
                 return _error(502, "project stop could not be completed")

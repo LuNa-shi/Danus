@@ -18,6 +18,10 @@ class FakeRuntime:
         self.stopped = []
         self.statuses = {}
         self.deadlines = {}
+        self.cleared_deadlines = []
+
+    def clear_deadline(self, runtime_name):
+        self.cleared_deadlines.append(runtime_name)
 
     def write_deadline(self, runtime_name, deadline):
         self.deadlines[runtime_name] = deadline
@@ -124,9 +128,9 @@ def test_project_run_deadline_and_graceful_stop_are_scoped(tmp_path: Path):
             f"/api/projects/{a['id']}/runs", json={"duration_seconds": 43200},
             headers={"X-CSRF-Token": csrf, "Origin": "https://testserver"},
         )
-        assert start.status_code == 201
+        assert start.status_code == 202
         run = start.json()
-        assert run["status"] == "running"
+        assert run["status"] == "start_requested"
         assert 43190 <= run["deadline"] - time.time() <= 43210
         assert runtime.started == [a["runtime_name"]]
         assert runtime.started != [b["runtime_name"]]
@@ -135,8 +139,8 @@ def test_project_run_deadline_and_graceful_stop_are_scoped(tmp_path: Path):
             f"/api/projects/{a['id']}/stop", json={},
             headers={"X-CSRF-Token": csrf, "Origin": "https://testserver"},
         )
-        assert stopped.status_code == 200
-        assert stopped.json()["status"] == "stopped"
+        assert stopped.status_code == 202
+        assert stopped.json()["status"] == "stop_requested"
         assert runtime.stopped == [a["runtime_name"]]
         assert runtime.stopped != [b["runtime_name"]]
         assert client.get(f"/api/projects/{b['id']}/runtime").json()["workers"] == []
@@ -150,9 +154,9 @@ def test_run_lookup_is_project_scoped(tmp_path: Path):
         a = client.post("/api/projects", json={"name": "A", "problem": "alpha", "roles": "high:1"}, headers=headers).json()
         b = client.post("/api/projects", json={"name": "B", "problem": "beta", "roles": "high:1"}, headers=headers).json()
         run = client.post(f"/api/projects/{a['id']}/runs", json={"duration_seconds": 60}, headers=headers).json()
-        assert client.get(f"/api/projects/{a['id']}/runs/{run['id']}").status_code == 200
-        assert client.get(f"/api/projects/{b['id']}/runs/{run['id']}").status_code == 404
-        assert client.post(f"/api/projects/{b['id']}/runs/{run['id']}/stop", json={}, headers=headers).status_code == 404
+        assert client.get(f"/api/projects/{a['id']}/runs/{run['run_id']}").status_code == 200
+        assert client.get(f"/api/projects/{b['id']}/runs/{run['run_id']}").status_code == 404
+        assert client.post(f"/api/projects/{b['id']}/runs/{run['run_id']}/stop", json={}, headers=headers).status_code == 404
 
 
 def test_logout_revokes_session_and_csrf_is_required(tmp_path: Path):
