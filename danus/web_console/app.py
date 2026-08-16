@@ -15,6 +15,9 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from danus import codex
+
+from .config import ProviderModelCatalog, main_agent_metadata, strategy_metadata
 from .runtime import DanusRuntimeAdapter, RuntimeErrorBase, validate_runtime_name
 from .files import FileValidationError, file_type, material_root, metadata, normalize_filename, promote_pending, remove_blob, stream_to_pending, validate_bytes
 from .main_agent import MainAgentError, MainAgentAdapter
@@ -31,6 +34,10 @@ class AppSettings:
     session_ttl_seconds: int = 12 * 3600
     allowed_origins: set[str] = field(default_factory=set)
     max_file_bytes: int = 25 * 1024 * 1024
+    default_max_parallel_workers: int = 1
+    max_parallel_workers_limit: int = 32
+    model_catalog_ttl_seconds: float = 300.0
+    model_catalog_timeout_seconds: float = 5.0
 
 
 def _error(status: int, detail: str) -> JSONResponse:
@@ -41,7 +48,13 @@ def _runtime_name(name: str) -> str:
     validate_runtime_name(name)
     return name
 
-def create_app(*, settings: AppSettings, runtime: Any | None = None, main_agent: Any | None = None) -> FastAPI:
+def create_app(
+    *,
+    settings: AppSettings,
+    runtime: Any | None = None,
+    main_agent: Any | None = None,
+    model_catalog: Any | None = None,
+) -> FastAPI:
     app = FastAPI(title="Danus Web Console", version="0.1.0")
 
     @app.middleware("http")
@@ -56,6 +69,10 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None, main_agent:
     store = ConsoleStore(settings.database_path)
     runtime = runtime or DanusRuntimeAdapter()
     main_agent = main_agent or MainAgentAdapter()
+    model_catalog = model_catalog or ProviderModelCatalog(
+        ttl_seconds=settings.model_catalog_ttl_seconds,
+        timeout_seconds=settings.model_catalog_timeout_seconds,
+    )
     app.state.console_store = store
     app.state.main_agent_adapter = main_agent
     app.state.runtime_adapter = runtime
@@ -97,6 +114,71 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None, main_agent:
         project = store.project(project_id)
         return project if project is not None else _error(404, "project not found")
 
+    def bounded_parallel(value: Any | None, *, default: int | None = None) -> int:
+        fallback = default if default is not None else settings.default_max_parallel_workers
+        try:
+            parsed = int(value if value is not None else fallback)
+        except (TypeError, ValueError):
+            raise ValueError("max_parallel_workers must be an integer")
+        if value is None and parsed < 1:
+            parsed = 1
+        if parsed < 1 or parsed > settings.max_parallel_workers_limit:
+            raise ValueError("max_parallel_workers out of range")
+        return parsed
+
+    def project_config(project: dict[str, Any]) -> dict[str, Any]:
+        max_parallel = bounded_parallel(project.get("max_parallel_workers"), default=settings.default_max_parallel_workers)
+        worker_model = project.get("worker_model") or project.get("model")
+        return {
+            "roles": project.get("roles") or "high:3,xhigh:4",
+            "worker_model": worker_model,
+            "model": worker_model,
+            "max_parallel_workers": max_parallel,
+        }
+
+    def project_payload(project: dict[str, Any], *, workers: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        config = project_config(project)
+        payload = {
+            "id": project["id"],
+            "name": project["name"],
+            "problem": project["problem"],
+            "runtime_name": project["runtime_name"],
+            "roles": config["roles"],
+            "worker_model": config["worker_model"],
+            "model": config["model"],
+            "max_parallel_workers": config["max_parallel_workers"],
+            "config": config,
+        }
+        if workers is not None:
+            payload["workers"] = workers
+        return payload
+
+    def projection_with_project(project: dict[str, Any], projection: dict[str, Any]) -> dict[str, Any]:
+        config = project_config(project)
+        for key, value in (projection.get("config") or {}).items():
+            if value is not None:
+                config[key] = value
+        return {
+            **projection,
+            "config": config,
+            "project": project_payload(project),
+        }
+
+    def unassigned_workers(projection: dict[str, Any]) -> list[str]:
+        workers = projection.get("workers", [])
+        return [
+            str(worker.get("worker") or "")
+            for worker in workers
+            if worker.get("assigned") is not True
+        ]
+
+    def latest_memory_entry(memory: dict[str, Any], kind: str) -> dict[str, Any] | None:
+        for channel in memory.get("channels", []) or []:
+            if str(channel.get("kind") or "").lower() == kind:
+                entries = channel.get("entries") or []
+                return entries[0] if entries else None
+        return None
+
     def reconcile_run(project_id: str, project: dict[str, Any], projection: dict[str, Any]) -> dict[str, Any]:
         active = store.active_run(project_id)
         if active is not None:
@@ -105,6 +187,9 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None, main_agent:
                 store.update_run(active["id"], status="stopped", stopped_at=time.time(), outcome="graceful_stop")
             elif active["status"] == "starting" and any(worker.get("alive") for worker in workers):
                 store.update_run(active["id"], status="running")
+            elif active["status"] == "running" and workers and not any(worker.get("alive") for worker in workers):
+                outcome = "worker_error" if any(worker.get("state") == "error" for worker in workers) else "workers_exited"
+                store.update_run(active["id"], status="stopped", stopped_at=time.time(), outcome=outcome)
             elif active["status"] in ("starting", "running") and time.time() >= active["deadline"]:
                 try:
                     runtime.stop_project(project["runtime_name"])
@@ -187,6 +272,35 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None, main_agent:
             return _error(401, "authentication required")
         return {"authenticated": True}
 
+    @app.get("/api/config")
+    async def config_projection(request: Request):
+        if isinstance((auth := auth_required(request)), JSONResponse):
+            return auth
+        default_worker_model = codex.model()
+        catalog = model_catalog.snapshot(default_worker_model=default_worker_model)
+        worker_models = catalog.get("models", [])
+        main_meta = main_agent_metadata(main_agent)
+        strategy_meta = strategy_metadata()
+        return {
+            "worker_models": worker_models,
+            "models": worker_models,
+            "default_worker_model": default_worker_model,
+            "default_max_parallel_workers": bounded_parallel(None),
+            "limits": {
+                "default_max_parallel_workers": bounded_parallel(None),
+                "max_parallel_workers": settings.max_parallel_workers_limit,
+            },
+            "main_agent": main_meta,
+            "strategy": strategy_meta,
+            "main_agent_backend": main_meta["backend"],
+            "strategy_transport": strategy_meta["transport"],
+            "model_catalog": {
+                key: value
+                for key, value in catalog.items()
+                if key not in {"models"}
+            },
+        }
+
     @app.get("/api/projects")
     async def list_projects(request: Request):
         if isinstance((auth := auth_required(request)), JSONResponse):
@@ -197,7 +311,7 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None, main_agent:
                 projection = runtime.status_project(project["runtime_name"])
             except RuntimeErrorBase:
                 projection = {"workers": [], "error": "runtime unavailable"}
-            rows.append({"id": project["id"], "name": project["name"], "problem": project["problem"], "runtime_name": project["runtime_name"], "workers": projection.get("workers", [])})
+            rows.append(project_payload(project, workers=projection.get("workers", [])))
         return rows
 
     @app.post("/api/projects")
@@ -212,13 +326,35 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None, main_agent:
             name = _runtime_name(payload["name"])
             problem = payload["problem"]
             roles = payload.get("roles", "high:3,xhigh:4")
-            model = payload.get("model")
+            worker_model = payload.get("worker_model", payload.get("model"))
+            if worker_model is not None:
+                worker_model = str(worker_model).strip() or None
+            # Resolve "server default" now so project metadata and every Worker
+            # ROLE.env retain the same concrete model for the lifetime of the
+            # project, even if the server default changes later.
+            worker_model = worker_model or codex.model()
+            max_parallel_workers = bounded_parallel(payload.get("max_parallel_workers"))
             if not isinstance(problem, str) or not problem.strip():
                 raise ValueError("problem must be non-empty")
             project_id = uuid.uuid4().hex
-            result = runtime.create_project(name, problem, roles, model)
+            result = runtime.create_project(
+                name,
+                problem,
+                roles,
+                worker_model,
+                max_parallel_workers=max_parallel_workers,
+            )
             try:
-                store.add_project({"id": project_id, "name": name, "runtime_name": name, "problem": problem, "created_at": time.time()})
+                store.add_project({
+                    "id": project_id,
+                    "name": name,
+                    "runtime_name": name,
+                    "problem": problem,
+                    "roles": roles,
+                    "worker_model": worker_model,
+                    "max_parallel_workers": max_parallel_workers,
+                    "created_at": time.time(),
+                })
             except sqlite3.IntegrityError:
                 try:
                     runtime.delete_project(name)
@@ -234,7 +370,17 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None, main_agent:
                 store.audit("project_create", "failure", details=json.dumps({"error": "metadata persistence failed"}))
                 return _error(500, "project metadata could not be persisted")
             store.audit("project_create", "success", project_id)
-            return JSONResponse({"id": project_id, "name": name, "problem": problem, "runtime_name": name, "workers": result.get("workers", [])}, status_code=201)
+            project = store.project(project_id)
+            return JSONResponse(project_payload(project or {
+                "id": project_id,
+                "name": name,
+                "runtime_name": name,
+                "problem": problem,
+                "roles": roles,
+                "worker_model": worker_model,
+                "max_parallel_workers": max_parallel_workers,
+                "created_at": time.time(),
+            }, workers=result.get("workers", [])), status_code=201)
         except (KeyError, TypeError, ValueError) as exc:
             return _error(400, str(exc))
         except RuntimeErrorBase as exc:
@@ -274,7 +420,7 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None, main_agent:
         project = project_or_404(project_id)
         if isinstance(project, JSONResponse):
             return project
-        return {"id": project["id"], "name": project["name"], "problem": project["problem"], "runtime_name": project["runtime_name"]}
+        return project_payload(project)
 
     @app.post("/api/projects/{project_id}/runs")
     async def start_run(project_id: str, request: Request):
@@ -295,14 +441,27 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None, main_agent:
             return _error(400, "invalid duration_seconds")
         async with lock_for(project_id):
             try:
-                reconcile_run(project_id, project, runtime.status_project(project["runtime_name"]))
+                status_projection = runtime.status_project(project["runtime_name"])
+                reconcile_run(project_id, project, status_projection)
             except RuntimeErrorBase:
-                # Keep control-plane state conservative when runtime status is
-                # unavailable; an active run must not be silently replaced.
-                pass
+                # A run may only start after the control plane can prove all
+                # workers have real Main Agent assignments.
+                return _error(502, "runtime projection unavailable")
             active = store.active_run(project_id)
             if active is not None:
                 return _error(409, "project already has an active run")
+            workers = status_projection.get("workers", [])
+            if not workers:
+                return _error(409, "project has no workers")
+            missing_assignments = [name for name in unassigned_workers(status_projection) if name]
+            if missing_assignments:
+                return JSONResponse(
+                    {
+                        "detail": "all workers must be assigned before starting a run",
+                        "unassigned_workers": missing_assignments,
+                    },
+                    status_code=409,
+                )
             started, deadline = time.time(), time.time() + duration
             run = {"id": uuid.uuid4().hex, "project_id": project_id, "duration_seconds": duration, "started_at": started, "deadline": deadline, "status": "starting"}
             # Record the control-plane run before spawning workers so a process
@@ -384,7 +543,7 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None, main_agent:
             active = store.active_run(project_id)
             if active is not None:
                 projection = {**projection, "run": {"id": active["id"], "status": active["status"], "deadline": active["deadline"]}}
-            return projection
+            return projection_with_project(project, projection)
         except RuntimeErrorBase:
             return _error(502, "runtime projection unavailable")
 
@@ -551,7 +710,7 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None, main_agent:
         if isinstance(project, JSONResponse):
             return project
         try:
-            return reconcile_run(project_id, project, runtime.status_project(project["runtime_name"]))
+            return projection_with_project(project, reconcile_run(project_id, project, runtime.status_project(project["runtime_name"])))
         except RuntimeErrorBase:
             return _error(502, "runtime projection unavailable")
 
@@ -580,6 +739,18 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None, main_agent:
         except RuntimeErrorBase:
             return _error(502, "fact graph projection unavailable")
 
+    @app.get("/api/projects/{project_id}/memory")
+    async def memory_projection(project_id: str, request: Request):
+        if isinstance((auth := auth_required(request)), JSONResponse):
+            return auth
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse):
+            return project
+        try:
+            return runtime.memory_projection(project["runtime_name"])
+        except RuntimeErrorBase:
+            return _error(502, "memory projection unavailable")
+
     @app.get("/api/projects/{project_id}/reports")
     async def reports_projection(project_id: str, request: Request):
         if isinstance((auth := auth_required(request)), JSONResponse):
@@ -603,6 +774,56 @@ def create_app(*, settings: AppSettings, runtime: Any | None = None, main_agent:
             return runtime.outputs_projection(project["runtime_name"])
         except RuntimeErrorBase:
             return _error(502, "outputs projection unavailable")
+
+    @app.get("/api/projects/{project_id}/orchestration")
+    async def orchestration_projection(project_id: str, request: Request):
+        if isinstance((auth := auth_required(request)), JSONResponse):
+            return auth
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse):
+            return project
+        try:
+            status_projection = runtime.status_project(project["runtime_name"])
+            memory = runtime.memory_projection(project["runtime_name"])
+        except RuntimeErrorBase:
+            return _error(502, "orchestration projection unavailable")
+        workers = status_projection.get("workers", [])
+        unassigned = [name for name in unassigned_workers(status_projection) if name]
+        session_row = store.agent_session(project_id)
+        session_projection = {
+            "backend": (session_row or {}).get("backend") or main_agent_backend,
+            "status": (session_row or {}).get("status") or "not_started",
+            "session_id": (session_row or {}).get("session_id"),
+            "session_id_present": bool((session_row or {}).get("session_id")),
+            "updated_at": (session_row or {}).get("updated_at"),
+        }
+        active = store.active_run(project_id)
+        run_projection = None
+        if active is not None:
+            run_projection = {"id": active["id"], "status": active["status"], "deadline": active["deadline"]}
+        return {
+            "project": project_payload(project),
+            "config": project_config(project),
+            "main_agent": session_projection,
+            "session": session_projection,
+            "main_agent_status": session_projection["status"],
+            "main_agent_backend": session_projection["backend"],
+            "workers_total": len(workers),
+            "assigned_workers": len(workers) - len(unassigned),
+            "unassigned_workers": unassigned,
+            "workers": [
+                {
+                    "worker": worker.get("worker"),
+                    "task": worker.get("task", ""),
+                    "assigned": worker.get("assigned") is True,
+                }
+                for worker in workers
+            ],
+            "master_guidance": latest_memory_entry(memory, "master_guidance"),
+            "guidance": latest_memory_entry(memory, "master_guidance"),
+            "elaboration": latest_memory_entry(memory, "elaboration"),
+            "run": run_projection,
+        }
 
     @app.get("/api/projects/{project_id}/messages")
     async def list_messages(project_id: str, request: Request):

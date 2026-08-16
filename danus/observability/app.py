@@ -87,17 +87,36 @@ _FM = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)$", re.DOTALL)
 
 def _parse_fact(text: str) -> Dict[str, Any]:
     """fact md = YAML-ish frontmatter (fact_id / problem_id / author /
-    predecessors) + ``## statement`` / ``## proof`` / ``## intuition`` sections."""
+    predecessors / glossary / references) + rendered markdown sections."""
     m = _FM.match(text)
     fm: Dict[str, Any] = {}
+    glossary: Dict[str, str] = {}
+    external_refs: List[Dict[str, Any]] = []
     body = text
     if m:
         body = m.group(2)
+        in_glossary = False
         for line in m.group(1).splitlines():
             if ":" not in line:
+                in_glossary = False
                 continue
             k, v = line.split(":", 1)
             k, v = k.strip(), v.strip()
+            if k == "glossary_introduces":
+                in_glossary = v != "{}"
+                continue
+            if k == "external_refs":
+                in_glossary = False
+                try:
+                    parsed_refs = json.loads(v) if v else []
+                    external_refs = [item for item in parsed_refs if isinstance(item, dict)] if isinstance(parsed_refs, list) else []
+                except json.JSONDecodeError:
+                    external_refs = []
+                continue
+            if in_glossary and line[:1].isspace():
+                glossary[k] = v
+                continue
+            in_glossary = False
             if v.startswith("[") and v.endswith("]"):
                 inner = v[1:-1].strip()
                 fm[k] = [x.strip().strip("'\"") for x in inner.split(",") if x.strip()] if inner else []
@@ -117,6 +136,8 @@ def _parse_fact(text: str) -> Dict[str, Any]:
         "problem_id": fm.get("problem_id", ""),
         "author": fm.get("author", ""),
         "predecessors": fm.get("predecessors", []) or [],
+        "glossary_introduces": glossary,
+        "external_refs": external_refs,
         "statement": secs["statement"].strip(),
         "proof": secs["proof"].strip(),
         "intuition": secs["intuition"].strip(),
@@ -215,6 +236,8 @@ class GraphNode(BaseModel):
     proof: str
     intuition: str
     predecessors: List[str]
+    glossary_introduces: Dict[str, str]
+    external_refs: List[Dict[str, Any]]
     depth: int
 
 
@@ -286,6 +309,8 @@ def build_factgraph(project: Optional[Path] = None) -> Dict[str, Any]:
         "id": f["fact_id"], "author": f["author"], "problem_id": f["problem_id"],
         "statement": f["statement"], "proof": f["proof"], "intuition": f["intuition"],
         "predecessors": deps[f["fact_id"]],
+        "glossary_introduces": f["glossary_introduces"],
+        "external_refs": f["external_refs"],
         "depth": depth.get(f["fact_id"], 0),
     } for f in facts]
     edges = [{"source": p, "target": f["fact_id"]} for f in facts for p in deps[f["fact_id"]]]

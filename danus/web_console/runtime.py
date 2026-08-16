@@ -1,6 +1,7 @@
 """Adapter from the Web Console control plane to Danus runtime APIs."""
 from __future__ import annotations
 
+import json
 import re
 import time
 from pathlib import Path
@@ -53,12 +54,26 @@ class DanusRuntimeAdapter:
     def list_projects(self) -> list[dict[str, Any]]:
         return self._call(cli.do_list)
 
-    def create_project(self, runtime_name: str, problem: str, roles: str, model: str | None = None) -> dict[str, Any]:
+    def create_project(
+        self,
+        runtime_name: str,
+        problem: str,
+        roles: str,
+        model: str | None = None,
+        *,
+        max_parallel_workers: int | None = None,
+    ) -> dict[str, Any]:
         validate_runtime_name(runtime_name)
         if not isinstance(problem, str) or not problem.strip():
             raise ValueError("problem must be non-empty")
         try:
-            result = cli.do_new(runtime_name, roles=roles, model=model, root=self.agents_root)
+            result = cli.do_new(
+                runtime_name,
+                roles=roles,
+                model=model,
+                root=self.agents_root,
+                max_parallel_workers=max_parallel_workers,
+            )
             project = Path(result["project_dir"]).resolve()
             if project.parent != self.agents_root:
                 raise RuntimeOperationError("runtime returned project outside configured root")
@@ -85,8 +100,82 @@ class DanusRuntimeAdapter:
         return {"workers": self._call(cli.do_stop, runtime_name, force=False)}
 
     def status_project(self, runtime_name: str) -> dict[str, Any]:
-        self._project_dir(runtime_name)
-        return {"workers": self._call(cli.do_status, runtime_name)}
+        root = self._project_dir(runtime_name)
+        workers = self._call(cli.do_status, runtime_name)
+        for worker in workers:
+            memory_count, checkpoint = self._worker_checkpoint(root, str(worker.get("worker", "")))
+            worker["local_memory_count"] = memory_count
+            worker["checkpoint"] = checkpoint
+        return {"config": self.project_config(runtime_name), "workers": workers}
+
+    def project_config(self, runtime_name: str) -> dict[str, Any]:
+        root = self._project_dir(runtime_name)
+        meta: dict[str, Any] = {}
+        path = root / "project.json"
+        if path.is_file() and not path.is_symlink():
+            try:
+                parsed = json.loads(path.read_text(encoding="utf-8"))
+                meta = parsed if isinstance(parsed, dict) else {}
+            except (json.JSONDecodeError, OSError):
+                meta = {}
+        max_parallel = meta.get("max_parallel_workers")
+        try:
+            max_parallel = int(max_parallel) if max_parallel is not None else None
+        except (TypeError, ValueError):
+            max_parallel = None
+        return {
+            "roles": meta.get("roles"),
+            "workers": meta.get("workers") if isinstance(meta.get("workers"), list) else L.list_workers(runtime_name, self.agents_root),
+            "model": meta.get("model"),
+            "worker_model": meta.get("worker_model") or meta.get("model"),
+            "max_parallel_workers": max_parallel,
+        }
+
+    @staticmethod
+    def _worker_checkpoint(root: Path, worker: str) -> tuple[int, dict[str, Any] | None]:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", worker):
+            return 0, None
+        memory_dir = (root / "workers" / worker / "local_memory").resolve()
+        if memory_dir.parent.parent.parent != root or not memory_dir.is_dir():
+            return 0, None
+        count = 0
+        candidates: list[tuple[float, int, dict[str, Any]]] = []
+        for path in sorted(memory_dir.glob("*.jsonl")):
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                modified = path.stat().st_mtime
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            for index, line in enumerate(lines):
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                count += 1
+                message = next(
+                    (
+                        value.strip()
+                        for key in ("note", "event", "claim", "summary", "result", "plan", "state", "event_type")
+                        if isinstance((value := entry.get(key)), str) and value.strip()
+                    ),
+                    None,
+                )
+                if message is None:
+                    continue
+                next_step = entry.get("next")
+                if isinstance(next_step, str) and next_step.strip():
+                    message = f"{message}\n\nNext: {next_step.strip()}"
+                candidates.append((modified, index, {
+                    "message": message,
+                    "source": path.stem,
+                    "round": entry.get("round"),
+                    "fact_id": entry.get("fact_id"),
+                }))
+        return count, max(candidates, key=lambda item: (item[0], item[1]))[2] if candidates else None
 
     def _safe_relative_files(self, runtime_name: str, relative: str, *, limit: int = 1000) -> list[dict[str, Any]]:
         root = self._project_dir(runtime_name)
@@ -128,6 +217,20 @@ class DanusRuntimeAdapter:
     def fact_graph_projection(self, runtime_name: str) -> dict[str, Any]:
         from danus.observability.app import build_factgraph
         return build_factgraph(self._project_dir(runtime_name))
+
+    def memory_projection(self, runtime_name: str) -> dict[str, Any]:
+        from danus.observability.app import build_channel, build_channels
+        root = self._project_dir(runtime_name)
+        channels = []
+        total = 0
+        for summary in build_channels(root).get("channels", []):
+            count = int(summary.get("count", 0) or 0)
+            total += count
+            if not count:
+                continue
+            detail = build_channel(str(summary["kind"]), root)
+            channels.append({**summary, "entries": detail.get("entries", [])[:6]})
+        return {"total": total, "channels": channels}
 
     def reports_projection(self, runtime_name: str) -> dict[str, Any]:
         return {"files": self._safe_relative_files(runtime_name, "reports")}

@@ -122,7 +122,7 @@ def test_subprocess_env_prepends_bin_dir_for_concrete_path():
         codex_bin = str(Path(d) / "codex")
         senv = codex.subprocess_env(codex_bin)
         first = senv["PATH"].split(os.pathsep)[0]
-        assert first == str(Path(d))
+        assert first == str(Path(d).resolve())
 
 
 def test_subprocess_env_bare_name_does_not_inject_cwd():

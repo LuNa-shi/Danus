@@ -27,7 +27,9 @@ class ConsoleStore:
                 """
                 CREATE TABLE IF NOT EXISTS projects (
                     id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, runtime_name TEXT NOT NULL UNIQUE,
-                    problem TEXT NOT NULL, created_at REAL NOT NULL
+                    problem TEXT NOT NULL, roles TEXT NOT NULL DEFAULT 'high:3,xhigh:4',
+                    worker_model TEXT, max_parallel_workers INTEGER NOT NULL DEFAULT 1,
+                    created_at REAL NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS files (
                     id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -82,6 +84,13 @@ class ConsoleStore:
                 conn.execute("ALTER TABLE main_agent_sessions ADD COLUMN backend TEXT NOT NULL DEFAULT 'codex'")
                 if "claude_session_id" in columns:
                     conn.execute("UPDATE main_agent_sessions SET session_id=claude_session_id WHERE session_id IS NULL")
+            project_columns = {row[1] for row in conn.execute("PRAGMA table_info(projects)")}
+            if "roles" not in project_columns:
+                conn.execute("ALTER TABLE projects ADD COLUMN roles TEXT NOT NULL DEFAULT 'high:3,xhigh:4'")
+            if "worker_model" not in project_columns:
+                conn.execute("ALTER TABLE projects ADD COLUMN worker_model TEXT")
+            if "max_parallel_workers" not in project_columns:
+                conn.execute("ALTER TABLE projects ADD COLUMN max_parallel_workers INTEGER NOT NULL DEFAULT 1")
 
     @staticmethod
     def _dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -90,8 +99,14 @@ class ConsoleStore:
     def add_project(self, project: dict[str, Any]) -> None:
         with self._lock, self._connect() as conn:
             conn.execute(
-                "INSERT INTO projects(id,name,runtime_name,problem,created_at) VALUES(?,?,?,?,?)",
-                (project["id"], project["name"], project["runtime_name"], project["problem"], project["created_at"]),
+                "INSERT INTO projects(id,name,runtime_name,problem,roles,worker_model,max_parallel_workers,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    project["id"], project["name"], project["runtime_name"], project["problem"],
+                    project.get("roles") or "high:3,xhigh:4",
+                    project.get("worker_model") or project.get("model"),
+                    int(project.get("max_parallel_workers") or 1),
+                    project["created_at"],
+                ),
             )
 
     def project(self, project_id: str) -> dict[str, Any] | None:

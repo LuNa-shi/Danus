@@ -23,6 +23,7 @@ service passes ``DANUS_VERIFY_MODEL``; the renderers pass
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from pathlib import Path
@@ -39,7 +40,7 @@ DEFAULT_EFFORT = "xhigh"
 def resolve_bin() -> str:
     """Resolve the codex binary at CALL time. Precedence:
       1. ``DANUS_CODEX_BIN`` env,
-      2. ``<repo>/bin/codex`` wrapper if it exists,
+      2. provisioned ``<repo>/bin/codex`` wrapper,
       3. ``shutil.which("codex")``,
       4. the bare string ``"codex"`` (so a missing binary raises a clear
          FileNotFoundError at exec time, not import time).
@@ -54,7 +55,8 @@ def resolve_bin() -> str:
             return override
         return shutil.which(override) or override
     wrapper = _REPO_ROOT / "bin" / "codex"
-    if wrapper.exists():
+    runtime_env = _REPO_ROOT / "runtime" / "runtime.env"
+    if wrapper.exists() and runtime_env.is_file():
         return str(wrapper)
     which = shutil.which("codex")
     if which:
@@ -94,7 +96,7 @@ def subprocess_env(codex_bin: str) -> Dict[str, str]:
     """
     env = os.environ.copy()
     if os.path.dirname(codex_bin):
-        codex_dir = os.path.dirname(os.path.abspath(codex_bin))
+        codex_dir = str(Path(codex_bin).resolve().parent)
         if codex_dir and codex_dir != ".":
             existing = env.get("PATH", "")
             parts = existing.split(os.pathsep) if existing else []
@@ -111,9 +113,28 @@ def exec_cmd(codex_bin: str, model: str, effort: str, *tail: str) -> List[str]:
     verbatim (each site keeps its own exact tail: sandbox flags, ``-C`` home,
     MCP ``-c`` injection, output path, the ``-`` stdin sentinel, the prompt, …).
     """
-    return [
-        codex_bin, "exec",
+    command = [codex_bin, "exec"]
+    provider_base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("CODEX_API_BASE_URL")
+    provider_key_env = (
+        "OPENAI_API_KEY" if os.environ.get("OPENAI_API_KEY")
+        else "DANUS_CODEX_API_KEY" if os.environ.get("DANUS_CODEX_API_KEY")
+        else None
+    )
+    if provider_base_url and provider_key_env:
+        provider_name = "danus_direct"
+        provider_config = f"model_providers.{provider_name}={{" + ",".join([
+            f"name={json.dumps('Danus Direct API')}",
+            f"base_url={json.dumps(provider_base_url)}",
+            f"env_key={json.dumps(provider_key_env)}",
+            f"wire_api={json.dumps('responses')}",
+        ]) + "}"
+        command.extend([
+            "--config", f'model_provider="{provider_name}"',
+            "--config", provider_config,
+        ])
+    command.extend([
         "--model", model,
         "--config", f'model_reasoning_effort="{effort}"',
         *tail,
-    ]
+    ])
+    return command

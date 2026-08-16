@@ -1,0 +1,349 @@
+"""Static Web Console regressions for layout and worker observability."""
+from __future__ import annotations
+
+from pathlib import Path
+
+
+STATIC = Path(__file__).resolve().parents[1] / "static"
+
+
+def _asset(name: str) -> str:
+    return (STATIC / name).read_text(encoding="utf-8")
+
+
+def test_desktop_layout_prioritizes_main_conversation_width():
+    css = _asset("style.css")
+
+    assert "--project-rail-width: clamp(200px, 12vw, 232px);" in css
+    assert "--worker-rail-width: clamp(224px, 14vw, 260px);" in css
+    assert "--conversation-max: 1180px;" in css
+    assert "grid-template-columns: minmax(0, 1fr) 7px var(--worker-rail-width)" in css
+    assert "width: min(100%, var(--conversation-max))" in css
+    assert "width: var(--project-rail-width); min-width: 0; max-width: var(--project-rail-width)" in css
+    assert "height: 100%; min-height: 100dvh" in css
+
+    # Regressions from the old narrow center-column bottleneck.
+    assert "width: min(100%, 820px)" not in css
+    assert "max-width: min(100%, 730px)" not in css
+
+
+def test_worker_observability_is_structured_and_uses_markdown_transcripts():
+    app = _asset("app.js")
+    css = _asset("style.css")
+
+    for token in (
+        "function workerCurrentAction",
+        "function workerRoundLogGroups",
+        "worker-card-action",
+        "worker-card-fields",
+        "worker-state-panel",
+        "worker-checkpoint",
+        "worker-metadata",
+        "metadataWasOpen",
+        "local_memory_count",
+        "renderWorkerRoundTranscript(groups, selectedRound, worker)",
+    ):
+        assert token in app
+
+    for token in (
+        "function latestWorkerEvent",
+        "function isMeaningfulWorkerEvent",
+        "Latest event",
+        "worker-card-latest",
+    ):
+        assert token not in app
+    assert ".worker-card-latest" not in css
+
+    assert "function renderTranscript" in app
+    assert '["exec", "apply patch"].includes(lower)' in app
+    assert "/^(web search:|patch:\\s)/i" in app
+    assert "renderMarkdown(block.text)" in app
+    assert ".map(normalizeLogLine)" in app
+    assert ".filter(Boolean)" in app
+    assert "<code>${esc(line)}</code>" not in app
+    assert ".worker-state.terminal" in css
+    assert ".worker-checkpoint" in css
+    assert ".worker-metadata" in css
+    assert ".trace-markdown" in css
+
+
+def test_markdown_tables_render_as_safe_structured_tables():
+    app = _asset("app.js")
+    css = _asset("style.css")
+
+    assert "function markdownTableCells" in app
+    assert "function isMarkdownTableDivider" in app
+    assert 'class="markdown-table-wrap"' in app
+    assert "<table><thead><tr>" in app
+    assert "tableHead.map((cell) => `<th>${inlineMarkdown(cell)}</th>`)" in app
+    assert ".markdown-table-wrap table" in css
+    assert ".markdown-table-wrap th" in css
+
+
+def test_fact_graph_loads_exact_local_cytoscape_distribution_and_license():
+    html = _asset("index.html")
+    app = _asset("app.js")
+    distribution = _asset("vendor/cytoscape/3.34.0/cytoscape.min.js")
+    license_text = _asset("vendor/cytoscape/3.34.0/LICENSE")
+    package_config = (STATIC.parents[2] / "pyproject.toml").read_text(encoding="utf-8")
+
+    local_script = '<script src="/static/vendor/cytoscape/3.34.0/cytoscape.min.js"></script>'
+    assert local_script in html
+    assert html.index(local_script) < html.index('<script src="/static/app.js"></script>')
+    assert "https://unpkg.com" not in html
+    assert "https://cdn.jsdelivr.net" not in html
+    assert 'style="' not in app
+    assert "3.34.0" in distribution
+    assert len(distribution) > 400_000
+    assert "The Cytoscape Consortium" in license_text
+    assert "Permission is hereby granted, free of charge" in license_text
+    assert '"static/vendor/cytoscape/3.34.0/*.js"' in package_config
+    assert '"static/vendor/cytoscape/3.34.0/LICENSE"' in package_config
+
+
+def test_fact_graph_maps_real_directed_data_with_deterministic_numbering_and_controls():
+    app = _asset("app.js")
+    css = _asset("style.css")
+
+    for token in (
+        "function renderFacts",
+        "function pendingFactVerifications",
+        "function factNodeOrder",
+        "function numberedFacts",
+        "function factGraphElements",
+        'group: "nodes"',
+        'group: "edges"',
+        "source: edge.source, target: edge.target",
+        'visibleNumber: `F${String(index + 1).padStart(digits, "0")}`',
+        'label: `${visibleNumber} · D${depth}',
+        'name: "breadthfirst"',
+        "directed: true",
+        'state.factCy.on("tap", "node"',
+        'data-fact-control="zoom-in"',
+        'data-fact-control="zoom-out"',
+        'data-fact-control="fit"',
+        'data-fact-control="reset-layout"',
+        "fact-overview",
+        "个 Fact 正在验证",
+    ):
+        assert token in app
+    assert ".insight-card-fact" in css
+    assert ".insight-card[open] { grid-column: 1 / -1" in css
+    assert ".fact-graph-canvas" in css
+    assert ".fact-graph-controls" in css
+    assert ".fact-legend" in css
+    assert ".fact-pipeline" in css
+
+    # The prior vertically stacked disclosure list is gone.
+    assert '<details class="fact-node">' not in app
+    assert ".fact-node-body" not in css
+
+
+def test_fact_inspector_feedback_and_accessible_real_node_navigation():
+    app = _asset("app.js")
+    css = _asset("style.css")
+
+    for token in (
+        "function factInspectorMarkup",
+        "renderMarkdown(node.statement)",
+        "renderMarkdown(node.proof)",
+        "renderMarkdown(node.intuition)",
+        "glossary_introduces",
+        "factReferencesMarkup(references)",
+        "Predecessor facts",
+        'data-fact-select="${esc(id)}"',
+        "Immutable ID",
+        "向 Main Agent 反馈",
+        "复制引用",
+        "function factFeedbackPrefix",
+        "不可变 ID：${entry.node.id}",
+        'const composer = $("message")',
+        "composer.focus()",
+        "navigator.clipboard.writeText(reference)",
+        'id="fact-node-picker"',
+        'role="application" tabindex="0"',
+        "handleFactGraphKeydown",
+    ):
+        assert token in app
+
+    assert ".fact-inspector" in css
+    assert ".fact-inspector-body" in css
+    assert ".fact-predecessor-chip" in css
+    assert ".fact-glossary" in css
+    assert ".fact-references" in css
+    assert ".sr-only" in css
+    assert "return `关于 ${factReferenceText(factId)}的反馈：\\n`;" in app
+
+
+def test_fact_graph_refresh_preserves_signature_selection_and_has_readable_fallback():
+    app = _asset("app.js")
+    css = _asset("style.css")
+
+    for token in (
+        "factGraphSignature: null",
+        "selectedFactId: null",
+        "function factGraphSignature",
+        "signature === state.factGraphSignature",
+        "updateFactPipeline(verifying, verifyingCount)",
+        "const retainedSelection = state.selectedFactId",
+        "state.selectedFactId = retainedSelection",
+        "function syncFactSelection",
+        'selected.closedNeighborhood()',
+        'removeClass("is-selected is-neighbor is-dimmed")',
+        'typeof window.cytoscape !== "function"',
+        "function showFactGraphFallback",
+        'id="fact-graph-fallback"',
+        "下方保留全部真实 Fact 的可读列表与检查器",
+    ):
+        assert token in app
+
+    assert ".fact-fallback-list" in css
+    assert ".fact-fallback-node.is-selected" in css
+    assert ".fact-explorer" in css
+
+
+def test_shared_memory_and_verifier_pending_states_remain_observable():
+    app = _asset("app.js")
+    css = _asset("style.css")
+
+    for token in (
+        "function renderMemory",
+        "共享记忆",
+        "/memory`",
+        "last_error",
+        "consecutive_failures",
+        "next_retry_at",
+        "排队等待可用 API 槽位",
+        "还没有已验证 Fact",
+        "个 Fact 正在验证",
+    ):
+        assert token in app
+    assert ".memory-row" in css
+    assert ".memory-evidence" in css
+    assert ".fact-pipeline" in css
+
+
+def test_architecture_correct_main_agent_and_project_configuration_are_visible():
+    html = _asset("index.html")
+    app = _asset("app.js")
+    css = _asset("style.css")
+
+    for token in (
+        'id="project-rail-resizer"',
+        'id="max-parallel-workers"',
+        "Worker 模型",
+        "Main Agent / Strategy",
+    ):
+        assert token in html
+    for token in (
+        'api("/api/config")',
+        "function bindRailResizer",
+        "function renderMainAgentControl",
+        "STRATEGIC ORCHESTRATOR",
+        "master_guidance",
+        "mainAgentInitializationMessage",
+        "configuredStrategyTransport",
+        "不要调用 consult",
+        "max_parallel_workers",
+        "worker.assigned",
+        "/orchestration`",
+    ):
+        assert token in app
+    assert "danus:rail-widths:v1" in app
+    assert ".main-agent-control" in css
+    assert ".rail-resizer" in css
+    assert ".orchestration-warning" in css
+
+
+def test_worker_trace_separates_output_and_collapses_tool_calls():
+    app = _asset("app.js")
+    css = _asset("style.css")
+
+    for token in (
+        "function transcriptBlocks",
+        "function toolTitle",
+        "function renderWorkerMessage",
+        'class="message-row assistant worker-message',
+        'class="trace-tool',
+        'data-trace-id="',
+        "rememberDrawerView",
+        "openTools",
+        "followTail",
+        "followBottom ? trace.scrollHeight",
+    ):
+        assert token in app
+    assert "<details class=\"trace-tool" in app
+    assert ".worker-message .message-bubble" in css
+    assert ".trace-tool > summary" in css
+    assert ".trace-tool-body" in css
+
+
+def test_worker_round_history_is_complete_numeric_selectable_and_scroll_aware():
+    app = _asset("app.js")
+    css = _asset("style.css")
+
+    assert ".slice(-80)" not in app
+    assert "tail 80" not in app
+    for token in (
+        "function workerRoundLogGroups",
+        'String(item.name || "").match(/^round_(\\d+)\\.log$/)',
+        "groups.set(round, { round, entries: [], lines: [] })",
+        "group.lines.push(...(item.lines || []))",
+        "return [...groups.values()].sort((left, right) => left.round - right.round)",
+        "function latestWorkerRoundSelection",
+        "groups[groups.length - 1].round",
+        "const selectedRound = latestWorkerRoundSelection(workerName)",
+        "[selectedRound]: { scrollTop: 0, followTail: true, forceBottom: true, openTools: [] }",
+        'const roundTabs = [{ value: "all", label: "全部轮次" }',
+        'data-worker-round="${esc(tab.value)}"',
+        "function renderWorkerRoundTranscript",
+        'selectedRound === "all" ? groups : groups.filter',
+        'class="round-transcript-group" data-round="${esc(group.round)}"',
+        "第 ${esc(group.round)} 轮",
+        "function isTraceNearBottom",
+        "followTail: isTraceNearBottom(trace)",
+        "const followBottom = saved.forceBottom || saved.followTail",
+        "trace.scrollTop = followBottom ? trace.scrollHeight : Math.min(saved.scrollTop || 0",
+        "saved.forceBottom = false",
+    ):
+        assert token in app
+
+    for token in (
+        ".worker-round-tabs",
+        ".worker-round-tab.is-active",
+        ".round-transcript-group + .round-transcript-group",
+        ".round-transcript-heading",
+    ):
+        assert token in css
+
+
+def test_worker_panel_floats_over_unchanged_layout_and_preserves_direct_transcript():
+    app = _asset("app.js")
+    css = _asset("style.css")
+
+    assert "has-worker-panel" not in app
+    assert "has-worker-panel" not in css
+    assert ".project-view { position: relative;" in css
+    assert ".conversation-layout { display: grid; grid-template-columns: minmax(0, 1fr) 7px var(--worker-rail-width); width: 100%; height: 100%; }" in css
+    assert ".rail-resizer-right { grid-column: 2; grid-row: 1; }" in css
+    assert ".worker-rail { grid-column: 3; grid-row: 1; }" in css
+    assert ".worker-drawer { position: absolute; z-index: 30; top: 12px; right: 12px; bottom: 12px; display: flex; width: calc(50% - 18px);" in css
+    assert "border: 1px solid var(--line-strong); border-radius: 18px" in css
+    assert "box-shadow: 0 24px 70px rgba(30,45,33,.18); backdrop-filter: blur(18px)" in css
+    assert "grid-template-columns: minmax(0, 1fr) minmax(0, 1fr)" not in css
+    assert "const groups = workerRoundLogGroups(worker.worker)" in app
+    assert "renderWorkerRoundTranscript(groups, selectedRound, worker)" in app
+    assert "worker?.assigned === true" in app
+    assert 'kind: "assignment"' in app
+    assert "text: worker.task" in app
+    assert 'visible.unshift({ id: "assignment", kind: "assignment", text: worker.task })' in app
+    assert 'blocks.filter((block) => block.kind !== "user")' in app
+    assert 'renderWorkerMessage("main-agent", block.text, worker)' in app
+    assert 'renderWorkerMessage("worker", block.text, worker)' in app
+    assert 'fromMainAgent ? "Main Agent"' in app
+    assert 'fromMainAgent ? "Delegated task" : "Worker"' in app
+    assert '<div class="message-bubble">${renderMarkdown(text)}</div>' in app
+    assert '<div class="trace-list">${renderWorkerRoundTranscript(groups, selectedRound, worker)}</div>' in app
+    assert "还没有任务或运行记录。" in app
+    assert "Main Agent 分配任务或 Worker 开始运行后" in app
+    assert "Main Agent assignment" not in app

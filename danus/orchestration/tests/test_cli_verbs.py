@@ -283,9 +283,8 @@ def test_alive_permission_error_means_alive():
 
 
 def test_alive_zombie_is_dead():
-    """A child that exited but hasn't been reaped is a zombie; /proc reports state
-    'Z' and ``_alive`` must call it dead. We fork a child that exits immediately
-    and do NOT wait() it, so it lingers as a zombie we own."""
+    """A child that exited but hasn't been reaped is a zombie; procfs on Linux
+    or ``ps`` on macOS reports state Z and ``_alive`` must call it dead."""
     import subprocess
     import time
     # 'true' exits at once; without wait() it becomes a zombie child of us.
@@ -295,15 +294,22 @@ def test_alive_zombie_is_dead():
         pid = proc.pid
         def is_zombie():
             try:
-                stat = Path(f"/proc/{pid}/stat").read_text()
-                return stat.rsplit(")", 1)[1].split()[0] == "Z"
-            except (OSError, IndexError):
+                proc_stat = Path(f"/proc/{pid}/stat")
+                if proc_stat.is_file():
+                    stat = proc_stat.read_text()
+                    return stat.rsplit(")", 1)[1].split()[0] == "Z"
+                state = subprocess.run(
+                    ["ps", "-o", "stat=", "-p", str(pid)],
+                    capture_output=True, text=True, timeout=1, check=False,
+                ).stdout.strip()
+                return state.startswith("Z")
+            except (OSError, IndexError, subprocess.SubprocessError):
                 return False
         end = time.time() + 5
         while time.time() < end and not is_zombie():
             time.sleep(0.02)
         assert is_zombie(), "child did not become a zombie"
-        assert cli._alive(pid) is False              # /proc state 'Z' => dead
+        assert cli._alive(pid) is False              # zombie state => dead
     finally:
         proc.wait()                                   # reap it
 
@@ -335,8 +341,16 @@ def test_worker_status_working_and_dead_labels(tmp: Path):
         import time
         wl.pid.write_text(str(os.getpid()))
         wl.status.write_text(json.dumps(
-            {"state": "running", "round": 2, "round_started_at": time.time()}))
-        assert cli.worker_status(wl)["label"] == "working"
+            {"state": "retrying", "round": 2, "round_started_at": time.time(),
+             "last_rc": 1, "last_error": "API rate limited (429)",
+             "consecutive_failures": 2, "next_retry_at": time.time() + 30}))
+        working = cli.worker_status(wl)
+        assert working["label"] == "working"
+        assert working["age_s"] is not None and working["age_s"] < 2
+        assert working["last_rc"] == 1
+        assert working["last_error"] == "API rate limited (429)"
+        assert working["consecutive_failures"] == 2
+        assert working["next_retry_at"] is not None
         # not alive + unknown terminal state => 'dead'
         wl.pid.write_text("2000000000")
         wl.status.write_text(json.dumps({"state": "weird", "round": 3}))
@@ -345,6 +359,16 @@ def test_worker_status_working_and_dead_labels(tmp: Path):
         # not alive + recognized terminal state => that state as label
         wl.status.write_text(json.dumps({"state": "deadline", "round": 3}))
         assert cli.worker_status(wl)["label"] == "deadline"
+
+
+def test_worker_status_includes_persisted_configuration(tmp: Path):
+    with _project_env(tmp):
+        cli.do_new("P", roles="xhigh:1", model="gpt-test")
+        wl = _wl("P", "xhigh")
+        status = cli.worker_status(wl)
+        assert status["role"] == "xhigh"
+        assert status["reasoning_effort"] == "xhigh"
+        assert status["model"] == "gpt-test"
 
 
 # --------------------------------------------------------------------------- #

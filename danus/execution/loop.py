@@ -20,10 +20,12 @@ Env (all optional; tests inject these):
   DANUS_ROUND_HARD_TIMEOUT   per-round hard timeout, seconds (default 14400 = 4h)
   DANUS_MAX_ROUNDS           round backstop, 0 = unlimited (default 0)
   DANUS_MAX_CONSEC_FAILURES  bail after this many consecutive failed rounds (default 5)
+  DANUS_MAX_PARALLEL_WORKERS fallback concurrent worker-round capacity per project
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -119,6 +121,96 @@ def _parse_last_fact_id(log_path: Path) -> Optional[str]:
     return ids[-1] if ids else None
 
 
+def _positive_int(value: object) -> int | None:
+    try:
+        parsed = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _project_max_parallel_workers(project_dir: Path) -> int | None:
+    meta = project_dir / "project.json"
+    if meta.is_file() and not meta.is_symlink():
+        try:
+            data = json.loads(meta.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            data = {}
+        if isinstance(data, dict):
+            configured = _positive_int(data.get("max_parallel_workers"))
+            if configured is not None:
+                return configured
+    return _positive_int(os.environ.get("DANUS_MAX_PARALLEL_WORKERS"))
+
+
+def _slot_paths(project_dir: Path, capacity: int) -> list[Path]:
+    if capacity == 1:
+        return [project_dir / ".worker-provider.lock"]
+    lock_dir = project_dir / ".worker-provider.lock.d"
+    lock_dir.mkdir(mode=0o700, exist_ok=True)
+    if lock_dir.is_symlink() or not lock_dir.is_dir():
+        raise OSError("worker slot lock path is not a directory")
+    return [lock_dir / f"slot-{idx}.lock" for idx in range(capacity)]
+
+
+def _try_acquire_slot(paths: list[Path]) -> object | None:
+    for path in paths:
+        lock = open(path, "a+")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return lock
+        except BlockingIOError:
+            lock.close()
+    return None
+
+
+def _acquire_worker_slot(wl: L.WorkerLayout) -> tuple[object | None, bool]:
+    """Optionally wait for one of the project's expensive-provider slots."""
+    capacity = _project_max_parallel_workers(wl.project_dir)
+    if capacity is None:
+        return None, True
+    paths = _slot_paths(wl.project_dir, capacity)
+    while True:
+        lock = _try_acquire_slot(paths)
+        if lock is not None:
+            return lock, True
+        write_status(
+            wl, state="queued", queue_reason="waiting for API slot",
+            queued_at=time.time(), slot_capacity=capacity,
+        )
+        if wl.stop.exists() or _deadline_passed(wl.project_dir):
+            return None, False
+        time.sleep(1)
+
+
+def _release_worker_slot(lock: object | None) -> None:
+    if lock is None:
+        return
+    fcntl.flock(lock, fcntl.LOCK_UN)  # type: ignore[arg-type]
+    lock.close()  # type: ignore[attr-defined]
+
+
+def _round_error(log_path: Path, rc: int) -> Optional[str]:
+    """Return a compact operator-facing reason for a failed Codex round."""
+    if rc in (0, 124):
+        return None
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")[-65536:]
+    except OSError:
+        text = ""
+    if "429 Too Many Requests" in text:
+        return "API rate limited (429)"
+    if "MCP startup failed" in text or "handshaking with MCP server failed" in text:
+        return "Danus gateway unavailable"
+    if "codex binary not found" in text or rc == 127:
+        return "codex binary not found"
+    for line in reversed(text.splitlines()):
+        clean = line.strip()
+        if clean.startswith("ERROR:"):
+            return clean.removeprefix("ERROR:").strip()[:240]
+    return f"Codex round exited with code {rc}"
+
+
 # --- one round ------------------------------------------------------------- #
 
 class _Child:
@@ -211,7 +303,11 @@ def main(worker_dir: str) -> int:
 
     signal.signal(signal.SIGTERM, _on_term)
 
-    write_status(wl, state="running", round=0, started_at=time.time())
+    write_status(
+        wl, state="running", round=0, started_at=time.time(),
+        error=None, last_error=None, consecutive_failures=0,
+        next_retry_at=None, last_rc=None,
+    )
     rnd = 0
     consec_fail = 0
     try:
@@ -227,25 +323,44 @@ def main(worker_dir: str) -> int:
                 write_status(wl, state="max_rounds")
                 break
 
+            slot, can_run = _acquire_worker_slot(wl)
+            if not can_run:
+                continue
             rnd += 1
             log_path = wl.logs / f"round_{rnd}.log"
-            write_status(wl, state="running", round=rnd, round_started_at=time.time())
-            rc = run_round(wl, role, prompt, log_path, hard_timeout)
             write_status(
-                wl, state="idle", round=rnd, last_round_at=time.time(),
+                wl, state="running", round=rnd, round_started_at=time.time(),
+                queue_reason=None, queued_at=None,
+            )
+            try:
+                rc = run_round(wl, role, prompt, log_path, hard_timeout)
+            finally:
+                _release_worker_slot(slot)
+            last_error = _round_error(log_path, rc)
+            consec_fail = consec_fail + 1 if rc not in (0, 124) else 0
+            retry_delay = 0.0
+            if last_error and beat > 0:
+                retry_delay = min(300.0, beat * (2 ** max(0, consec_fail - 1)))
+                if "429" in last_error:
+                    retry_delay = max(30.0, retry_delay)
+            write_status(
+                wl, state="retrying" if last_error else "idle", round=rnd,
+                last_round_at=time.time(),
                 last_rc=rc, last_fact_id=_parse_last_fact_id(log_path),
+                last_error=last_error, consecutive_failures=consec_fail,
+                next_retry_at=time.time() + retry_delay if retry_delay else None,
             )
 
             if rc == 127:                    # codex missing — do not spin
                 write_status(wl, state="error", error="codex binary not found")
                 return 127
-            consec_fail = consec_fail + 1 if rc not in (0, 124) else 0
             if max_fail and consec_fail >= max_fail:
                 write_status(wl, state="error", error=f"{consec_fail} consecutive failed rounds")
                 return 1
 
-            if beat > 0:
-                time.sleep(beat)
+            delay = retry_delay or beat
+            if delay > 0:
+                time.sleep(delay)
     finally:
         _cleanup_pid(wl)
     return 0

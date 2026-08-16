@@ -1,2 +1,128 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Danus Web Console</title><link rel="stylesheet" href="/static/style.css"></head><body><header><h1>Danus Web Console</h1><span id="auth-state">未登录</span><button id="logout" hidden>退出</button></header><main><section id="login-panel"><h2>登录</h2><form id="login-form"><input id="password" type="password" autocomplete="current-password" placeholder="应用密码" required><button>登录</button></form><p id="login-error" class="error"></p></section><section id="console" hidden><aside><h2>Projects</h2><form id="project-form"><input id="project-name" placeholder="Project 名称" required><textarea id="problem" placeholder="数学问题" required></textarea><input id="roles" value="high:1,xhigh:1" aria-label="Worker roster"><button>创建 Project</button></form><ul id="project-list"></ul></aside><section id="project-view"><p>请选择一个 Project。</p></section></section></main><script src="/static/app.js"></script></body></html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f7f8f5">
+  <title>Danus · Agent workspace</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-lockup">
+        <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+        <div>
+          <strong>danus</strong>
+          <span>agent workspace</span>
+        </div>
+      </div>
+      <div class="topbar-context">
+        <span class="eyebrow">研究工作台</span>
+        <span id="topbar-project-name">未选择项目</span>
+      </div>
+      <div class="topbar-actions">
+        <span id="auth-state" class="connection-state"><i></i>未登录</span>
+        <button id="logout" class="text-button" hidden>退出</button>
+      </div>
+    </header>
+
+    <section id="login-panel" class="login-screen">
+      <div class="login-card">
+        <div class="login-orbit" aria-hidden="true"><span></span><span></span><span></span></div>
+        <p class="eyebrow">DANUS CONTROL PLANE</p>
+        <h1>让一群 agent<br><em>一起把问题想清楚。</em></h1>
+        <p class="login-copy">进入项目工作台，和 Main Agent 对话，并实时观察每个 worker 的推理进度。</p>
+        <form id="login-form" class="login-form">
+          <label for="password">应用密码</label>
+          <div class="input-with-action">
+            <input id="password" type="password" autocomplete="current-password" placeholder="输入密码" required>
+            <button type="submit" class="primary-button">进入工作台 <span aria-hidden="true">↗</span></button>
+          </div>
+        </form>
+        <p id="login-error" class="form-error" role="alert"></p>
+        <div class="login-footnote"><span class="status-dot online"></span>本地安全连接 · 项目数据只保存在你的运行环境</div>
+      </div>
+    </section>
+
+    <section id="console" class="console-shell" hidden>
+      <aside class="sidebar" aria-label="项目导航">
+        <button id="new-project" class="new-project-button"><span class="plus-icon">+</span><span>新建项目</span><kbd>⌘ K</kbd></button>
+        <div class="sidebar-section">
+          <div class="sidebar-section-heading"><span>项目</span><span id="project-count" class="count-badge">0</span></div>
+          <div id="project-list" class="project-list" role="list"></div>
+        </div>
+        <div class="sidebar-tip">
+          <span class="tip-icon">✦</span>
+          <div><strong>Danus swarm</strong><p>主 agent 负责方向，workers 负责证明。</p></div>
+        </div>
+        <div class="sidebar-footer">
+          <div class="profile-chip"><span class="profile-avatar">L</span><div><strong>本地操作者</strong><small>workspace owner</small></div><span class="profile-menu">···</span></div>
+        </div>
+      </aside>
+
+      <div id="project-rail-resizer" class="rail-resizer rail-resizer-left" role="separator" aria-label="调整项目侧栏宽度" aria-orientation="vertical" tabindex="0"></div>
+
+      <main id="project-view" class="project-view" aria-live="polite">
+        <div class="empty-project-state">
+          <div class="empty-mark"><span></span><span></span><span></span></div>
+          <p class="eyebrow">WELCOME TO DANUS</p>
+          <h1>从一个问题开始。</h1>
+          <p>创建一个项目，让 Main Agent 拆解方向，再把具体工作交给一组可观测的 workers。</p>
+          <form id="starter-form" class="starter-composer">
+            <textarea id="starter-message" placeholder="比如：帮我研究这个猜想，先找出三个可能的证明方向……" required></textarea>
+            <div class="starter-composer-footer"><span>直接开始对话，Danus 会自动创建项目</span><button type="submit" class="primary-button">开始协作 <span aria-hidden="true">↗</span></button></div>
+          </form>
+          <button id="start-empty-project" class="link-button" type="button">或打开完整项目配置</button>
+        </div>
+      </main>
+    </section>
+  </div>
+
+  <div id="project-modal" class="modal-backdrop" hidden>
+    <section class="project-modal" role="dialog" aria-modal="true" aria-labelledby="project-modal-title">
+      <div class="modal-header">
+        <div><p class="eyebrow">NEW PROJECT</p><h2 id="project-modal-title">配置一个新的研究项目</h2></div>
+        <button id="modal-close" class="close-button" type="button" aria-label="关闭">×</button>
+      </div>
+      <form id="project-form" class="project-form">
+        <div class="form-section">
+          <label for="project-name">项目名称</label>
+          <input id="project-name" placeholder="例如：riemann-boundary" required>
+          <p class="field-help">项目标识使用英文、数字、短横线或下划线；具体问题可以用中文描述。</p>
+        </div>
+        <div class="form-section">
+          <label for="problem">你想解决什么问题？</label>
+          <textarea id="problem" placeholder="描述目标、已知条件，或者直接把你现在的困惑交给 Main Agent。" required></textarea>
+        </div>
+        <div class="form-section">
+          <div class="label-row"><label>Worker roster</label><span class="field-help">可以随时从右侧观察</span></div>
+          <div class="worker-config-list">
+            <div class="worker-config-row">
+              <span class="config-avatar high-avatar">H</span>
+              <div class="config-copy"><strong>探索 worker</strong><span>快速试探、找反例、收集线索</span></div>
+              <label class="count-control"><span>数量</span><input id="high-count" type="number" min="0" max="9" value="1"></label>
+            </div>
+            <div class="worker-config-row">
+              <span class="config-avatar xhigh-avatar">X</span>
+              <div class="config-copy"><strong>证明 worker</strong><span>深度推理、补全 lemma、反复验证</span></div>
+              <label class="count-control"><span>数量</span><input id="xhigh-count" type="number" min="0" max="9" value="1"></label>
+            </div>
+          </div>
+          <input id="roles" type="hidden" value="high:1,xhigh:1">
+        </div>
+        <div class="form-section form-grid project-runtime-grid">
+          <div><label for="model">Worker 模型</label><select id="model"><option value="">正在读取服务端模型…</option></select><p id="model-help" class="field-help">模型目录由服务端安全读取，浏览器不会接触 API Key。</p></div>
+          <div><label for="max-parallel-workers">同时运行</label><select id="max-parallel-workers"><option value="1">1 个 worker</option><option value="2">2 个 workers</option><option value="4">4 个 workers</option><option value="8">8 个 workers</option></select><p class="field-help">其余 worker 保留上下文并排队，不改变 Main Agent 的分工。</p></div>
+          <div><label>Main Agent / Strategy</label><div id="main-agent-mode" class="mode-preview"><span class="status-dot online"></span>读取服务器配置…</div><p class="field-help">Main Agent 负责策略和派工；Worker 模型与策略模型是不同层。</p></div>
+        </div>
+        <div class="modal-actions"><button id="cancel-project" type="button" class="secondary-button">取消</button><button type="submit" class="primary-button">创建项目 <span aria-hidden="true">↗</span></button></div>
+      </form>
+    </section>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/static/vendor/cytoscape/3.34.0/cytoscape.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -126,6 +126,18 @@ def test_parse_fact_frontmatter_line_without_colon():
     assert fact["fact_id"] == "f9"  # the colonless frontmatter line is skipped, not fatal
 
 
+def test_parse_fact_exposes_glossary_and_external_references():
+    txt = (
+        "---\nfact_id: f10\nproblem_id: P\nauthor: w\npredecessors: []\n"
+        "glossary_introduces:\n  X: a smooth projective variety\n  h: an ample class\n"
+        'external_refs: [{"key":"Voi02","title":"Hodge Theory","cited_for":"Hard Lefschetz"}]\n'
+        "---\n## statement\nS\n## proof\nP\n"
+    )
+    fact = app._parse_fact(txt)
+    assert fact["glossary_introduces"] == {"X": "a smooth projective variety", "h": "an ample class"}
+    assert fact["external_refs"] == [{"key": "Voi02", "title": "Hodge Theory", "cited_for": "Hard Lefschetz"}]
+
+
 def test_load_jsonl_permission_denied_returns_empty():
     import stat
     with tempfile.TemporaryDirectory() as d:

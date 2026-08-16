@@ -1,7 +1,7 @@
 """``danus`` — the main agent's control surface over codex workers.
 
     danus list   [--json]
-    danus new    <project> [--roles high:3,xhigh:4] [--model M]
+    danus new    <project> [--roles high:3,xhigh:4] [--model M] [--max-parallel-workers N]
     danus assign <project>/<worker> (--task "…" | --file P | --stdin)
     danus finalize <project> [--paper <paper_id>] [<fact_id> ...]
     danus start  <project>[/<worker>]
@@ -26,6 +26,7 @@ import fcntl
 import json
 import os
 import signal
+import subprocess
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -63,13 +64,22 @@ def _alive(pid: Optional[int]) -> bool:
     except PermissionError:
         return True  # exists but not ours
     # The pid exists — but a zombie (killed, not yet reaped by its parent) is
-    # effectively dead. Linux /proc tells us the process state.
+    # effectively dead. Prefer Linux /proc, then use portable ``ps`` on macOS
+    # and other Unix hosts that do not mount procfs.
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
         state = stat.rsplit(")", 1)[1].split()[0]  # field after "(comm)"
         return state != "Z"
     except (OSError, IndexError):
-        return True
+        try:
+            result = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=1, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return True
+        state = result.stdout.strip().split(maxsplit=1)[0] if result.stdout.strip() else ""
+        return not state.startswith("Z")
 
 
 def _read_status(wl: L.WorkerLayout) -> Dict:
@@ -80,6 +90,49 @@ def _read_status(wl: L.WorkerLayout) -> Dict:
         return json.loads(sp.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return {}
+
+
+def _read_worker_config(wl: L.WorkerLayout) -> Dict:
+    """Expose persisted worker role settings to observability clients."""
+    config: Dict[str, str] = {}
+    try:
+        if wl.role.exists():
+            for line in wl.role.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    config[key.strip()] = value.strip()
+    except OSError:
+        pass
+    try:
+        project_meta = wl.project_dir / "project.json"
+        if project_meta.exists():
+            meta = json.loads(project_meta.read_text(encoding="utf-8"))
+            config.setdefault("PROJECT_MODEL", str(meta.get("model") or ""))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return config
+
+
+def _task_assigned(text: str) -> bool:
+    normalized = " ".join(text.strip().lower().split())
+    if not normalized:
+        return False
+    return not (
+        normalized.startswith("# task")
+        and "(unassigned" in normalized
+        and "danus assign" in normalized
+    )
+
+
+def _read_task_state(wl: L.WorkerLayout) -> Dict:
+    try:
+        if wl.task.is_symlink() or not wl.task.is_file():
+            return {"task": "", "assigned": False}
+        task = wl.task.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {"task": "", "assigned": False}
+    return {"task": task, "assigned": _task_assigned(task)}
 
 
 # --------------------------------------------------------------------------- #
@@ -207,7 +260,11 @@ def worker_status(wl: L.WorkerLayout) -> Dict:
     st = _read_status(wl)
     state = st.get("state", "—")
     now = time.time()
-    last = st.get("last_round_at") or st.get("round_started_at") or st.get("updated_at")
+    # While a round is active, age means time in the current round. A stale
+    # last_round_at from a previous Run must not make a freshly restarted worker
+    # look many minutes old.
+    last = (st.get("round_started_at") if state == "running"
+            else st.get("last_round_at") or st.get("round_started_at") or st.get("updated_at"))
     age = (now - last) if isinstance(last, (int, float)) else None
 
     if alive:
@@ -221,10 +278,24 @@ def worker_status(wl: L.WorkerLayout) -> Dict:
     else:
         label = state if state in ("stopped", "deadline", "max_rounds", "error",
                                    "terminated", "created") else "dead"
+    config = _read_worker_config(wl)
+    task_state = _read_task_state(wl)
     return {
         "worker": wl.name, "pid": pid, "alive": alive, "state": state,
         "round": st.get("round", 0), "age_s": round(age, 1) if age is not None else None,
         "last_fact_id": st.get("last_fact_id"), "label": label,
+        "task": task_state["task"],
+        "assigned": task_state["assigned"],
+        "last_rc": st.get("last_rc"),
+        "last_error": st.get("last_error") or st.get("error"),
+        "consecutive_failures": st.get("consecutive_failures", 0),
+        "next_retry_at": st.get("next_retry_at"),
+        "queue_reason": st.get("queue_reason"),
+        "queued_at": st.get("queued_at"),
+        "role": config.get("ROLE") or wl.name,
+        "model": config.get("MODEL") or config.get("PROJECT_MODEL") or None,
+        "reasoning_effort": config.get("REASONING_EFFORT") or config.get("ROLE") or None,
+        "author": config.get("DANUS_AUTHOR") or wl.name,
     }
 
 
@@ -342,6 +413,8 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("project")
     n.add_argument("--roles", default="high:3,xhigh:4", help="e.g. high:3,xhigh:4 (default)")
     n.add_argument("--model", default=None)
+    n.add_argument("--max-parallel-workers", type=int, default=None,
+                   help="project resource limit for concurrent worker rounds")
 
     a = sub.add_parser("assign", help="write a worker's per-round TASK.md")
     a.add_argument("target", help="<project>/<worker>")
@@ -378,7 +451,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         rows = do_list()
         print(json.dumps(rows, ensure_ascii=False, indent=2) if args.json else _fmt_list(rows))
     elif args.cmd == "new":
-        r = do_new(args.project, roles=args.roles, model=args.model)
+        r = do_new(args.project, roles=args.roles, model=args.model,
+                   max_parallel_workers=args.max_parallel_workers)
         print(f"created {args.project} with {len(r['workers'])} workers: "
               f"{', '.join(r['workers'])}\n  {r['project_dir']}")
     elif args.cmd == "assign":

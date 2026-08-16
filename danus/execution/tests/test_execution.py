@@ -10,6 +10,7 @@ Runs standalone (``python -m danus.execution.tests.test_execution``) and pytest.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import tempfile
@@ -123,7 +124,7 @@ def test_do_new_supports_explicit_root(tmp: Path):
     with _project_env(tmp):
         explicit = tmp / "explicit"
         r = scaffold.do_new("P", roles="high:1", root=explicit)
-        assert Path(r["project_dir"]) == explicit / "P"
+        assert Path(r["project_dir"]) == (explicit / "P").resolve()
         assert (explicit / "P" / "workers" / "high" / "TASK.md").exists()
 
 
@@ -143,6 +144,7 @@ def test_do_new_verify_url_from_env(tmp: Path):
             scaffold.do_new("Q", roles="high:1")
         cfg = L.WorkerLayout(L.worker_dir("Q", "high")).codex_config.read_text()
         assert 'DANUS_VERIFY_URL = "http://127.0.0.1:9999/verify"' in cfg
+        assert f'PYTHONPATH = "{Path(scaffold.__file__).resolve().parents[2]}"' in cfg
 
 
 # --- loop helpers (pure) --------------------------------------------------- #
@@ -153,6 +155,48 @@ def test_parse_last_fact_id(tmp: Path):
     assert loop._parse_last_fact_id(log) == "fedcba9876543210"
     log.write_text("no facts here, and DEADBEEF is not 16 hex lower\n")
     assert loop._parse_last_fact_id(log) is None
+
+
+def test_round_error_classifies_rate_limit_and_gateway_failure(tmp: Path):
+    log = tmp / "round.log"
+    log.write_text("ERROR: exceeded retry limit, last status: 429 Too Many Requests\n")
+    assert loop._round_error(log, 1) == "API rate limited (429)"
+    log.write_text("MCP startup failed: handshaking with MCP server failed\n")
+    assert loop._round_error(log, 1) == "Danus gateway unavailable"
+    assert loop._round_error(log, 0) is None
+
+
+def test_serial_worker_slot_reports_queued_and_honors_stop(tmp: Path):
+    with _project_env(tmp):
+        scaffold.do_new("P", roles="high:1")
+        wl = L.WorkerLayout(L.worker_dir("P", "high"))
+        provider_lock = open(wl.project_dir / ".worker-provider.lock", "w")
+        fcntl.flock(provider_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        wl.stop.touch()
+        try:
+            with _env(DANUS_MAX_PARALLEL_WORKERS="1"):
+                slot, can_run = loop._acquire_worker_slot(wl)
+            assert slot is None and can_run is False
+            assert json.loads(wl.status.read_text())["state"] == "queued"
+        finally:
+            fcntl.flock(provider_lock, fcntl.LOCK_UN)
+            provider_lock.close()
+
+
+def test_project_parallel_capacity_overrides_process_fallback(tmp: Path):
+    with _project_env(tmp), _env(DANUS_MAX_PARALLEL_WORKERS="1"):
+        scaffold.do_new("P", roles="high:1,xhigh:1", max_parallel_workers=2)
+        project = L.project_dir("P")
+        assert loop._project_max_parallel_workers(project) == 2
+        paths = loop._slot_paths(project, 2)
+        first = loop._try_acquire_slot(paths)
+        second = loop._try_acquire_slot(paths)
+        try:
+            assert first is not None and second is not None
+            assert loop._try_acquire_slot(paths) is None
+        finally:
+            loop._release_worker_slot(second)
+            loop._release_worker_slot(first)
 
 
 def test_deadline_passed(tmp: Path):

@@ -37,7 +37,7 @@ write-paper = ["mcp"]                                     # danus.write_paper   
 human-summary = ["mcp"]                                   # danus.human_summary — human-summary MCP service
 verify = ["fastapi", "uvicorn", "pydantic"]         # danus.verify  — cold-start verifier HTTP service
 observability = ["fastapi", "uvicorn", "pydantic"]  # danus.observability — read-only dashboard
-web-console = ["fastapi", "uvicorn", "pydantic", "python-multipart"]      # danus.web_console — authenticated control plane
+web-console = ["mcp", "fastapi", "uvicorn", "pydantic", "python-multipart"]      # danus.web_console — control plane + project-scoped Main Agent tools
 strategy = ["openai", "anthropic"]                  # danus.strategy — API consult transports
 dev = ["pytest", "mcp", "fastapi", "uvicorn", "pydantic", "python-multipart", "openai", "anthropic"]  # full test suite (all modules)
 
@@ -46,4 +46,10 @@ include = ["danus*"]
 
 [tool.setuptools.package-data]
 "danus.core" = ["*.json"]
-"danus.web_console" = ["static/*.html", "static/*.js", "static/*.css"]
+"danus.web_console" = [
+    "static/*.html",
+    "static/*.js",
+    "static/*.css",
+    "static/vendor/cytoscape/3.34.0/*.js",
+    "static/vendor/cytoscape/3.34.0/LICENSE",
+]

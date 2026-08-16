@@ -1,11 +1,14 @@
 """Authenticated Web Console HTTP seam tests for the first vertical slice."""
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
 from starlette.testclient import TestClient
 
+from danus.execution import layout as L
+from danus.web_console.config import ProviderModelCatalog
 from danus.web_console.app import AppSettings, create_app
 from danus.web_console.security import hash_password
 
@@ -19,6 +22,7 @@ class FakeRuntime:
         self.statuses = {}
         self.deadlines = {}
         self.cleared_deadlines = []
+        self.configs = {}
 
     def project_context_dir(self, runtime_name):
         project = self.root / runtime_name
@@ -31,32 +35,59 @@ class FakeRuntime:
     def write_deadline(self, runtime_name, deadline):
         self.deadlines[runtime_name] = deadline
 
-    def create_project(self, runtime_name, problem, roles, model=None):
+    def create_project(self, runtime_name, problem, roles, model=None, max_parallel_workers=None):
         self.created.append((runtime_name, problem, roles, model))
         project = self.root / runtime_name
         project.mkdir(parents=True, exist_ok=True)
         (project / "PROBLEM.md").write_text(problem + "\n", encoding="utf-8")
-        self.statuses[runtime_name] = []
-        return {"runtime_name": runtime_name, "project_dir": str(project), "workers": []}
+        parsed = L.parse_roles(roles)
+        self.configs[runtime_name] = {
+            "roles": roles,
+            "model": model,
+            "worker_model": model,
+            "max_parallel_workers": max_parallel_workers or 1,
+        }
+        self.statuses[runtime_name] = [{
+            "worker": worker,
+            "alive": False,
+            "state": "created",
+            "round": 0,
+            "role": base,
+            "model": model,
+            "reasoning_effort": base,
+            "author": worker,
+            "task": "# Task\n\n(unassigned — the main agent writes your assignment here via `danus assign`; you read this file at the start of every round)\n",
+            "assigned": False,
+        } for worker, base in parsed]
+        return {"runtime_name": runtime_name, "project_dir": str(project), "workers": self.statuses[runtime_name]}
 
     def start_project(self, runtime_name):
         self.started.append(runtime_name)
-        self.statuses[runtime_name] = [{"worker": "high", "alive": True, "state": "running", "round": 1}]
+        self.statuses[runtime_name] = [
+            {**worker, "alive": True, "state": "running", "round": max(1, int(worker.get("round", 0)) + 1)}
+            for worker in self.statuses.get(runtime_name, [])
+        ]
         return {"workers": self.statuses[runtime_name]}
 
     def stop_project(self, runtime_name):
         self.stopped.append(runtime_name)
-        self.statuses[runtime_name] = [{"worker": "high", "alive": False, "state": "stopped", "round": 1}]
+        self.statuses[runtime_name] = [
+            {**worker, "alive": False, "state": "stopped"}
+            for worker in self.statuses.get(runtime_name, [])
+        ]
         return {"workers": self.statuses[runtime_name]}
 
     def status_project(self, runtime_name):
-        return {"workers": self.statuses.get(runtime_name, [])}
+        return {"config": self.configs.get(runtime_name, {}), "workers": self.statuses.get(runtime_name, [])}
 
     def logs_projection(self, runtime_name, worker=None, tail=200):
         return {"entries": [{"worker": worker or "high", "name": "loop.log", "lines": ["status"]}]}
 
     def fact_graph_projection(self, runtime_name):
         return {"nodes": [], "edges": [], "max_depth": 0}
+
+    def memory_projection(self, runtime_name):
+        return {"total": 0, "channels": []}
 
     def reports_projection(self, runtime_name):
         return {"files": []}
@@ -66,7 +97,22 @@ class FakeRuntime:
 
     def delete_project(self, runtime_name):
         self.statuses.pop(runtime_name, None)
+        self.configs.pop(runtime_name, None)
         return {"deleted": runtime_name}
+
+    def assign_all(self, runtime_name, *, task="do the assigned work"):
+        for worker in self.statuses.get(runtime_name, []):
+            worker["assigned"] = True
+            worker["task"] = task
+
+
+class FakeMemoryRuntime(FakeRuntime):
+    def __init__(self, root: Path):
+        super().__init__(root)
+        self.memory_entries = {}
+
+    def memory_projection(self, runtime_name):
+        return self.memory_entries.get(runtime_name, {"total": 0, "channels": []})
 
 
 def _app(tmp_path: Path):
@@ -147,6 +193,8 @@ def test_project_run_deadline_and_graceful_stop_are_scoped(tmp_path: Path):
             "/api/projects", json={"name": "B", "problem": "beta", "roles": "high:1"},
             headers={"X-CSRF-Token": csrf, "Origin": "https://testserver"},
         ).json()
+        runtime.assign_all(a["runtime_name"])
+        runtime.assign_all(b["runtime_name"])
         start = client.post(
             f"/api/projects/{a['id']}/runs", json={"duration_seconds": 43200},
             headers={"X-CSRF-Token": csrf, "Origin": "https://testserver"},
@@ -166,7 +214,10 @@ def test_project_run_deadline_and_graceful_stop_are_scoped(tmp_path: Path):
         assert stopped.json()["status"] == "stop_requested"
         assert runtime.stopped == [a["runtime_name"]]
         assert runtime.stopped != [b["runtime_name"]]
-        assert client.get(f"/api/projects/{b['id']}/runtime").json()["workers"] == []
+        b_workers = client.get(f"/api/projects/{b['id']}/runtime").json()["workers"]
+        assert len(b_workers) == 1
+        assert b_workers[0]["worker"] == "high"
+        assert b_workers[0]["alive"] is False
 
 
 def test_runtime_poll_reconciles_graceful_stop_to_terminal_run(tmp_path: Path):
@@ -175,12 +226,29 @@ def test_runtime_poll_reconciles_graceful_stop_to_terminal_run(tmp_path: Path):
         csrf = _login(client)
         headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
         project = client.post("/api/projects", json={"name": "A", "problem": "alpha", "roles": "high:1"}, headers=headers).json()
+        runtime.assign_all(project["runtime_name"])
         started = client.post(f"/api/projects/{project['id']}/runs", json={"duration_seconds": 3600}, headers=headers).json()
         assert client.get(f"/api/projects/{project['id']}/runs/{started['run_id']}").json()["status"] == "running"
         assert client.post(f"/api/projects/{project['id']}/runs/{started['run_id']}/stop", json={}, headers=headers).status_code == 202
         terminal = client.get(f"/api/projects/{project['id']}/runs/{started['run_id']}").json()
         assert terminal["status"] == "stopped"
         assert terminal["outcome"] == "graceful_stop"
+        assert terminal["stopped_at"] is not None
+
+
+def test_runtime_poll_reconciles_unexpected_worker_exit(tmp_path: Path):
+    app, runtime = _app(tmp_path)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
+        runtime.assign_all(project["runtime_name"])
+        started = client.post(f"/api/projects/{project['id']}/runs", json={"duration_seconds": 3600}, headers=headers).json()
+        client.get(f"/api/projects/{project['id']}/workers")
+        runtime.statuses[project["runtime_name"]] = [{"worker": "high", "alive": False, "state": "error", "round": 2, "assigned": True, "task": "do the assigned work"}]
+        client.get(f"/api/projects/{project['id']}/workers")
+        terminal = client.get(f"/api/projects/{project['id']}/runs/{started['run_id']}").json()
+        assert terminal["status"] == "stopped"
+        assert terminal["outcome"] == "worker_error"
         assert terminal["stopped_at"] is not None
 
 
@@ -191,6 +259,7 @@ def test_run_lookup_is_project_scoped(tmp_path: Path):
         headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
         a = client.post("/api/projects", json={"name": "A", "problem": "alpha", "roles": "high:1"}, headers=headers).json()
         b = client.post("/api/projects", json={"name": "B", "problem": "beta", "roles": "high:1"}, headers=headers).json()
+        runtime.assign_all(a["runtime_name"])
         run = client.post(f"/api/projects/{a['id']}/runs", json={"duration_seconds": 60}, headers=headers).json()
         assert client.get(f"/api/projects/{a['id']}/runs/{run['run_id']}").status_code == 200
         assert client.get(f"/api/projects/{b['id']}/runs/{run['run_id']}").status_code == 404
@@ -222,6 +291,7 @@ def test_runtime_start_failure_is_persisted_without_success_claim(tmp_path: Path
         csrf = _login(client)
         headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
         project = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
+        runtime.assign_all(project["runtime_name"])
         response = client.post(f"/api/projects/{project['id']}/runs", json={"duration_seconds": 60}, headers=headers)
         assert response.status_code == 502
         assert response.json() == {"detail": "project run could not be started"}
@@ -238,14 +308,37 @@ def test_real_runtime_adapter_keeps_two_project_contexts_isolated(tmp_path: Path
     cli.spawn_loop = lambda worker_dir: 999_999_999
     try:
         adapter = DanusRuntimeAdapter(tmp_path / "agents")
-        a = adapter.create_project("A", "alpha problem", "high:1")
-        b = adapter.create_project("B", "beta problem", "high:1")
+        a = adapter.create_project("A", "alpha problem", "high:1", max_parallel_workers=1)
+        b = adapter.create_project("B", "beta problem", "high:1", max_parallel_workers=1)
         assert (tmp_path / "agents" / "A" / "PROBLEM.md").read_text() == "alpha problem\n"
         assert (tmp_path / "agents" / "B" / "PROBLEM.md").read_text() == "beta problem\n"
         assert set(project["project"] for project in adapter.list_projects()) == {"A", "B"}
         assert a["project_dir"] != b["project_dir"]
-        assert adapter.status_project("A")["workers"][0]["worker"] == "high"
-        assert adapter.status_project("B")["workers"][0]["worker"] == "high"
+        status_a = adapter.status_project("A")
+        status_b = adapter.status_project("B")
+        assert status_a["config"]["max_parallel_workers"] == 1
+        assert status_a["workers"][0]["worker"] == "high"
+        assert status_a["workers"][0]["assigned"] is False
+        assert "unassigned" in status_a["workers"][0]["task"]
+        assert status_b["workers"][0]["worker"] == "high"
+        local_memory = tmp_path / "agents" / "A" / "workers" / "high" / "local_memory"
+        (local_memory / "events.jsonl").write_text(
+            '{"event_type": "search_math_results", "query": "Hodge decomposition"}\n',
+            encoding="utf-8",
+        )
+        (local_memory / "notes.jsonl").write_text(
+            '{"round": 2, "note": "resume from verified lemma", "fact_id": "abc123"}\n'
+            '{"round": 3, "result": "verified Hodge lemma", "next": "build the Lefschetz bridge"}\n',
+            encoding="utf-8",
+        )
+        status = adapter.status_project("A")["workers"][0]
+        assert status["local_memory_count"] == 3
+        assert status["checkpoint"] == {
+            "message": "verified Hodge lemma\n\nNext: build the Lefschetz bridge",
+            "source": "notes",
+            "round": 3,
+            "fact_id": None,
+        }
     finally:
         cli.spawn_loop = original_spawn
 
@@ -302,6 +395,7 @@ def test_restart_after_stop_does_not_require_projection_poll(tmp_path: Path):
     with TestClient(app, base_url="https://testserver") as client:
         csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
         project = client.post("/api/projects", json={"name":"A", "problem":"alpha"}, headers=headers).json()
+        runtime.assign_all(project["runtime_name"])
         first = client.post(f"/api/projects/{project['id']}/runs", json={"duration_seconds":3600}, headers=headers).json()
         assert client.post(f"/api/projects/{project['id']}/runs/{first['run_id']}/stop", json={}, headers=headers).status_code == 202
         second = client.post(f"/api/projects/{project['id']}/runs", json={"duration_seconds":3600}, headers=headers)
@@ -376,8 +470,9 @@ def test_read_only_projections_are_authenticated_and_project_scoped(tmp_path: Pa
     with TestClient(app, base_url="https://testserver") as client:
         csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
         project = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
+        runtime.assign_all(project["runtime_name"])
         pid = project["id"]
-        for endpoint in ("workers", "logs", "fact-graph", "reports", "outputs"):
+        for endpoint in ("workers", "logs", "fact-graph", "memory", "reports", "outputs"):
             assert client.get(f"/api/projects/{pid}/{endpoint}").status_code == 200
             assert client.get(f"/api/projects/foreign/{endpoint}").status_code == 404
         assert client.get("/api/projects/foreign/logs").status_code == 404
@@ -396,6 +491,7 @@ def test_deadline_rejects_new_main_agent_work(tmp_path: Path):
     with TestClient(app, base_url="https://testserver") as client:
         csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
         project = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
+        runtime.assign_all(project["runtime_name"])
         run = client.post(f"/api/projects/{project['id']}/runs", json={"duration_seconds": 1}, headers=headers).json()
         import sqlite3
         with sqlite3.connect(tmp_path / "console.sqlite3") as db:
@@ -411,6 +507,7 @@ def test_project_deletion_requires_stop_confirmation_and_isolation(tmp_path: Pat
         a = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
         b = client.post("/api/projects", json={"name": "B", "problem": "beta"}, headers=headers).json()
         assert client.request("DELETE", f"/api/projects/{a['id']}", json={"confirm_name": "wrong"}, headers=headers).status_code == 400
+        runtime.assign_all(a["runtime_name"])
         client.post(f"/api/projects/{a['id']}/runs", json={"duration_seconds": 60}, headers=headers)
         assert client.request("DELETE", f"/api/projects/{a['id']}", json={"confirm_name": "A"}, headers=headers).status_code == 409
         client.post(f"/api/projects/{a['id']}/stop", json={}, headers=headers)
@@ -418,3 +515,134 @@ def test_project_deletion_requires_stop_confirmation_and_isolation(tmp_path: Pat
         assert deleted.status_code == 200
         assert client.get(f"/api/projects/{a['id']}").status_code == 404
         assert client.get(f"/api/projects/{b['id']}").status_code == 200
+
+
+def test_provider_model_catalog_uses_configured_endpoint_without_exposing_credentials(monkeypatch):
+    captured = {}
+
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self):
+            return json.dumps({"data": [
+                {"id": "gpt-5.6-luna", "owned_by": "provider"},
+                {"id": "gpt-image-2", "owned_by": "provider"},
+            ]}).encode()
+
+    def opener(request, *, timeout):
+        captured["url"] = request.full_url
+        captured["authorization"] = request.get_header("Authorization")
+        captured["timeout"] = timeout
+        return Response()
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://provider.example/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "catalog-secret")
+    snapshot = ProviderModelCatalog(opener=opener, now=lambda: 123.0).snapshot(
+        default_worker_model="gpt-5.5",
+    )
+
+    assert captured == {
+        "url": "https://provider.example/v1/models",
+        "authorization": "Bearer catalog-secret",
+        "timeout": 5.0,
+    }
+    by_id = {row["id"]: row for row in snapshot["models"]}
+    assert by_id["gpt-5.6-luna"]["selectable"] is True
+    assert by_id["gpt-image-2"]["selectable"] is False
+    assert "catalog-secret" not in json.dumps(snapshot)
+
+
+def test_config_project_capacity_and_assignment_gate_are_server_enforced(tmp_path: Path, monkeypatch):
+    class Catalog:
+        def snapshot(self, **kwargs):
+            return {
+                "models": [
+                    {"id": "gpt-5.6-luna", "selectable": True},
+                    {"id": "gpt-image-2", "selectable": False},
+                ],
+                "provider": {"credential_configured": True},
+                "cached": False,
+                "stale": False,
+            }
+
+    class Main:
+        backend = "codex"
+        model = "gpt-5.6-luna"
+        effort = "xhigh"
+
+    monkeypatch.setenv("DANUS_CONSULT_TRANSPORT", "off")
+    runtime = FakeRuntime(tmp_path / "projects")
+    settings = AppSettings(
+        database_path=tmp_path / "console.sqlite3",
+        password_hash=hash_password("correct horse battery staple"),
+        cookie_secure=True,
+        allowed_origins={"https://testserver"},
+        default_max_parallel_workers=2,
+    )
+    app = create_app(settings=settings, runtime=runtime, main_agent=Main(), model_catalog=Catalog())
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        config = client.get("/api/config").json()
+        assert config["default_max_parallel_workers"] == 2
+        assert config["main_agent"] == {
+            "backend": "codex", "model": "gpt-5.6-luna", "effort": "xhigh",
+            "provider_configured": False,
+        }
+        assert config["strategy"]["transport"] == "off"
+        assert [row["id"] for row in config["worker_models"]] == ["gpt-5.6-luna", "gpt-image-2"]
+
+        project = client.post("/api/projects", json={
+            "name": "A", "problem": "alpha", "roles": "high:1,xhigh:1",
+            "model": "gpt-5.6-luna", "max_parallel_workers": 2,
+        }, headers=headers).json()
+        assert project["worker_model"] == "gpt-5.6-luna"
+        assert project["max_parallel_workers"] == 2
+
+        rejected = client.post(
+            f"/api/projects/{project['id']}/runs",
+            json={"duration_seconds": 60}, headers=headers,
+        )
+        assert rejected.status_code == 409
+        assert rejected.json()["unassigned_workers"] == ["high", "xhigh"]
+        assert runtime.started == []
+
+        runtime.assign_all(project["runtime_name"])
+        accepted = client.post(
+            f"/api/projects/{project['id']}/runs",
+            json={"duration_seconds": 60}, headers=headers,
+        )
+        assert accepted.status_code == 202
+        assert runtime.started == [project["runtime_name"]]
+
+
+def test_orchestration_projection_reads_real_session_guidance_and_tasks(tmp_path: Path):
+    runtime = FakeMemoryRuntime(tmp_path / "projects")
+    settings = AppSettings(
+        database_path=tmp_path / "console.sqlite3",
+        password_hash=hash_password("correct horse battery staple"),
+        cookie_secure=True,
+        allowed_origins={"https://testserver"},
+    )
+    app = create_app(settings=settings, runtime=runtime)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post("/api/projects", json={
+            "name": "A", "problem": "alpha", "roles": "high:1,xhigh:1",
+        }, headers=headers).json()
+        runtime.statuses[project["runtime_name"]][0].update({"assigned": True, "task": "Explore branch A"})
+        runtime.memory_entries[project["runtime_name"]] = {"total": 2, "channels": [
+            {"kind": "master_guidance", "entries": [{"claim": "Split into branches A and B"}]},
+            {"kind": "elaboration", "entries": [{"claim": "The missing bridge is compactness"}]},
+        ]}
+        app.state.console_store.upsert_agent_session(
+            project["id"], "session-1", "inactive", time.time(), backend="codex",
+        )
+
+        projection = client.get(f"/api/projects/{project['id']}/orchestration").json()
+        assert projection["main_agent"]["status"] == "inactive"
+        assert projection["main_agent"]["session_id_present"] is True
+        assert projection["assigned_workers"] == 1
+        assert projection["unassigned_workers"] == ["xhigh"]
+        assert projection["workers"][0]["task"] == "Explore branch A"
+        assert projection["master_guidance"]["claim"] == "Split into branches A and B"
+        assert projection["elaboration"]["claim"] == "The missing bridge is compactness"

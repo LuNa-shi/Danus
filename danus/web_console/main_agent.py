@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable
+
+from danus.strategy.config import resolve_transport
 
 from .runtime import RuntimeErrorBase
 
@@ -43,9 +46,21 @@ class MainAgentAdapter:
     def _resolve_codex() -> str:
         try:
             from danus import codex
-            return codex.resolve_bin()
+            resolved = codex.resolve_bin()
         except Exception:
             return "codex"
+        # `bin/codex` is the deployment wrapper, but it intentionally exits when
+        # bootstrap has not produced runtime/runtime.env yet. A developer who
+        # launches the Web Console directly should still be able to use an
+        # already-installed Codex CLI from PATH. Keep the wrapper preference once
+        # the self-contained runtime exists; this preserves deployment pinning.
+        repo = Path(__file__).resolve().parents[2]
+        wrapper = repo / "bin" / "codex"
+        if resolved == str(wrapper) and not (repo / "runtime" / "runtime.env").is_file():
+            system_codex = shutil.which("codex")
+            if system_codex and system_codex != resolved:
+                return system_codex
+        return resolved
 
     @staticmethod
     def _default_runner(cmd, *, input, cwd, env, timeout):
@@ -55,10 +70,24 @@ class MainAgentAdapter:
         repo = Path(__file__).resolve().parents[2]
         contract = repo / "agents" / "contracts" / "main_agent.md"
         contract_text = contract.read_text(encoding="utf-8") if contract.is_file() else ""
+        strategy_transport = resolve_transport(None)
+        if strategy_transport == "off":
+            strategy_policy = (
+                "SERVER STRATEGY POLICY: strategy consult is OFF for this deployment. "
+                "Do not invoke `consult` or any external strategy model. Use your Main Agent "
+                "orchestration judgment to record the elaboration and master_guidance through "
+                "the project-scoped Danus MCP tools, then assign Workers through `danus-web-agent`."
+            )
+        else:
+            strategy_policy = (
+                f"SERVER STRATEGY POLICY: strategy consult transport is {strategy_transport}. "
+                "Use the server-configured transport and model; do not hard-code or substitute a model id."
+            )
         return "\n".join([
             "You are the Danus Main Agent for exactly one Project.",
             "Follow the Main Agent contract below. Retain strategic orchestration authority; do not submit facts directly.",
             "Use the project-scoped `danus-web-agent` command for status, assignment, and graceful worker lifecycle coordination. It is the only allowed lifecycle command and is pinned to this Project. Do not edit Danus source code or access another Project. Use the Danus MCP tools for scoped memory and Fact Graph oversight; never submit facts as Main Agent.",
+            strategy_policy,
             "MAIN AGENT CONTRACT:\n" + contract_text,
             "The Web Console supplies this project state and material manifest explicitly.",
             "Project state:", json.dumps(project_state, ensure_ascii=False, sort_keys=True),
@@ -80,13 +109,26 @@ class MainAgentAdapter:
             # Codex auth/config variables are explicitly allowlisted. The API
             # key is intentionally inherited only when configured as the server
             # side Codex credential; unrelated host secrets are excluded.
-            "CODEX_HOME", "DANUS_CODEX_API_KEY",
+            "CODEX_HOME", "DANUS_CODEX_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL",
             "CODEX_API_BASE_URL", "CODEX_API_MODEL",
             "DANUS_CODEX_BIN", "DANUS_CODEX_MODEL", "DANUS_CODEX_EFFORT",
             "DANUS_VERIFY_URL", "DANUS_VERIFY_TIMEOUT", "DANUS_RUNTIME",
             "DANUS_PY", "DANUS_WEB_AGENT_BIN",
             "DANUS_WEB_MAIN_AGENT_BACKEND",
             "DANUS_AGENTS_ROOT", "DANUS_ROOT", "CODEX_BACKEND",
+            # The documented Main Agent loop may invoke the strategy consult.
+            # Pass only its explicit Danus namespace; never forward unrelated
+            # host credentials into the model-generated subprocess.
+            "DANUS_CONSULT_TRANSPORT", "DANUS_CONSULT_API_KEY",
+            "DANUS_CONSULT_BASE_URL", "DANUS_CONSULT_MODEL",
+            "DANUS_CONSULT_PRICE_IN", "DANUS_CONSULT_PRICE_OUT",
+            "DANUS_CONSULT_TIMEOUT", "DANUS_CONSULT_BACKGROUND",
+            "DANUS_CONSULT_STORE", "DANUS_CONSULT_CLAUDE_CODE_MODEL",
+            "DANUS_CONSULT_CLAUDE_CODE_BIN", "DANUS_CONSULT_CLAUDE_CODE_MAX_WALL",
+            "DANUS_CONSULT_CLAUDE_CODE_PRICE_IN", "DANUS_CONSULT_CLAUDE_CODE_PRICE_OUT",
+            "DANUS_CONSULT_CLAUDE_API_KEY", "DANUS_CONSULT_CLAUDE_API_BASE_URL",
+            "DANUS_CONSULT_CLAUDE_API_MODEL", "DANUS_CONSULT_CLAUDE_API_FALLBACK",
+            "DANUS_CONSULT_CLAUDE_API_PRICE_IN", "DANUS_CONSULT_CLAUDE_API_PRICE_OUT",
         }
         env = {key: value for key, value in inherited.items() if key in keep}
         # Claude subscription auth is intentionally inherited from its local
@@ -104,6 +146,11 @@ class MainAgentAdapter:
             # Pin the MCP server to the interpreter running the Web Console when
             # scripts/env.sh did not explicitly provide a Danus runtime Python.
             "DANUS_PY": env.get("DANUS_PY") or sys.executable,
+            # Codex runs from the Project context, not the source checkout. In a
+            # developer launch without bootstrap's installed venv, the scoped
+            # lifecycle CLI and MCP gateway still need to import this checkout.
+            # Do not inherit an arbitrary host PYTHONPATH; expose only Danus.
+            "PYTHONPATH": str(repo),
         })
         # A project-scoped main session must be able to invoke the repository's
         # lifecycle CLI, whose wrapper sources scripts/env.sh. Keep the repo bin
@@ -120,7 +167,32 @@ class MainAgentAdapter:
         return env
 
     @staticmethod
-    def _parse_codex(stdout: str) -> tuple[str | None, str]:
+    def _text_value(value: Any) -> str:
+        """Normalize the text shapes emitted by Codex JSON events."""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return "".join(MainAgentAdapter._text_value(item) for item in value)
+        if isinstance(value, dict):
+            for key in ("text", "value", "output_text", "message", "content"):
+                if key in value:
+                    text = MainAgentAdapter._text_value(value[key])
+                    if text:
+                        return text
+        return ""
+
+    @classmethod
+    def _message_text(cls, obj: Any) -> str:
+        if not isinstance(obj, dict):
+            return ""
+        for key in ("text", "message", "content", "output_text"):
+            text = cls._text_value(obj.get(key))
+            if text:
+                return text
+        return ""
+
+    @classmethod
+    def _parse_codex(cls, stdout: str) -> tuple[str | None, str]:
         thread_id = None
         reply = ""
         for line in (stdout or "").splitlines():
@@ -136,12 +208,14 @@ class MainAgentAdapter:
                 thread_id = payload.get("session_id") or payload.get("id") or thread_id
             if kind == "item.completed":
                 obj = item.get("item") or {}
-                if obj.get("type") == "agent_message":
-                    reply = obj.get("text") or reply
+                if obj.get("type") in {"agent_message", "message"} and obj.get("role", "assistant") == "assistant":
+                    reply = cls._message_text(obj) or reply
             elif kind == "event_msg" and payload.get("type") == "agent_message":
-                reply = payload.get("message") or reply
+                reply = cls._message_text(payload) or reply
             elif kind == "event_msg" and payload.get("type") == "task_complete":
-                reply = payload.get("last_agent_message") or reply
+                reply = cls._text_value(payload.get("last_agent_message")) or reply
+            elif kind in {"response.output_text.done", "response.completed"}:
+                reply = cls._message_text(item) or cls._message_text(payload) or reply
         return thread_id, reply.strip()
 
     @staticmethod
@@ -161,21 +235,48 @@ class MainAgentAdapter:
                 f"DANUS_AGENTS_ROOT={q(root.parent)}",
                 f"DANUS_PROJECT_SCOPE={q(root.name)}",
                 f"DANUS_VERIFY_URL={q(env.get('DANUS_VERIFY_URL', ''))}",
+                f"PYTHONPATH={q(env.get('PYTHONPATH', ''))}",
             ]) + "}",
         ]
         return "mcp_servers.danus={" + ",".join(fields) + "}"
 
     def _send_codex(self, *, root: Path, session_id: str | None, prompt: str, env: dict[str, str]) -> dict[str, Any]:
-        model = self.model or os.environ.get("DANUS_CODEX_MODEL", "gpt-5.5")
-        effort = self.effort or os.environ.get("DANUS_CODEX_EFFORT", "xhigh")
+        model = self.model or env.get("DANUS_CODEX_MODEL") or env.get("CODEX_API_MODEL")
+        provider_base_url = env.get("OPENAI_BASE_URL") or env.get("CODEX_API_BASE_URL")
+        provider_key_env = (
+            "OPENAI_API_KEY" if env.get("OPENAI_API_KEY")
+            else "DANUS_CODEX_API_KEY" if env.get("DANUS_CODEX_API_KEY")
+            else None
+        )
+        direct_provider = bool(provider_base_url and provider_key_env)
+        if direct_provider and not model:
+            # The direct endpoint may not expose the model configured in the
+            # operator's personal Codex home. Use the broadly available model
+            # verified for Danus unless the server explicitly selects one.
+            model = "gpt-5.5"
+        effort = self.effort or env.get("DANUS_CODEX_EFFORT", "xhigh")
         mcp_config = self._codex_mcp_config(root, env)
         # The Main Agent needs to write Project-owned orchestration files through
         # the narrow broker. Codex auto-reviews approval requests and confines
         # approved commands to its workspace-write policy rooted at `cwd=root`;
         # the prompt and broker further constrain the lifecycle vocabulary.
-        common = ["--json", "--model", model, "--config", f'model_reasoning_effort="{effort}"',
-                  "--skip-git-repo-check", "--approve-for-me",
-                  "-C", str(root), "--config", mcp_config]
+        common = ["--json"]
+        if direct_provider:
+            provider_config = "model_providers.danus_web={" + ",".join([
+                f"name={json.dumps('Danus Web API')}",
+                f"base_url={json.dumps(provider_base_url)}",
+                f"env_key={json.dumps(provider_key_env)}",
+                f"wire_api={json.dumps('responses')}",
+            ]) + "}"
+            common += [
+                "--config", 'model_provider="danus_web"',
+                "--config", provider_config,
+            ]
+        if model:
+            common += ["--model", model]
+        common += ["--config", f'model_reasoning_effort="{effort}"',
+                   "--approve-for-me",
+                   "--skip-git-repo-check", "-C", str(root), "--config", mcp_config]
         cmd = [self.codex_bin, "exec", *common]
         if session_id:
             # Codex's resume parser accepts the common exec options only when
@@ -217,7 +318,8 @@ class MainAgentAdapter:
             "env": {"DANUS_ROLE": "main", "DANUS_AUTHOR": "main_agent",
                     "DANUS_PROJECT_DIR": str(root), "DANUS_AGENTS_ROOT": str(root.parent),
                     "DANUS_PROJECT_SCOPE": root.name,
-                    "DANUS_VERIFY_URL": env.get("DANUS_VERIFY_URL", "")},
+                    "DANUS_VERIFY_URL": env.get("DANUS_VERIFY_URL", ""),
+                    "PYTHONPATH": env.get("PYTHONPATH", str(repo))},
         }}}
         new_session = session_id is None
         sid = session_id or str(uuid.uuid4())

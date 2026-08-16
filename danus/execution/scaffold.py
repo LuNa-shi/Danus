@@ -76,6 +76,7 @@ DANUS_PROJECT_DIR = {project_dir}
 DANUS_AUTHOR = {author}
 DANUS_ROLE = "worker"
 DANUS_VERIFY_URL = {verify_url}
+PYTHONPATH = {pythonpath}
 """
 
 _TASK_PLACEHOLDER = (
@@ -106,6 +107,11 @@ def write_codex_config(wl: "L.WorkerLayout") -> None:
         project_dir=_toml_str(str(wl.project_dir)),
         author=_toml_str(wl.name),
         verify_url=_toml_str(_verify_url()),
+        # The MCP process starts from the worker directory. An inherited
+        # relative PYTHONPATH such as "." therefore cannot import this checkout.
+        # Pin the package parent explicitly; in a wheel install this resolves to
+        # site-packages, while in a source checkout it resolves to the repo root.
+        pythonpath=_toml_str(str(Path(__file__).resolve().parents[2])),
     ))
 
 
@@ -114,7 +120,8 @@ def write_codex_config(wl: "L.WorkerLayout") -> None:
 # --------------------------------------------------------------------------- #
 
 def do_new(project: str, roles: str = "high:3,xhigh:4",
-           model: Optional[str] = None, root: Optional[Path] = None) -> Dict:
+           model: Optional[str] = None, root: Optional[Path] = None,
+           max_parallel_workers: Optional[int] = None) -> Dict:
     """Scaffold a project dir + one worker home per role. Refuses to clobber an
     existing project dir (no silent overwrite of a live fact graph). Returns
     ``{"project_dir", "workers"}``."""
@@ -123,6 +130,10 @@ def do_new(project: str, roles: str = "high:3,xhigh:4",
         raise SystemExit(f"project already exists: {pdir} (pick another name or remove it)")
     role_pairs = L.parse_roles(roles)
     model = model or _default_model()
+    if max_parallel_workers is not None:
+        max_parallel_workers = int(max_parallel_workers)
+        if max_parallel_workers < 1:
+            raise ValueError("max_parallel_workers must be >= 1")
 
     L.workers_dir(project, root).mkdir(parents=True, exist_ok=True)
     (pdir / "global_memory").mkdir(exist_ok=True)
@@ -149,6 +160,8 @@ def do_new(project: str, roles: str = "high:3,xhigh:4",
         created.append(worker)
 
     meta = {"name": project, "model": model, "roles": roles, "workers": created}
+    if max_parallel_workers is not None:
+        meta["max_parallel_workers"] = max_parallel_workers
     atomic_write(pdir / "project.json", json.dumps(meta, ensure_ascii=False, indent=2))
     return {"project_dir": str(pdir), "workers": created}
 

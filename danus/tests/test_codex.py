@@ -46,6 +46,8 @@ def env(**kv):
 _ALL = dict(
     DANUS_CODEX_BIN=None, CODEX_BIN=None,
     DANUS_CODEX_MODEL=None, DANUS_CODEX_EFFORT=None,
+    OPENAI_BASE_URL=None, OPENAI_API_KEY=None,
+    CODEX_API_BASE_URL=None, DANUS_CODEX_API_KEY=None,
     DANUS_VERIFY_MODEL=None, DANUS_VERIFY_EFFORT=None,
     DANUS_WRITE_PAPER_MODEL=None, DANUS_WRITE_PAPER_EFFORT=None,
     DANUS_HUMAN_SUMMARY_MODEL=None, DANUS_HUMAN_SUMMARY_EFFORT=None,
@@ -59,33 +61,37 @@ def test_resolve_bin_prefers_danus_codex_bin_over_alias():
         assert codex.resolve_bin() == "/x/primary"
 
 
-def test_resolve_bin_falls_back_to_wrapper_then_which_then_bare():
-    # no env override → the <repo>/bin/codex wrapper wins if it exists, else
-    # shutil.which("codex"), else the bare string "codex".
-    with env(**_ALL):
-        got = codex.resolve_bin()
-        import shutil
-        wrapper = Path(codex.__file__).resolve().parents[1] / "bin" / "codex"
-        if wrapper.exists():
-            assert got == str(wrapper)
-        else:
-            assert got == (shutil.which("codex") or "codex")
+def test_resolve_bin_uses_repo_wrapper_only_when_runtime_is_provisioned():
+    import shutil
+    real_root, real_which = codex._REPO_ROOT, shutil.which
+    try:
+        with tempfile.TemporaryDirectory() as d, env(**_ALL):
+            root = Path(d)
+            wrapper = root / "bin" / "codex"
+            wrapper.parent.mkdir()
+            wrapper.write_text("#!/bin/sh\n")
+            (root / "runtime").mkdir()
+            codex._REPO_ROOT = root
+            shutil.which = lambda name: "/system/bin/codex"
+
+            assert codex.resolve_bin() == "/system/bin/codex"
+
+            (root / "runtime" / "runtime.env").write_text("DANUS_NODE=/runtime/node\n")
+            assert codex.resolve_bin() == str(wrapper)
+    finally:
+        codex._REPO_ROOT, shutil.which = real_root, real_which
 
 
 def test_resolve_bin_bare_when_nothing_available(monkeypatch=None):
-    # simulate: no env, no wrapper, no codex on PATH → bare "codex"
     import shutil
-    real_which = shutil.which
-    shutil.which = lambda *a, **k: None  # type: ignore[assignment]
+    real_root, real_which = codex._REPO_ROOT, shutil.which
     try:
-        with env(**_ALL):
-            # if the repo happens to ship a bin/codex wrapper, that legitimately
-            # wins; only assert the bare-string fallback when no wrapper exists.
-            wrapper = Path(codex.__file__).resolve().parents[1] / "bin" / "codex"
-            if not wrapper.exists():
-                assert codex.resolve_bin() == "codex"
+        with tempfile.TemporaryDirectory() as d, env(**_ALL):
+            codex._REPO_ROOT = Path(d)
+            shutil.which = lambda *a, **k: None  # type: ignore[assignment]
+            assert codex.resolve_bin() == "codex"
     finally:
-        shutil.which = real_which  # type: ignore[assignment]
+        codex._REPO_ROOT, shutil.which = real_root, real_which
 
 
 # --- model / effort precedence ---------------------------------------------- #
@@ -143,7 +149,8 @@ def test_subprocess_env_idempotent_when_dir_already_on_path():
 # --- exec_cmd shape --------------------------------------------------------- #
 
 def test_exec_cmd_shape_quoted_effort_and_verbatim_tail():
-    cmd = codex.exec_cmd("/x/codex", "the-model", "xhigh", "-C", "/home", "-")
+    with env(**_ALL):
+        cmd = codex.exec_cmd("/x/codex", "the-model", "xhigh", "-C", "/home", "-")
     assert cmd == [
         "/x/codex", "exec",
         "--model", "the-model",
@@ -153,14 +160,51 @@ def test_exec_cmd_shape_quoted_effort_and_verbatim_tail():
 
 
 def test_exec_cmd_empty_tail():
-    cmd = codex.exec_cmd("codex", "m", "e")
+    with env(**_ALL):
+        cmd = codex.exec_cmd("codex", "m", "e")
     assert cmd == ["codex", "exec", "--model", "m", "--config", 'model_reasoning_effort="e"']
+
+
+def test_exec_cmd_builds_direct_provider_without_putting_key_in_argv():
+    secret = "redacted-test-secret"
+    with env(**{
+        **_ALL,
+        "OPENAI_BASE_URL": "https://provider.example/v1",
+        "OPENAI_API_KEY": secret,
+    }):
+        cmd = codex.exec_cmd("codex", "gpt-5.5", "xhigh", "prompt")
+
+    assert 'model_provider="danus_direct"' in cmd
+    assert any(
+        value.startswith("model_providers.danus_direct={")
+        and 'base_url="https://provider.example/v1"' in value
+        and 'env_key="OPENAI_API_KEY"' in value
+        and 'wire_api="responses"' in value
+        for value in cmd
+    )
+    assert not any(secret in value for value in cmd)
+
+
+def test_exec_cmd_supports_codex_base_url_and_danus_key_pair():
+    with env(**{
+        **_ALL,
+        "CODEX_API_BASE_URL": "https://codex-provider.example/v1",
+        "DANUS_CODEX_API_KEY": "redacted-danus-secret",
+    }):
+        cmd = codex.exec_cmd("codex", "gpt-5.5", "high")
+
+    assert any(
+        'base_url="https://codex-provider.example/v1"' in value
+        and 'env_key="DANUS_CODEX_API_KEY"' in value
+        for value in cmd
+    )
+    assert not any("redacted-danus-secret" in value for value in cmd)
 
 
 def main() -> None:
     tests = [
         test_resolve_bin_prefers_danus_codex_bin_over_alias,
-        test_resolve_bin_falls_back_to_wrapper_then_which_then_bare,
+        test_resolve_bin_uses_repo_wrapper_only_when_runtime_is_provisioned,
         test_resolve_bin_bare_when_nothing_available,
         test_model_override_wins_then_neutral_then_default,
         test_effort_override_wins_then_neutral_then_default,
@@ -170,6 +214,8 @@ def main() -> None:
         test_subprocess_env_idempotent_when_dir_already_on_path,
         test_exec_cmd_shape_quoted_effort_and_verbatim_tail,
         test_exec_cmd_empty_tail,
+        test_exec_cmd_builds_direct_provider_without_putting_key_in_argv,
+        test_exec_cmd_supports_codex_base_url_and_danus_key_pair,
     ]
     for t in tests:
         t()
