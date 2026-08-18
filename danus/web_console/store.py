@@ -105,7 +105,6 @@ class ConsoleStore:
                 conn.execute("ALTER TABLE projects ADD COLUMN max_parallel_workers INTEGER NOT NULL DEFAULT 1")
             if "initial_direction_confirmed_at" not in project_columns:
                 conn.execute("ALTER TABLE projects ADD COLUMN initial_direction_confirmed_at REAL")
-                conn.execute("UPDATE projects SET initial_direction_confirmed_at=created_at")
             run_columns = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
             if "start_attempt_generation" not in run_columns:
                 conn.execute(

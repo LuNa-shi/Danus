@@ -269,7 +269,7 @@ def test_project_run_budget_rejects_invalid_types_and_bounds(
             "/api/projects", json={"name": "A", "problem": "alpha", "roles": "high:1"},
             headers={"X-CSRF-Token": csrf, "Origin": "https://testserver"},
         ).json()
-        runtime.assign_all(project["runtime_name"])
+        runtime.assign_all(project["runtime_name"]); app.state.console_store.confirm_initial_direction(project["id"], time.time())
 
         response = client.post(
             f"/api/projects/{project['id']}/runs",
@@ -294,8 +294,8 @@ def test_project_run_deadline_and_graceful_stop_are_scoped(tmp_path: Path):
             "/api/projects", json={"name": "B", "problem": "beta", "roles": "high:1"},
             headers={"X-CSRF-Token": csrf, "Origin": "https://testserver"},
         ).json()
-        runtime.assign_all(a["runtime_name"])
-        runtime.assign_all(b["runtime_name"])
+        runtime.assign_all(a["runtime_name"]); app.state.console_store.confirm_initial_direction(a["id"], time.time())
+        runtime.assign_all(b["runtime_name"]); app.state.console_store.confirm_initial_direction(b["id"], time.time())
         start = client.post(
             f"/api/projects/{a['id']}/runs", json={"duration_seconds": 43200},
             headers={"X-CSRF-Token": csrf, "Origin": "https://testserver"},
@@ -344,6 +344,9 @@ def test_initial_direction_confirmation_gates_assignment(tmp_path: Path, monkeyp
         blocked = _broker_lifecycle(client, project, "assign", worker="high", task="direction")
         assert blocked.status_code == 409
         assert "initial direction confirmation" in blocked.json()["detail"]
+        start_blocked = _broker_lifecycle(client, project, "start")
+        assert start_blocked.status_code == 409
+        assert "initial direction confirmation" in start_blocked.json()["detail"]
         no_guidance = client.post(f"/api/projects/{project['id']}/initial-direction/confirm", json={"confirm": "A"}, headers=headers)
         assert no_guidance.status_code == 409
         runtime.memory_entries[project["runtime_name"]] = {"total": 1, "channels": [{"kind": "master_guidance", "entries": [{"claim": "direction", "evidence": "guidance-source: consult-derived"}]}]}
@@ -390,7 +393,7 @@ def test_internal_lifecycle_broker_is_loopback_only_and_project_capability_scope
             json={"name": "B", "problem": "beta", "roles": "high:1"},
             headers=headers,
         ).json()
-        runtime.assign_all(a["runtime_name"])
+        runtime.assign_all(a["runtime_name"]); app.state.console_store.confirm_initial_direction(a["id"], time.time())
         intent = client.post(
             f"/api/projects/{a['id']}/runs",
             json={"duration_seconds": 60},
@@ -445,7 +448,7 @@ def test_fresh_start_intent_is_not_promoted_by_preexisting_live_roster(tmp_path:
             json={"name": "A", "problem": "alpha", "roles": "high:1"},
             headers=headers,
         ).json()
-        runtime.assign_all(project["runtime_name"])
+        runtime.assign_all(project["runtime_name"]); app.state.console_store.confirm_initial_direction(project["id"], time.time())
         # Simulate a stale/pre-existing worker from outside this fresh run intent.
         runtime.statuses[project["runtime_name"]][0].update(
             {"alive": True, "state": "running", "round": 9}
@@ -508,7 +511,7 @@ def test_internal_lifecycle_broker_reports_partial_start_for_incomplete_roster(
             json={"name": "A", "problem": "alpha", "roles": "high:1,xhigh:1"},
             headers=headers,
         ).json()
-        runtime.assign_all(project["runtime_name"])
+        runtime.assign_all(project["runtime_name"]); app.state.console_store.confirm_initial_direction(project["id"], time.time())
         intent = client.post(
             f"/api/projects/{project['id']}/runs",
             json={"duration_seconds": 60}, headers=headers,
@@ -556,7 +559,7 @@ def test_runtime_poll_reconciles_graceful_stop_to_terminal_run(tmp_path: Path):
         csrf = _login(client)
         headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
         project = client.post("/api/projects", json={"name": "A", "problem": "alpha", "roles": "high:1"}, headers=headers).json()
-        runtime.assign_all(project["runtime_name"])
+        runtime.assign_all(project["runtime_name"]); app.state.console_store.confirm_initial_direction(project["id"], time.time())
         started = client.post(f"/api/projects/{project['id']}/runs", json={"duration_seconds": 3600}, headers=headers).json()
         assert _broker_start(client, project).status_code == 200
         assert client.get(f"/api/projects/{project['id']}/runs/{started['run_id']}").json()["status"] == "running"
@@ -577,7 +580,7 @@ def test_runtime_poll_reconciles_unexpected_worker_exit(tmp_path: Path):
     with TestClient(app, base_url="https://testserver") as client:
         csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
         project = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
-        runtime.assign_all(project["runtime_name"])
+        runtime.assign_all(project["runtime_name"]); app.state.console_store.confirm_initial_direction(project["id"], time.time())
         started = client.post(f"/api/projects/{project['id']}/runs", json={"duration_seconds": 3600}, headers=headers).json()
         assert _broker_start(client, project).status_code == 200
         client.get(f"/api/projects/{project['id']}/workers")
@@ -596,7 +599,7 @@ def test_run_lookup_is_project_scoped(tmp_path: Path):
         headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
         a = client.post("/api/projects", json={"name": "A", "problem": "alpha", "roles": "high:1"}, headers=headers).json()
         b = client.post("/api/projects", json={"name": "B", "problem": "beta", "roles": "high:1"}, headers=headers).json()
-        runtime.assign_all(a["runtime_name"])
+        runtime.assign_all(a["runtime_name"]); app.state.console_store.confirm_initial_direction(a["id"], time.time())
         run = client.post(f"/api/projects/{a['id']}/runs", json={"duration_seconds": 60}, headers=headers).json()
         assert client.get(f"/api/projects/{a['id']}/runs/{run['run_id']}").status_code == 200
         assert client.get(f"/api/projects/{b['id']}/runs/{run['run_id']}").status_code == 404
@@ -639,7 +642,7 @@ def test_runtime_start_failure_is_persisted_without_success_claim(tmp_path: Path
         project = client.post(
             "/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers,
         ).json()
-        runtime.assign_all(project["runtime_name"])
+        runtime.assign_all(project["runtime_name"]); app.state.console_store.confirm_initial_direction(project["id"], time.time())
         intent = client.post(
             f"/api/projects/{project['id']}/runs",
             json={"duration_seconds": 60}, headers=headers,
@@ -761,7 +764,7 @@ def test_restart_after_stop_does_not_require_projection_poll(tmp_path: Path):
     with TestClient(app, base_url="https://testserver") as client:
         csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
         project = client.post("/api/projects", json={"name":"A", "problem":"alpha"}, headers=headers).json()
-        runtime.assign_all(project["runtime_name"])
+        runtime.assign_all(project["runtime_name"]); app.state.console_store.confirm_initial_direction(project["id"], time.time())
         first = client.post(f"/api/projects/{project['id']}/runs", json={"duration_seconds":3600}, headers=headers).json()
         assert client.post(f"/api/projects/{project['id']}/runs/{first['run_id']}/stop", json={}, headers=headers).status_code == 202
         second = client.post(f"/api/projects/{project['id']}/runs", json={"duration_seconds":3600}, headers=headers)
@@ -1118,7 +1121,7 @@ def test_read_only_projections_are_authenticated_and_project_scoped(tmp_path: Pa
     with TestClient(app, base_url="https://testserver") as client:
         csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
         project = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
-        runtime.assign_all(project["runtime_name"])
+        runtime.assign_all(project["runtime_name"]); app.state.console_store.confirm_initial_direction(project["id"], time.time())
         pid = project["id"]
         for endpoint in ("workers", "logs", "fact-graph", "memory", "reports", "outputs"):
             assert client.get(f"/api/projects/{pid}/{endpoint}").status_code == 200
@@ -1139,7 +1142,7 @@ def test_deadline_rejects_new_main_agent_work(tmp_path: Path):
     with TestClient(app, base_url="https://testserver") as client:
         csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
         project = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
-        runtime.assign_all(project["runtime_name"])
+        runtime.assign_all(project["runtime_name"]); app.state.console_store.confirm_initial_direction(project["id"], time.time())
         run = client.post(f"/api/projects/{project['id']}/runs", json={"duration_seconds": 1}, headers=headers).json()
         import sqlite3
         with sqlite3.connect(tmp_path / "console.sqlite3") as db:
@@ -1157,7 +1160,7 @@ def test_project_deletion_requires_stop_confirmation_and_isolation(tmp_path: Pat
         a = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
         b = client.post("/api/projects", json={"name": "B", "problem": "beta"}, headers=headers).json()
         assert client.request("DELETE", f"/api/projects/{a['id']}", json={"confirm_name": "wrong"}, headers=headers).status_code == 400
-        runtime.assign_all(a["runtime_name"])
+        runtime.assign_all(a["runtime_name"]); app.state.console_store.confirm_initial_direction(a["id"], time.time())
         client.post(f"/api/projects/{a['id']}/runs", json={"duration_seconds": 60}, headers=headers)
         assert client.request("DELETE", f"/api/projects/{a['id']}", json={"confirm_name": "A"}, headers=headers).status_code == 409
         client.post(f"/api/projects/{a['id']}/stop", json={}, headers=headers)
@@ -1253,8 +1256,16 @@ def test_config_project_capacity_and_assignment_gate_are_server_enforced(tmp_pat
             json={"duration_seconds": 60}, headers=headers,
         )
         assert rejected.status_code == 409
-        assert rejected.json()["unassigned_workers"] == ["high", "xhigh"]
+        assert "initial direction confirmation" in rejected.json()["detail"]
         assert runtime.started == []
+
+        app.state.console_store.confirm_initial_direction(project["id"], time.time())
+        rejected = client.post(
+            f"/api/projects/{project['id']}/runs",
+            json={"duration_seconds": 60}, headers=headers,
+        )
+        assert rejected.status_code == 409
+        assert rejected.json()["unassigned_workers"] == ["high", "xhigh"]
 
         runtime.assign_all(project["runtime_name"])
         accepted = client.post(
@@ -1360,7 +1371,7 @@ def test_runtime_and_run_projection_report_partial_graceful_stop_progress(tmp_pa
             json={"name": "A", "problem": "alpha", "roles": "high:8"},
             headers=headers,
         ).json()
-        runtime.assign_all(project["runtime_name"])
+        runtime.assign_all(project["runtime_name"]); app.state.console_store.confirm_initial_direction(project["id"], time.time())
         run = client.post(
             f"/api/projects/{project['id']}/runs",
             json={"duration_seconds": 3600},
@@ -1416,7 +1427,7 @@ def test_worker_safety_controls_are_authenticated_confirmed_and_project_scoped(t
             "/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers,
         ).json()
         pid = project["id"]
-        runtime.assign_all(project["runtime_name"])
+        runtime.assign_all(project["runtime_name"]); app.state.console_store.confirm_initial_direction(project["id"], time.time())
         started = client.post(
             f"/api/projects/{pid}/runs", json={"duration_seconds": 60}, headers=headers,
         )
@@ -1468,6 +1479,7 @@ def test_selected_force_stop_keeps_run_active_when_other_workers_remain_live(tmp
         ).json()
         for worker in runtime.statuses[project["runtime_name"]]:
             worker["assigned"] = True
+        app.state.console_store.confirm_initial_direction(project["id"], time.time())
         started = client.post(
             f"/api/projects/{project['id']}/runs",
             json={"duration_seconds": 60}, headers=headers,
@@ -1559,7 +1571,7 @@ def test_deadline_supervisor_enforces_expiry_without_browser_polling(tmp_path: P
         project = client.post(
             "/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers,
         ).json()
-        runtime.assign_all(project["runtime_name"])
+        runtime.assign_all(project["runtime_name"]); app.state.console_store.confirm_initial_direction(project["id"], time.time())
         started = client.post(
             f"/api/projects/{project['id']}/runs",
             json={"duration_seconds": 1}, headers=headers,
@@ -1585,7 +1597,7 @@ def test_running_run_reports_degraded_when_any_expected_worker_disappears(tmp_pa
             json={"name": "A", "problem": "alpha", "roles": "high:1,xhigh:1"},
             headers=headers,
         ).json()
-        runtime.assign_all(project["runtime_name"])
+        runtime.assign_all(project["runtime_name"]); app.state.console_store.confirm_initial_direction(project["id"], time.time())
         started = client.post(
             f"/api/projects/{project['id']}/runs",
             json={"duration_seconds": 60}, headers=headers,
@@ -1631,7 +1643,7 @@ def test_broker_stop_refusal_keeps_unresolved_raw_process_nonterminal(tmp_path: 
         project = client.post(
             "/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers,
         ).json()
-        runtime.assign_all(project["runtime_name"])
+        runtime.assign_all(project["runtime_name"]); app.state.console_store.confirm_initial_direction(project["id"], time.time())
         started = client.post(
             f"/api/projects/{project['id']}/runs",
             json={"duration_seconds": 60}, headers=headers,
@@ -1657,7 +1669,7 @@ def test_pause_and_resume_are_rejected_after_stop_intent(tmp_path: Path):
         project = client.post(
             "/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers,
         ).json()
-        runtime.assign_all(project["runtime_name"])
+        runtime.assign_all(project["runtime_name"]); app.state.console_store.confirm_initial_direction(project["id"], time.time())
         started = client.post(
             f"/api/projects/{project['id']}/runs",
             json={"duration_seconds": 60}, headers=headers,
@@ -1709,7 +1721,7 @@ def test_deadline_does_not_claim_terminal_for_unresolved_raw_process(tmp_path: P
         project = client.post(
             "/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers,
         ).json()
-        runtime.assign_all(project["runtime_name"])
+        runtime.assign_all(project["runtime_name"]); app.state.console_store.confirm_initial_direction(project["id"], time.time())
         started = client.post(
             f"/api/projects/{project['id']}/runs",
             json={"duration_seconds": 1}, headers=headers,
@@ -1770,7 +1782,7 @@ def test_deadline_supervisor_is_not_blocked_by_main_agent_turn(tmp_path: Path):
         project = client.post(
             "/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers,
         ).json()
-        runtime.assign_all(project["runtime_name"])
+        runtime.assign_all(project["runtime_name"]); app.state.console_store.confirm_initial_direction(project["id"], time.time())
         assert client.post(
             f"/api/projects/{project['id']}/runs",
             json={"duration_seconds": 1}, headers=headers,

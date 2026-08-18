@@ -469,9 +469,9 @@ def create_app(
                 return runtime.status_project(project["runtime_name"])
             except (RuntimeErrorBase, OSError):
                 return _error(502, "project status unavailable")
+        if action in {"assign", "start"} and project.get("initial_direction_confirmed_at") is None:
+            return _error(409, "initial direction confirmation required before assignment or start")
         if action == "assign":
-            if project.get("initial_direction_confirmed_at") is None:
-                return _error(409, "initial direction confirmation required before assignment")
             task = payload.get("task")
             if worker is None or not isinstance(task, str) or not task.strip():
                 return _error(400, "assign requires worker and non-empty task")
@@ -828,6 +828,8 @@ def create_app(
         project = project_or_404(project_id)
         if isinstance(project, JSONResponse):
             return project
+        if project.get("initial_direction_confirmed_at") is None:
+            return _error(409, "initial direction confirmation required before run start")
         try:
             payload = await request.json()
         except Exception:
@@ -1390,8 +1392,11 @@ def create_app(
 
     @app.post("/api/projects/{project_id}/initial-direction/confirm")
     async def confirm_initial_direction(project_id: str, request: Request):
-        if isinstance((auth := auth_required(request)), JSONResponse):
-            return auth
+        current = auth_required(request)
+        if isinstance(current, JSONResponse):
+            return current
+        if not csrf_ok(request, current):
+            return _error(403, "csrf validation failed")
         project = project_or_404(project_id)
         if isinstance(project, JSONResponse):
             return project
