@@ -35,10 +35,6 @@ def test_start_posts_scoped_intent_to_host_broker_without_spawning_locally(
         "http://127.0.0.1:8080/internal/api/projects/project-a/lifecycle",
     )
     monkeypatch.setenv("DANUS_WEB_LIFECYCLE_TOKEN", "project-capability")
-    monkeypatch.setattr(
-        agent_cli.cli, "do_start",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("local start called")),
-    )
     requests = []
 
     def open_request(request, *, timeout):
@@ -71,19 +67,16 @@ def test_stop_posts_to_host_broker_while_status_remains_project_local(
     monkeypatch.setenv("DANUS_PROJECT_DIR", str(project))
     monkeypatch.setenv("DANUS_WEB_LIFECYCLE_URL", "http://127.0.0.1/lifecycle/A")
     monkeypatch.setenv("DANUS_WEB_LIFECYCLE_TOKEN", "project-capability")
-    monkeypatch.setattr(
-        agent_cli.cli, "do_stop",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("local stop called")),
-    )
-    monkeypatch.setattr(
-        agent_cli.cli, "do_status",
-        lambda target, *, root: [{"worker": "high", "target": target, "root": str(root)}],
-    )
     requests = []
 
     def open_request(request, *, timeout):
+        payload = json.loads(request.data)
         requests.append(request)
-        return _Response({"status": "stop_requested"})
+        return _Response(
+            {"status": "stop_requested"}
+            if payload["action"] == "stop"
+            else {"workers": [{"worker": "high", "alive": True}]}
+        )
 
     monkeypatch.setattr(agent_cli.urllib.request, "urlopen", open_request)
 
@@ -92,7 +85,29 @@ def test_stop_posts_to_host_broker_while_status_remains_project_local(
     assert json.loads(capsys.readouterr().out) == {"status": "stop_requested"}
 
     assert agent_cli.main(["status"]) == 0
-    assert json.loads(capsys.readouterr().out) == [{
-        "worker": "high", "target": "A", "root": str(root.resolve()),
-    }]
-    assert len(requests) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "workers": [{"worker": "high", "alive": True}],
+    }
+    assert json.loads(requests[1].data) == {"action": "status"}
+    assert len(requests) == 2
+
+
+def test_assign_posts_task_to_project_capability_broker(tmp_path: Path, monkeypatch, capsys):
+    root = tmp_path / "projects"
+    project = root / "A"
+    project.mkdir(parents=True)
+    monkeypatch.setenv("DANUS_PROJECT_SCOPE", "A")
+    monkeypatch.setenv("DANUS_AGENTS_ROOT", str(root))
+    monkeypatch.setenv("DANUS_PROJECT_DIR", str(project))
+    monkeypatch.setenv("DANUS_WEB_LIFECYCLE_URL", "http://127.0.0.1/lifecycle/A")
+    monkeypatch.setenv("DANUS_WEB_LIFECYCLE_TOKEN", "project-capability")
+    requests = []
+
+    def open_request(request, *, timeout):
+        requests.append(json.loads(request.data))
+        return _Response({"status": "assigned", "worker": "high"})
+
+    monkeypatch.setattr(agent_cli.urllib.request, "urlopen", open_request)
+    assert agent_cli.main(["assign", "high", "--task", "prove the lemma"]) == 0
+    assert requests == [{"action": "assign", "worker": "high", "task": "prove the lemma"}]
+    assert json.loads(capsys.readouterr().out)["status"] == "assigned"

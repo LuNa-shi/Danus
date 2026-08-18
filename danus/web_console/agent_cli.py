@@ -8,8 +8,6 @@ from pathlib import Path
 import urllib.error
 import urllib.request
 
-from danus.orchestration import cli
-
 
 def _project() -> tuple[str, Path]:
     name = os.environ.get("DANUS_PROJECT_SCOPE", "")
@@ -20,12 +18,19 @@ def _project() -> tuple[str, Path]:
     return name, root
 
 
-def _broker_post(action: str, *, force: bool = False) -> dict:
+def _broker_post(
+    action: str, *, worker: str | None = None, task: str | None = None,
+    force: bool = False,
+) -> dict:
     url = os.environ.get("DANUS_WEB_LIFECYCLE_URL", "")
     token = os.environ.get("DANUS_WEB_LIFECYCLE_TOKEN", "")
     if not url or not token:
         raise SystemExit("Main Agent lifecycle broker is not configured")
     payload = {"action": action}
+    if worker is not None:
+        payload["worker"] = worker
+    if task is not None:
+        payload["task"] = task
     if force:
         payload["force"] = True
     request = urllib.request.Request(
@@ -69,9 +74,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     target = name
     if args.command == "status":
-        result = cli.do_status(target, root=root)
+        result = _broker_post("status")
     elif args.command == "assign":
-        result = cli.do_assign(f"{name}/{args.worker}", args.task, root=root)
+        result = _broker_post("assign", worker=args.worker, task=args.task)
     elif args.command == "start":
         result = _broker_post("start")
     else:

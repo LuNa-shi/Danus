@@ -91,6 +91,12 @@ class DanusRuntimeAdapter:
                 return []
             raise RuntimeOperationError(message) from exc
 
+    def assign_worker(self, runtime_name: str, worker: str, task: str) -> dict[str, Any]:
+        self._project_dir(runtime_name)
+        if not isinstance(task, str) or not task.strip():
+            raise RuntimeOperationError("task must be non-empty")
+        return self._call(cli.do_assign, f"{runtime_name}/{worker}", task)
+
     def start_project(self, runtime_name: str) -> dict[str, Any]:
         self._project_dir(runtime_name)
         return {"workers": self._call(cli.do_start, runtime_name)}

@@ -279,9 +279,6 @@ class MainAgentAdapter:
             "DANUS_PROJECT_DIR": str(root), "DANUS_AGENTS_ROOT": str(root.parent),
             "DANUS_PROJECT_SCOPE": root.name,
             "DANUS_WEB_AGENT_BIN": str(repo / "bin" / "danus-web-agent"),
-            # Pin the MCP server to the interpreter running the Web Console when
-            # scripts/env.sh did not explicitly provide a Danus runtime Python.
-            "DANUS_PY": env.get("DANUS_PY") or sys.executable,
         })
         if (lifecycle_url is None) != (lifecycle_token is None):
             raise MainAgentError("incomplete lifecycle broker capability")
@@ -296,7 +293,8 @@ class MainAgentAdapter:
         path_parts = []
         for entry in env.get("PATH", "").split(os.pathsep) if env.get("PATH") else []:
             try:
-                if Path(entry).resolve() == repo_bin:
+                resolved_entry = Path(entry).absolute()
+                if resolved_entry in {repo_bin, Path(sys.executable).parent.absolute()}:
                     continue
             except (OSError, RuntimeError):
                 pass

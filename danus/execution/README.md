@@ -10,6 +10,7 @@ danus/execution/
   layout.py     paths + names; WorkerLayout; parse_roles("high:3,xhigh:4")
   scaffold.py   do_new (project + worker dirs, .codex config, symlinks), spawn_loop
   loop.py       the round loop: kickoff prompt, run_round, stop conditions, status
+  processes.py  persisted process identity + exact pidfd lifecycle
   __main__.py   `python -m danus.execution <worker_dir>` → loop.main
   tests/{test_execution.py, test_loop.py}
 ```
@@ -21,15 +22,16 @@ danus/execution/
 `agents/contracts/worker.md`, `.agents/skills` → `agents/skills/worker`, a
 `.codex/config.toml` (MCP = `python -m danus.gateway`, `DANUS_ROLE=worker`,
 `DANUS_VERIFY_URL`, `tool_timeout_sec=3600`), `TASK.md`, `local_memory/`, and the
-control files (`.status.json` `.pid` `.stop` `logs/`). `agents_root` =
+control files (`.status.json` `.pid` `.process.json` `.stop` `logs/`). `agents_root` =
 `DANUS_AGENTS_ROOT` (default `runtime/projects`).
 
 ## The round loop (`loop.py`)
 
 A **round = one `codex exec` continuation session** that resumes from persisted
-memory (NOT one increment). Launched detached in its **own process group**
-(`start_new_session`), so it survives your shell and `stop --force` can `killpg` the
-loop + its codex child. Stop conditions checked at the round boundary: `.stop` flag,
+memory (NOT one increment). Launched detached in its **own process group** (`start_new_session`) so it
+survives your shell. Emergency termination freezes and signals exact persisted
+process identities through pidfds; it never trusts a recycled numeric PID/PGID.
+Stop conditions checked at the round boundary: `.stop` flag,
 `.run_deadline`, `DANUS_MAX_ROUNDS` (0 = unlimited), `DANUS_MAX_CONSEC_FAILURES`
 (5). Config read at call time (`DANUS_ROUND_HARD_TIMEOUT` 4h, `DANUS_ROUND_BEAT` 5s).
 `.status.json` is written atomically. **Resumability is continuity in the stores**,

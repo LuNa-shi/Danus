@@ -412,10 +412,34 @@ def create_app(
         except Exception:
             return _error(400, "invalid lifecycle request")
         action = payload.get("action") if isinstance(payload, dict) else None
-        if action not in {"start", "stop"}:
+        if action not in {"assign", "status", "start", "stop"}:
             return _error(400, "invalid lifecycle action")
         if payload.get("force") is True:
             return _error(403, "force stop is reserved for host safety controls")
+        worker = payload.get("worker")
+        if worker is not None:
+            try:
+                validate_runtime_name(str(worker))
+            except ValueError:
+                return _error(400, "invalid worker")
+            worker = str(worker)
+
+        if action == "status":
+            try:
+                return runtime.status_project(project["runtime_name"])
+            except (RuntimeErrorBase, OSError):
+                return _error(502, "project status unavailable")
+        if action == "assign":
+            task = payload.get("task")
+            if worker is None or not isinstance(task, str) or not task.strip():
+                return _error(400, "assign requires worker and non-empty task")
+            try:
+                result = runtime.assign_worker(project["runtime_name"], worker, task)
+            except (RuntimeErrorBase, OSError) as exc:
+                store.audit("worker_assign", "failure", project_id)
+                return _error(409, str(exc)[:200] or "assignment failed")
+            store.audit("worker_assign", "success", project_id)
+            return {"status": "assigned", "worker": worker, "result": result}
 
         active = store.active_run(project_id)
         if active is None:

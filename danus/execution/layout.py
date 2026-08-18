@@ -17,7 +17,7 @@ which is also the codex working dir / LocalMemory root)::
         .codex/config.toml                        # MCP = danus gateway, role=worker
         TASK.md                                   # per-round assignment (danus assign)
         local_memory/                             # worker-private (codex writes)
-        .role .pid .pid.lock .stop .status.json  logs/
+        .role .pid .process.json .pid.lock .stop .status.json  logs/
 
 Key defaults:
   - the MCP server is launched as the installed package ``python -m danus.gateway``

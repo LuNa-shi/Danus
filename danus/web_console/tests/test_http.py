@@ -64,6 +64,14 @@ class FakeRuntime:
         } for worker, base in parsed]
         return {"runtime_name": runtime_name, "project_dir": str(project), "workers": self.statuses[runtime_name]}
 
+    def assign_worker(self, runtime_name, worker, task):
+        for row in self.statuses.get(runtime_name, []):
+            if row["worker"] == worker:
+                row["assigned"] = True
+                row["task"] = task
+                return {"worker": worker, "result": "assigned"}
+        raise RuntimeError("worker not found")
+
     def start_project(self, runtime_name):
         self.started.append(runtime_name)
         self.statuses[runtime_name] = [
@@ -147,7 +155,8 @@ def _login(client: TestClient):
 
 
 def _broker_lifecycle(
-    client: TestClient, project: dict, action: str, *, secret: bytes = _LIFECYCLE_SECRET,
+    client: TestClient, project: dict, action: str, *, worker: str | None = None,
+    task: str | None = None, secret: bytes = _LIFECYCLE_SECRET,
 ):
     token = project_lifecycle_capability(secret, project["id"], project["runtime_name"])
     with TestClient(
@@ -155,7 +164,12 @@ def _broker_lifecycle(
     ) as internal:
         return internal.post(
             f"/internal/api/projects/{project['id']}/lifecycle",
-            json={"action": action}, headers={"Authorization": f"Bearer {token}"},
+            json={
+                "action": action,
+                **({"worker": worker} if worker else {}),
+                **({"task": task} if task is not None else {}),
+            },
+            headers={"Authorization": f"Bearer {token}"},
         )
 
 
@@ -1452,3 +1466,25 @@ def test_deadline_supervisor_is_not_blocked_by_main_agent_turn(tmp_path: Path):
             main.release.set()
             thread.join(timeout=5)
         assert response["message"].status_code == 201
+
+
+def test_broker_scopes_status_and_assignment_without_shared_python_access(tmp_path: Path):
+    app, runtime = _app(tmp_path)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client)
+        headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post(
+            "/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers,
+        ).json()
+
+        assigned = _broker_lifecycle(
+            client, project, "assign", worker="high", task="prove the scoped lemma",
+        )
+        assert assigned.status_code == 200
+        assert assigned.json()["status"] == "assigned"
+        status = _broker_lifecycle(client, project, "status")
+        assert status.status_code == 200
+        worker = status.json()["workers"][0]
+        assert worker["worker"] == "high"
+        assert worker["assigned"] is True
+        assert worker["task"] == "prove the scoped lemma"
