@@ -852,7 +852,11 @@ def create_app(
             try:
                 runtime.write_deadline(project["runtime_name"], deadline)
                 store.audit("run_start", "intent_recorded", project_id)
-                return JSONResponse({"run_id": run["id"], "status": "start_requested", "deadline": deadline}, status_code=202)
+                return JSONResponse({
+                    "run_id": run["id"], "status": "start_requested",
+                    "duration_seconds": duration, "started_at": started,
+                    "deadline": deadline,
+                }, status_code=202)
             except (RuntimeErrorBase, OSError) as exc:
                 # A failed deadline write must not leave an active intent that
                 # appears safe to start later.
@@ -920,6 +924,8 @@ def create_app(
                 progress = worker_progress(projection.get("workers", []))
                 projection = {**projection, "run": {
                     "id": active["id"], "status": active["status"],
+                    "duration_seconds": active["duration_seconds"],
+                    "started_at": active["started_at"],
                     "deadline": active["deadline"], "outcome": active.get("outcome"),
                     "expected_worker_names": expected, "alive_worker_names": alive,
                     "alive_workers": alive, "not_running_workers": pending, **progress,

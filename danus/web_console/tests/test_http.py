@@ -268,7 +268,11 @@ def test_project_run_deadline_and_graceful_stop_are_scoped(tmp_path: Path):
         assert start.status_code == 202
         run = start.json()
         assert run["status"] == "start_requested"
+        assert run["duration_seconds"] == 43200
         assert 43190 <= run["deadline"] - time.time() <= 43210
+        projected_run = client.get(f"/api/projects/{a['id']}/runtime").json()["run"]
+        assert projected_run["duration_seconds"] == 43200
+        assert projected_run["started_at"] <= projected_run["deadline"]
         # The browser records the bounded run intent; only the project Main
         # Agent may request the normal Worker start through the host broker.
         assert runtime.started == []
