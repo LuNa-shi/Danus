@@ -658,153 +658,21 @@ class MainAgentAdapter:
 
     @classmethod
     def _parse_codex(cls, stdout: str) -> tuple[str | None, str]:
-        thread_id = None
-        reply = ""
-        for line in (stdout or "").splitlines():
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            kind = item.get("type")
-            payload = item.get("payload") or {}
-            if kind == "thread.started":
-                thread_id = item.get("thread_id") or thread_id
-            elif kind == "session_meta":
-                thread_id = payload.get("session_id") or payload.get("id") or thread_id
-            if kind == "item.completed":
-                obj = item.get("item") or {}
-                if obj.get("type") in {"agent_message", "message"} and obj.get("role", "assistant") == "assistant":
-                    reply = cls._message_text(obj) or reply
-            elif kind == "event_msg" and payload.get("type") == "agent_message":
-                reply = cls._message_text(payload) or reply
-            elif kind == "event_msg" and payload.get("type") == "task_complete":
-                reply = cls._text_value(payload.get("last_agent_message")) or reply
-            elif kind in {"response.output_text.done", "response.completed"}:
-                reply = cls._message_text(item) or cls._message_text(payload) or reply
-        return thread_id, reply.strip()
+        trace = normalize_trace(stdout)
+        return trace.session_id, trace.reply
 
     @staticmethod
     def _codex_terminal_state(stdout: str) -> str | None:
-        state = None
-        for line in (stdout or "").splitlines():
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            kind = item.get("type")
-            payload = item.get("payload") or {}
-            if kind == "event_msg" and payload.get("type") == "task_complete":
-                state = "failed" if payload.get("error") is not None else "completed"
-            elif kind in {"turn.failed", "response.failed", "error"}:
-                state = "failed"
-            elif kind == "turn.completed":
-                state = "completed"
-            elif kind == "response.completed":
-                response = item.get("response") or payload.get("response") or {}
-                failed = isinstance(response, dict) and (
-                    response.get("error") is not None
-                    or response.get("status") in {"failed", "cancelled", "incomplete"}
-                )
-                state = "failed" if failed else "completed"
-        return state
+        return normalize_trace(stdout).terminal_state
 
     @classmethod
     def _parse_codex_failure(cls, stdout: str) -> tuple[str | None, str] | None:
-        """Extract the final structured provider failure from Codex JSON events."""
-        failure = None
-        for line in (stdout or "").splitlines():
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            kind = item.get("type")
-            payload = item.get("payload") or {}
-            error = None
-            has_terminal_error = False
-            if kind == "event_msg" and payload.get("type") == "task_complete" and "error" in payload:
-                error = payload.get("error")
-                has_terminal_error = True
-            elif kind in {"turn.failed", "response.failed", "error"}:
-                error = item.get("error") or payload.get("error") or payload or item
-                has_terminal_error = True
-            if not has_terminal_error:
-                continue
-            if isinstance(error, dict):
-                code = error.get("codex_error_info") or error.get("code") or error.get("type")
-                message = cls._text_value(error.get("message")) or cls._text_value(error)
-            else:
-                code = None
-                message = cls._text_value(error)
-            safe_message = message.strip() if message else "Codex reported a terminal error."
-            failure = (str(code) if code else None, safe_message)
-        return failure
-
+        return normalize_trace(stdout).failure
 
     @staticmethod
     def _codex_activity(stdout: str) -> tuple[bool, bool]:
-        """Return (tool activity observed, parse uncertain) for retry safety."""
-        observed_tool_activity = False
-        parse_uncertain = False
-        passive_item_types = {"agent_message", "message", "reasoning"}
-        tool_item_types = {
-            "command_execution", "file_change", "function_call", "function_call_output",
-            "mcp_tool_call", "tool_call", "tool_search_call", "tool_search_output",
-            "custom_tool_call", "custom_tool_call_output", "web_search_call",
-        }
-        passive_event_types = {
-            "task_started", "task_complete", "user_message", "agent_message", "token_count",
-        }
-        for line in (stdout or "").splitlines():
-            if not line.strip():
-                continue
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                parse_uncertain = True
-                continue
-            kind = item.get("type")
-            payload = item.get("payload") or {}
-            if kind == "response_item":
-                item_type = payload.get("type")
-                if item_type in tool_item_types:
-                    observed_tool_activity = True
-                elif item_type not in passive_item_types:
-                    parse_uncertain = True
-            elif kind in {"item.started", "item.completed"}:
-                nested = item.get("item") or {}
-                item_type = nested.get("type")
-                if item_type in tool_item_types:
-                    observed_tool_activity = True
-                elif item_type not in passive_item_types:
-                    parse_uncertain = True
-            elif kind == "response.completed":
-                response = item.get("response") or payload.get("response") or {}
-                output = response.get("output") if isinstance(response, dict) else None
-                if not isinstance(output, list):
-                    parse_uncertain = True
-                for nested in output or []:
-                    item_type = nested.get("type") if isinstance(nested, dict) else None
-                    if item_type in tool_item_types:
-                        observed_tool_activity = True
-                    elif item_type not in passive_item_types:
-                        parse_uncertain = True
-            elif kind == "event_msg":
-                event_type = payload.get("type")
-                if event_type and (
-                    "tool_call" in str(event_type)
-                    or str(event_type).startswith(("exec_", "command_", "file_change"))
-                ):
-                    observed_tool_activity = True
-                elif event_type not in passive_event_types:
-                    parse_uncertain = True
-            elif kind not in {
-                "thread.started", "turn.started", "turn.completed",
-                "session_meta", "world_state", "turn_context",
-                "response.output_text.done", "turn.failed",
-                "response.failed", "error",
-            }:
-                parse_uncertain = True
-        return observed_tool_activity, parse_uncertain
+        trace = normalize_trace(stdout)
+        return trace.tool_activity, trace.parse_uncertain
 
     @staticmethod
     def _codex_mcp_config(root: Path, env: dict[str, str]) -> str:

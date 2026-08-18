@@ -92,7 +92,11 @@ def normalize_trace(stdout: str) -> NormalizedTrace:
             obj = item.get("item") if isinstance(item.get("item"), dict) else {}
             typ = str(obj.get("type") or "")
             if typ in {"command_execution", "file_change", "function_call", "function_call_output", "mcp_tool_call", "tool_call", "tool_search_call", "tool_search_output", "custom_tool_call", "custom_tool_call_output"}: tool = True
-            elif typ not in {"agent_message", "message", "reasoning", ""}: uncertain = True
+            elif typ in {"agent_message", "message"} and str(obj.get("role") or "assistant") == "assistant":
+                content = obj.get("content")
+                if isinstance(content, list): reply = "".join(str(part.get("text") or "") for part in content if isinstance(part, dict)) or reply
+                elif isinstance(content, str): reply = content
+            elif typ not in {"reasoning", ""}: uncertain = True
         elif kind == "response.completed":
             response = item.get("response") if isinstance(item.get("response"), dict) else payload.get("response") if isinstance(payload.get("response"), dict) else {}
             output = response.get("output") if isinstance(response.get("output"), list) else []
