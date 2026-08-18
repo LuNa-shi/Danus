@@ -722,6 +722,8 @@ def test_operator_can_select_preview_and_submit_a_non_default_run_budget():
     assert ".run-budget-control" in css
     assert "grid-template-columns: minmax(130px, .55fr) minmax(0, 1.2fr) minmax(180px, 1fr)" in css
     assert ".run-budget-preview.error" in css
+    assert "@media (max-width: 1100px)" in css
+    assert ".run-budget-control { grid-template-columns: 1fr; gap: 8px; }" in css
     assert ".run-budget-control, .lifecycle-controls { grid-template-columns: 1fr" in css
 
 
