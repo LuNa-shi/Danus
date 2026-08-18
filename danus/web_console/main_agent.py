@@ -1,10 +1,16 @@
 """Project-scoped Main Agent session adapter."""
 from __future__ import annotations
 
+from collections import deque
 import json
+import math
 import os
+import re
 import shutil
+import signal
+import shlex
 import subprocess
+import threading
 import sys
 import time
 import uuid
@@ -17,7 +23,19 @@ from .runtime import RuntimeErrorBase
 
 
 class MainAgentError(RuntimeErrorBase):
-    pass
+    """A user-visible Main Agent turn failure with safe operational metadata."""
+
+    def __init__(self, message: str, *, code: str | None = None,
+                 session_id: str | None = None, retryable: bool = False,
+                 safe_to_retry: bool = False, attempts: int = 1,
+                 observed_tool_activity: bool = False):
+        super().__init__(message)
+        self.code = code
+        self.session_id = session_id
+        self.retryable = retryable
+        self.safe_to_retry = safe_to_retry
+        self.attempts = attempts
+        self.observed_tool_activity = observed_tool_activity
 
 
 class MainAgentAdapter:
@@ -31,7 +49,10 @@ class MainAgentAdapter:
 
     def __init__(self, *, runner: Callable[..., Any] | None = None, backend: str = "codex",
                  claude_bin: str = "claude", codex_bin: str = "codex", model: str | None = None,
-                 effort: str | None = None, timeout: float = 900.0):
+                 effort: str | None = None, timeout: float = 900.0,
+                 max_attempts: int | None = None, retry_base_seconds: float | None = None,
+                 retry_cap_seconds: float | None = None,
+                 sleeper: Callable[[float], None] | None = None):
         if backend not in {"codex", "claude"}:
             raise ValueError("main-agent backend must be codex or claude")
         self.backend = backend
@@ -40,7 +61,28 @@ class MainAgentAdapter:
         self.model = model
         self.effort = effort
         self.timeout = timeout
+        configured_attempts = max_attempts if max_attempts is not None else self._int_env("DANUS_WEB_MAIN_AGENT_MAX_ATTEMPTS", 3)
+        configured_base = retry_base_seconds if retry_base_seconds is not None else self._float_env("DANUS_WEB_MAIN_AGENT_RETRY_BASE_SECONDS", 2.0)
+        configured_cap = retry_cap_seconds if retry_cap_seconds is not None else self._float_env("DANUS_WEB_MAIN_AGENT_RETRY_CAP_SECONDS", 8.0)
+        self.max_attempts = min(5, max(1, configured_attempts))
+        self.retry_base_seconds = configured_base if math.isfinite(configured_base) and configured_base >= 0 else 2.0
+        self.retry_cap_seconds = configured_cap if math.isfinite(configured_cap) and configured_cap >= 0 else 8.0
         self._runner = runner or self._default_runner
+        self._sleeper = sleeper or time.sleep
+
+    @staticmethod
+    def _int_env(name: str, default: int) -> int:
+        try:
+            return int(os.environ.get(name, str(default)))
+        except ValueError:
+            return default
+
+    @staticmethod
+    def _float_env(name: str, default: float) -> float:
+        try:
+            return float(os.environ.get(name, str(default)))
+        except ValueError:
+            return default
 
     @staticmethod
     def _resolve_codex() -> str:
@@ -63,8 +105,97 @@ class MainAgentAdapter:
         return resolved
 
     @staticmethod
-    def _default_runner(cmd, *, input, cwd, env, timeout):
-        return subprocess.run(cmd, input=input, capture_output=True, text=True, cwd=cwd, env=env, timeout=timeout)
+    def _default_runner(cmd, *, input, cwd, env, timeout, on_stdout_line=None):
+        if on_stdout_line is None:
+            return subprocess.run(
+                cmd, input=input, capture_output=True, text=True,
+                cwd=cwd, env=env, timeout=timeout,
+            )
+
+        process = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, cwd=cwd, env=env, bufsize=1, start_new_session=True,
+        )
+        stdout_head: list[str] = []
+        stdout_tail: deque[str] = deque()
+        stderr_tail: deque[str] = deque(maxlen=100)
+        stdout_line_count = 0
+        stdout_tail_chars = 0
+        stdout_content_truncated = False
+        timed_out = threading.Event()
+
+        def drain_stderr() -> None:
+            if process.stderr is not None:
+                for line in iter(lambda: process.stderr.readline(1024 * 1024 + 1), ""):
+                    stderr_tail.append(line[:16384])
+
+        def signal_process_group(sig: int) -> None:
+            try:
+                os.killpg(process.pid, sig)
+            except (ProcessLookupError, PermissionError):
+                try:
+                    process.send_signal(sig)
+                except ProcessLookupError:
+                    pass
+
+        def terminate_on_timeout() -> None:
+            timed_out.set()
+            signal_process_group(signal.SIGTERM)
+            for _ in range(10):
+                try:
+                    os.killpg(process.pid, 0)
+                except (ProcessLookupError, PermissionError):
+                    return
+                time.sleep(0.1)
+            # The parent may already be gone while a descendant still owns the pipes.
+            signal_process_group(signal.SIGKILL)
+
+        stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+        timer = threading.Timer(timeout, terminate_on_timeout)
+        stderr_thread.start()
+        timer.start()
+        try:
+            if process.stdin is not None:
+                try:
+                    process.stdin.write(input)
+                    process.stdin.close()
+                except BrokenPipeError:
+                    pass
+            if process.stdout is not None:
+                for line in iter(lambda: process.stdout.readline(1024 * 1024 + 1), ""):
+                    stdout_line_count += 1
+                    if len(line) > 262144:
+                        stdout_content_truncated = True
+                    captured = line[:262144]
+                    if len(stdout_head) < 20:
+                        stdout_head.append(captured)
+                    else:
+                        stdout_tail.append(captured)
+                        stdout_tail_chars += len(captured)
+                        while stdout_tail_chars > 8 * 1024 * 1024 and stdout_tail:
+                            stdout_tail_chars -= len(stdout_tail.popleft())
+                    on_stdout_line(line.rstrip("\n"))
+            returncode = process.wait()
+        except BaseException:
+            signal_process_group(signal.SIGKILL)
+            if process.poll() is None:
+                process.wait()
+            raise
+        finally:
+            timer.cancel()
+            stderr_thread.join(timeout=2)
+
+        capture_truncated = stdout_content_truncated or stdout_line_count > len(stdout_head) + len(stdout_tail)
+        stdout = "".join(stdout_head)
+        if capture_truncated:
+            stdout += "\n<CODEX_STDOUT_CAPTURE_TRUNCATED>\n"
+        stdout += "".join(stdout_tail)
+        stderr = "".join(stderr_tail)
+        if timed_out.is_set():
+            raise subprocess.TimeoutExpired(
+                cmd=cmd, timeout=timeout, output=stdout, stderr=stderr,
+            )
+        return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
 
     def _prompt(self, *, message: str, manifest: list[dict[str, Any]], project_state: dict[str, Any], attachments: list[dict[str, Any]]) -> str:
         repo = Path(__file__).resolve().parents[2]
@@ -191,6 +322,211 @@ class MainAgentAdapter:
                 return text
         return ""
 
+    @staticmethod
+    def _redact_display_text(value: str, limit: int = 1200) -> str:
+        text = str(value or "")
+        text = re.sub(
+            r"(?is)-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?-----END [^-\r\n]*PRIVATE KEY-----",
+            "<REDACTED_PRIVATE_KEY>", text,
+        )
+        text = re.sub(
+            r"(?im)^(\s*(?:export\s+)?[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|AUTHORIZATION|COOKIE|SESSION|CREDENTIAL)[A-Z0-9_]*\s*=).*$",
+            r"\1<REDACTED>", text,
+        )
+        text = re.sub(
+            r"(?i)((?:-u|--user)\s+)(?:\"[^\"]*\"|'[^']*'|\S+)",
+            r"\1<REDACTED>", text,
+        )
+        text = re.sub(
+            r"(?i)([a-z][a-z0-9+.-]*://)[^/\s:@]+:[^@\s/]+@",
+            r"\1<REDACTED>@", text,
+        )
+        text = re.sub(
+            r"(?i)((?:authorization|cookie|set-cookie|x-session)\s*[:=]\s*)(?:bearer\s+)?[^\r\n]+",
+            r"\1<REDACTED>", text,
+        )
+        text = re.sub(
+            r"(?i)([\"']?(?:api[_-]?key|token|secret|password|auth[_-]?token|session|cookie|credential|private[_-]?key|access[_-]?key)[\"']?\s*[:=]\s*)([\"']?)[^\s,\"';}]+\2",
+            r"\1<REDACTED>", text,
+        )
+        text = re.sub(r"(?i)\b(?:sk|rk)-[A-Za-z0-9_-]{8,}\b", "<REDACTED>", text)
+        text = re.sub(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b", "<REDACTED>", text)
+        text = re.sub(r"\bglpat-[A-Za-z0-9_-]{20,}\b", "<REDACTED>", text)
+        text = re.sub(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b", "<REDACTED>", text)
+        text = re.sub(r"\bAIza[0-9A-Za-z_-]{20,}\b", "<REDACTED>", text)
+        text = re.sub(r"\b(?:hf|npm)_[A-Za-z0-9_-]{20,}\b", "<REDACTED>", text)
+        text = re.sub(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b", "<REDACTED>", text)
+        text = re.sub(
+            r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}\b",
+            "<REDACTED>", text,
+        )
+        return text[:limit]
+
+    @classmethod
+    def _safe_display_value(cls, value: Any, limit: int = 1200) -> str:
+        secret_names = re.compile(r"(?i)(api[_-]?key|token|secret|password|authorization|auth[_-]?token|session|cookie|credential|private[_-]?key|access[_-]?key)")
+
+        def clean(item: Any) -> Any:
+            if isinstance(item, dict):
+                return {
+                    str(key): "<REDACTED>" if secret_names.search(str(key)) else clean(inner)
+                    for key, inner in item.items()
+                }
+            if isinstance(item, list):
+                return [clean(inner) for inner in item]
+            if isinstance(item, str):
+                return cls._redact_display_text(item, limit=limit)
+            if item is None or isinstance(item, (bool, int, float)):
+                return item
+            return cls._redact_display_text(str(item), limit=limit)
+
+        parsed = value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                parsed = value
+        if isinstance(parsed, (dict, list)):
+            rendered = json.dumps(clean(parsed), ensure_ascii=False, sort_keys=True)
+        else:
+            rendered = str(clean(parsed))
+        return cls._redact_display_text(rendered, limit=limit)
+
+    @classmethod
+    def _tool_call_detail(cls, tool: str, raw_detail: Any) -> str:
+        parsed = raw_detail
+        if isinstance(raw_detail, str):
+            try:
+                parsed = json.loads(raw_detail)
+            except (json.JSONDecodeError, TypeError):
+                parsed = raw_detail
+        lowered = str(tool or "").lower()
+        if lowered in {"exec_command", "command_execution"}:
+            command = parsed.get("cmd") if isinstance(parsed, dict) else parsed
+            try:
+                parts = shlex.split(str(command or ""))
+            except ValueError:
+                parts = str(command or "").split()
+            if not parts:
+                return "命令执行"
+            visible_count = 3 if parts[0].endswith("danus-web-agent") else 1
+            summary = " ".join(parts[:visible_count])
+            hidden = isinstance(parsed, dict) and any(
+                re.search(r"(?i)(key|token|secret|password|authorization|session|cookie|credential)", str(key))
+                for key in parsed
+            )
+            suffix = "；敏感参数已隐藏" if hidden else ""
+            return cls._redact_display_text(f"命令：{summary}{suffix}", 500)
+        if isinstance(parsed, dict):
+            secret_names = re.compile(r"(?i)(key|token|secret|password|authorization|session|cookie|credential)")
+            keys = sorted(str(key) for key in parsed if not secret_names.search(str(key)))
+            identity = {
+                str(key): parsed[key]
+                for key in ("project", "worker", "kind", "role")
+                if key in parsed and not secret_names.search(str(key))
+            }
+            pieces = [f"参数字段：{', '.join(keys[:20])}" if keys else "无公开参数"]
+            if identity:
+                pieces.append(cls._safe_display_value(identity, 500))
+            if len(keys) != len(parsed):
+                pieces.append("敏感参数已隐藏")
+            return "；".join(pieces)[:800]
+        return "参数已隐藏"
+
+    @classmethod
+    def _codex_progress_events(cls, line: str) -> list[dict[str, Any]]:
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            return []
+        kind = item.get("type")
+        payload = item.get("payload") or {}
+        events: list[dict[str, Any]] = []
+
+        def from_object(obj: Any, phase: str) -> None:
+            if not isinstance(obj, dict):
+                return
+            item_type = obj.get("type")
+            if item_type == "reasoning":
+                return
+            if item_type in {"agent_message", "message"}:
+                role = obj.get("role", "assistant")
+                text = cls._message_text(obj)
+                if role == "assistant" and text:
+                    events.append({"type": "agent.message", "detail": cls._redact_display_text(text, 4000)})
+                return
+            if item_type in {
+                "function_call", "custom_tool_call", "tool_search_call", "web_search_call",
+                "mcp_tool_call", "tool_call",
+            }:
+                tool = obj.get("name") or obj.get("tool") or item_type
+                raw_detail = obj.get("arguments") or obj.get("input") or obj.get("query") or ""
+                events.append({
+                    "type": "tool.started", "tool": cls._redact_display_text(str(tool), 120),
+                    "detail": cls._tool_call_detail(str(tool), raw_detail),
+                })
+                return
+            if item_type in {
+                "function_call_output", "custom_tool_call_output", "tool_search_output",
+            }:
+                events.append({
+                    "type": "tool.completed", "tool": "tool result",
+                    "detail": "工具已返回结果（原始输出未展示）",
+                })
+                return
+            if item_type == "command_execution":
+                command = obj.get("command") or obj.get("cmd") or ""
+                events.append({
+                    "type": "tool.completed" if phase == "completed" else "tool.started",
+                    "tool": "exec_command",
+                    "detail": cls._tool_call_detail("exec_command", command),
+                    "status": "completed" if phase == "completed" else "started",
+                })
+                return
+            if item_type == "file_change":
+                events.append({
+                    "type": "tool.completed" if phase == "completed" else "tool.started",
+                    "tool": "file_change",
+                    "detail": "文件变更状态已更新（具体内容未展示）",
+                })
+
+        if kind in {"thread.started", "turn.started"}:
+            events.append({"type": "turn.started", "detail": "Main Agent 会话已建立"})
+        elif kind == "turn.completed":
+            events.append({"type": "turn.completed", "detail": "Main Agent 已完成本次回复"})
+        elif kind == "turn.failed":
+            error = item.get("error") or payload.get("error") or {}
+            message = error.get("message") if isinstance(error, dict) else str(error or "")
+            events.append({"type": "turn.failed", "detail": cls._redact_display_text(message or "Main Agent 执行失败")})
+        elif kind == "response_item":
+            from_object(payload, "completed")
+        elif kind in {"item.started", "item.completed"}:
+            from_object(item.get("item") or {}, "completed" if kind == "item.completed" else "started")
+        elif kind == "response.completed":
+            response = item.get("response") or payload.get("response") or {}
+            for output in response.get("output", []) if isinstance(response, dict) else []:
+                from_object(output, "completed")
+        elif kind == "event_msg":
+            event_type = payload.get("type")
+            if event_type == "agent_message":
+                text = cls._message_text(payload)
+                if text:
+                    events.append({"type": "agent.message", "detail": cls._redact_display_text(text, 4000)})
+            elif event_type == "task_complete":
+                if payload.get("error") is not None:
+                    error = payload.get("error")
+                    message = error.get("message") if isinstance(error, dict) else str(error or "")
+                    events.append({"type": "turn.failed", "detail": cls._redact_display_text(message or "Main Agent 执行失败")})
+                else:
+                    events.append({"type": "turn.completed", "detail": "Main Agent 已完成本次回复"})
+            elif event_type and "tool_call" in str(event_type):
+                events.append({
+                    "type": "tool.completed" if str(event_type).endswith(("end", "completed")) else "tool.started",
+                    "tool": cls._redact_display_text(str(payload.get("tool") or payload.get("name") or "MCP tool"), 120),
+                    "detail": "工具调用状态已更新（原始输出未展示）",
+                })
+        return events
+
     @classmethod
     def _parse_codex(cls, stdout: str) -> tuple[str | None, str]:
         thread_id = None
@@ -219,6 +555,129 @@ class MainAgentAdapter:
         return thread_id, reply.strip()
 
     @staticmethod
+    def _codex_terminal_state(stdout: str) -> str | None:
+        state = None
+        for line in (stdout or "").splitlines():
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            kind = item.get("type")
+            payload = item.get("payload") or {}
+            if kind == "event_msg" and payload.get("type") == "task_complete":
+                state = "failed" if payload.get("error") is not None else "completed"
+            elif kind in {"turn.failed", "response.failed", "error"}:
+                state = "failed"
+            elif kind == "turn.completed":
+                state = "completed"
+            elif kind == "response.completed":
+                response = item.get("response") or payload.get("response") or {}
+                failed = isinstance(response, dict) and (
+                    response.get("error") is not None
+                    or response.get("status") in {"failed", "cancelled", "incomplete"}
+                )
+                state = "failed" if failed else "completed"
+        return state
+
+    @classmethod
+    def _parse_codex_failure(cls, stdout: str) -> tuple[str | None, str] | None:
+        """Extract the final structured provider failure from Codex JSON events."""
+        failure = None
+        for line in (stdout or "").splitlines():
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            kind = item.get("type")
+            payload = item.get("payload") or {}
+            error = None
+            has_terminal_error = False
+            if kind == "event_msg" and payload.get("type") == "task_complete" and "error" in payload:
+                error = payload.get("error")
+                has_terminal_error = True
+            elif kind in {"turn.failed", "response.failed", "error"}:
+                error = item.get("error") or payload.get("error") or payload or item
+                has_terminal_error = True
+            if not has_terminal_error:
+                continue
+            if isinstance(error, dict):
+                code = error.get("codex_error_info") or error.get("code") or error.get("type")
+                message = cls._text_value(error.get("message")) or cls._text_value(error)
+            else:
+                code = None
+                message = cls._text_value(error)
+            safe_message = message.strip() if message else "Codex reported a terminal error."
+            failure = (str(code) if code else None, safe_message)
+        return failure
+
+
+    @staticmethod
+    def _codex_activity(stdout: str) -> tuple[bool, bool]:
+        """Return (tool activity observed, parse uncertain) for retry safety."""
+        observed_tool_activity = False
+        parse_uncertain = False
+        passive_item_types = {"agent_message", "message", "reasoning"}
+        tool_item_types = {
+            "command_execution", "file_change", "function_call", "function_call_output",
+            "mcp_tool_call", "tool_call", "tool_search_call", "tool_search_output",
+            "custom_tool_call", "custom_tool_call_output", "web_search_call",
+        }
+        passive_event_types = {
+            "task_started", "task_complete", "user_message", "agent_message", "token_count",
+        }
+        for line in (stdout or "").splitlines():
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                parse_uncertain = True
+                continue
+            kind = item.get("type")
+            payload = item.get("payload") or {}
+            if kind == "response_item":
+                item_type = payload.get("type")
+                if item_type in tool_item_types:
+                    observed_tool_activity = True
+                elif item_type not in passive_item_types:
+                    parse_uncertain = True
+            elif kind in {"item.started", "item.completed"}:
+                nested = item.get("item") or {}
+                item_type = nested.get("type")
+                if item_type in tool_item_types:
+                    observed_tool_activity = True
+                elif item_type not in passive_item_types:
+                    parse_uncertain = True
+            elif kind == "response.completed":
+                response = item.get("response") or payload.get("response") or {}
+                output = response.get("output") if isinstance(response, dict) else None
+                if not isinstance(output, list):
+                    parse_uncertain = True
+                for nested in output or []:
+                    item_type = nested.get("type") if isinstance(nested, dict) else None
+                    if item_type in tool_item_types:
+                        observed_tool_activity = True
+                    elif item_type not in passive_item_types:
+                        parse_uncertain = True
+            elif kind == "event_msg":
+                event_type = payload.get("type")
+                if event_type and (
+                    "tool_call" in str(event_type)
+                    or str(event_type).startswith(("exec_", "command_", "file_change"))
+                ):
+                    observed_tool_activity = True
+                elif event_type not in passive_event_types:
+                    parse_uncertain = True
+            elif kind not in {
+                "thread.started", "turn.started", "turn.completed",
+                "session_meta", "world_state", "turn_context",
+                "response.output_text.done", "turn.failed",
+                "response.failed", "error",
+            }:
+                parse_uncertain = True
+        return observed_tool_activity, parse_uncertain
+
+    @staticmethod
     def _codex_mcp_config(root: Path, env: dict[str, str]) -> str:
         """Return one TOML inline-table override for the scoped Danus MCP."""
         def q(value: str) -> str:
@@ -240,7 +699,8 @@ class MainAgentAdapter:
         ]
         return "mcp_servers.danus={" + ",".join(fields) + "}"
 
-    def _send_codex(self, *, root: Path, session_id: str | None, prompt: str, env: dict[str, str]) -> dict[str, Any]:
+    def _send_codex(self, *, root: Path, session_id: str | None, prompt: str,
+                    env: dict[str, str], on_progress: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
         model = self.model or env.get("DANUS_CODEX_MODEL") or env.get("CODEX_API_MODEL")
         provider_base_url = env.get("OPENAI_BASE_URL") or env.get("CODEX_API_BASE_URL")
         provider_key_env = (
@@ -277,30 +737,133 @@ class MainAgentAdapter:
         common += ["--config", f'model_reasoning_effort="{effort}"',
                    "--approve-for-me",
                    "--skip-git-repo-check", "-C", str(root), "--config", mcp_config]
-        cmd = [self.codex_bin, "exec", *common]
-        if session_id:
-            # Codex's resume parser accepts the common exec options only when
-            # they precede the `resume` subcommand.
-            cmd += ["resume", session_id, "-"]
-        else:
-            cmd += ["-"]
+
+        def command(resume_id: str | None) -> list[str]:
+            cmd = [self.codex_bin, "exec", *common]
+            if resume_id:
+                # Codex's resume parser accepts the common exec options only when
+                # they precede the `resume` subcommand.
+                cmd += ["resume", resume_id, "-"]
+            else:
+                cmd += ["-"]
+            return cmd
+
+        retryable_codes = {
+            "server_overloaded", "rate_limit_exceeded", "service_unavailable",
+            "upstream_timeout", "request_timeout", "timeout",
+        }
+        continuation = (
+            "Continue the interrupted Main Agent turn after a transient provider failure. "
+            "Do not repeat completed side effects. Inspect current Project state before any "
+            "write, finish the remaining orchestration work, and return the final operator reply."
+        )
         started = time.monotonic()
-        try:
-            result = self._runner(cmd, input=prompt, cwd=str(root), env=env, timeout=self.timeout)
-        except subprocess.TimeoutExpired as exc:
-            raise MainAgentError("main agent turn timed out") from exc
-        except (FileNotFoundError, PermissionError, OSError) as exc:
-            raise MainAgentError(f"main agent process could not start: {exc}") from exc
-        actual_id, reply = self._parse_codex(getattr(result, "stdout", ""))
-        if getattr(result, "returncode", 1) != 0 or not reply:
-            detail = (getattr(result, "stderr", "") or "").strip()[-300:]
-            raise MainAgentError("main agent turn failed" + (f": {detail}" if detail else ""))
-        chosen_id = actual_id or session_id
-        if not chosen_id:
-            raise MainAgentError("main agent returned no session identity")
-        return {"session_id": chosen_id, "reply": reply,
-                "status": "completed", "seconds": round(time.monotonic() - started, 1),
-                "read_status": "unknown"}
+        active_session_id = session_id
+        active_prompt = prompt
+        last_progress_signature: tuple[Any, ...] | None = None
+
+        def emit_stdout_line(line: str) -> None:
+            nonlocal last_progress_signature
+            if on_progress is None:
+                return
+            for event in self._codex_progress_events(line):
+                signature = (
+                    event.get("type"), event.get("tool"), event.get("detail"),
+                    event.get("status"), event.get("call_id"),
+                )
+                if signature == last_progress_signature:
+                    continue
+                last_progress_signature = signature
+                try:
+                    on_progress(event)
+                except Exception:
+                    # Progress display is best-effort and must never abort a turn.
+                    continue
+
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                result = self._runner(
+                    command(active_session_id), input=active_prompt, cwd=str(root),
+                    env=env, timeout=self.timeout, on_stdout_line=emit_stdout_line,
+                )
+            except subprocess.TimeoutExpired as exc:
+                partial = getattr(exc, "stdout", None) or getattr(exc, "output", None) or ""
+                if isinstance(partial, bytes):
+                    partial = partial.decode("utf-8", errors="replace")
+                actual_id, _ = self._parse_codex(str(partial))
+                observed_tool_activity, _ = self._codex_activity(str(partial))
+                raise MainAgentError(
+                    "main agent turn timed out", code="timeout",
+                    session_id=actual_id or active_session_id,
+                    attempts=attempt, observed_tool_activity=observed_tool_activity,
+                ) from exc
+            except (FileNotFoundError, PermissionError, OSError) as exc:
+                raise MainAgentError(
+                    f"main agent process could not start: {exc}",
+                    session_id=active_session_id, attempts=attempt,
+                ) from exc
+
+            stdout = getattr(result, "stdout", "") or ""
+            actual_id, reply = self._parse_codex(stdout)
+            failure = self._parse_codex_failure(stdout)
+            terminal_state = self._codex_terminal_state(stdout)
+            observed_tool_activity, parse_uncertain = self._codex_activity(stdout)
+            chosen_id = actual_id or active_session_id
+            if getattr(result, "returncode", 1) == 0 and reply and failure is None and terminal_state == "completed":
+                if not chosen_id:
+                    raise MainAgentError(
+                        "main agent returned no session identity", attempts=attempt,
+                    )
+                return {
+                    "session_id": chosen_id,
+                    "reply": self._redact_display_text(reply, max(1, len(reply) + 1)),
+                    "status": "completed", "seconds": round(time.monotonic() - started, 1),
+                    "read_status": "unknown", "attempts": attempt,
+                }
+
+            code, structured_detail = failure or (None, "")
+            stderr_detail = (getattr(result, "stderr", "") or "").strip()[-300:]
+            if terminal_state is None and not structured_detail and not stderr_detail:
+                structured_detail = "main agent returned without a terminal completion event"
+            retryable = bool(code in retryable_codes)
+            automatic_retry_safe = not observed_tool_activity and not parse_uncertain
+            if retryable and automatic_retry_safe and attempt < self.max_attempts and chosen_id:
+                delay = min(self.retry_cap_seconds, self.retry_base_seconds * (2 ** (attempt - 1)))
+                if on_progress is not None:
+                    safe_retry_detail = self._redact_display_text(structured_detail, 1200)
+                    try:
+                        on_progress({
+                            "type": "turn.retry",
+                            "status": "retrying",
+                            "attempt": attempt + 1,
+                            "max_attempts": self.max_attempts,
+                            "delay_seconds": delay,
+                            "error_code": code,
+                            "message": safe_retry_detail,
+                            "detail": safe_retry_detail,
+                            "session_id": chosen_id,
+                        })
+                    except Exception:
+                        pass
+                self._sleeper(delay)
+                active_session_id = chosen_id
+                active_prompt = continuation
+                continue
+
+            detail = (structured_detail or stderr_detail).strip()[-300:]
+            code_label = f" [{code}]" if code else ""
+            raise MainAgentError(
+                "main agent turn failed" + code_label + (f": {detail}" if detail else ""),
+                code=code, session_id=chosen_id, retryable=retryable,
+                safe_to_retry=retryable and automatic_retry_safe,
+                attempts=attempt, observed_tool_activity=observed_tool_activity,
+            )
+
+        raise MainAgentError(
+            "main agent turn failed", session_id=active_session_id,
+            attempts=self.max_attempts,
+        )
+
 
     def _send_claude(self, *, root: Path, session_id: str | None, prompt: str, env: dict[str, str]) -> dict[str, Any]:
         repo = Path(__file__).resolve().parents[2]
@@ -357,7 +920,10 @@ class MainAgentAdapter:
                 "status": "completed", "seconds": round(time.monotonic() - started, 1),
                 "read_status": parsed.get("read_status", "unknown")}
 
-    def send(self, *, context_dir: Path, session_id: str | None, message: str, manifest: list[dict[str, Any]], project_state: dict[str, Any], attachments: list[dict[str, Any]]) -> dict[str, Any]:
+    def send(self, *, context_dir: Path, session_id: str | None, message: str,
+             manifest: list[dict[str, Any]], project_state: dict[str, Any],
+             attachments: list[dict[str, Any]],
+             on_progress: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
         raw_root = Path(context_dir)
         if raw_root.is_symlink():
             raise MainAgentError("project context directory must not be a symlink")
@@ -367,5 +933,11 @@ class MainAgentAdapter:
         if not isinstance(message, str) or not message.strip():
             raise MainAgentError("message must be non-empty")
         prompt = self._prompt(message=message, manifest=manifest, project_state=project_state, attachments=attachments)
-        result = self._send_codex(root=root, session_id=session_id, prompt=prompt, env=self._env(root)) if self.backend == "codex" else self._send_claude(root=root, session_id=session_id, prompt=prompt, env=self._env(root))
+        env = self._env(root)
+        result = self._send_codex(
+            root=root, session_id=session_id, prompt=prompt, env=env,
+            on_progress=on_progress,
+        ) if self.backend == "codex" else self._send_claude(
+            root=root, session_id=session_id, prompt=prompt, env=env,
+        )
         return result

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -9,8 +10,10 @@ from starlette.testclient import TestClient
 
 from danus.execution import layout as L
 from danus.web_console.config import ProviderModelCatalog
-from danus.web_console.app import AppSettings, create_app
+from danus.web_console.app import AppSettings, _public_main_agent_error, create_app
+from danus.web_console.main_agent import MainAgentError
 from danus.web_console.security import hash_password
+from danus.web_console.store import ConsoleStore
 
 
 class FakeRuntime:
@@ -463,6 +466,270 @@ def test_malformed_main_agent_result_marks_message_failed(tmp_path: Path):
         assert response.status_code == 502
         messages = client.get(f"/api/projects/{project['id']}/messages").json()
         assert messages[0]["status"] == "failed"
+        events = client.get(f"/api/projects/{project['id']}/main-agent-events").json()["events"]
+        assert [event["type"] for event in events] == ["turn.failed"]
+        assert events[0]["status"] == "failed"
+
+
+def test_main_agent_timeout_public_error_is_fail_closed():
+    error = MainAgentError("raw timeout diagnostics", code="timeout", retryable=False)
+
+    public = _public_main_agent_error(error)
+
+    assert "不要直接重试" in public
+    assert "重复操作" in public
+    assert "raw timeout diagnostics" not in public
+
+
+def test_main_agent_transient_failure_is_visible_and_keeps_resumable_session(tmp_path: Path):
+    class RetryingMain:
+        backend = "codex"
+        progress = []
+
+        def send(self, **kwargs):
+            event = {
+                "status": "retrying", "attempt": 2, "max_attempts": 3,
+                "delay_seconds": 2, "error_code": "server_overloaded",
+                "message": "Selected model is at capacity. Please try a different model.",
+                "session_id": "sid-overloaded",
+            }
+            kwargs["on_progress"](event)
+            self.progress.append(event)
+            raise MainAgentError(
+                "main agent turn failed: Selected model is at capacity. Please try a different model.",
+                code="server_overloaded", session_id="sid-overloaded",
+                retryable=True, safe_to_retry=True, attempts=3,
+            )
+
+    main = RetryingMain()
+    settings = AppSettings(
+        database_path=tmp_path / "retry.sqlite3",
+        password_hash=hash_password("correct horse battery staple"),
+        cookie_secure=True,
+        allowed_origins={"https://testserver"},
+    )
+    app = create_app(
+        settings=settings,
+        runtime=FakeRuntime(tmp_path / "retry-projects"),
+        main_agent=main,
+    )
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client)
+        headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post(
+            "/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers,
+        ).json()
+        response = client.post(
+            f"/api/projects/{project['id']}/messages",
+            json={"text": "hello", "attachment_ids": []}, headers=headers,
+        )
+
+        assert response.status_code == 502
+        assert response.json() == {
+            "detail": "上游模型当前繁忙；自动重试后仍未完成，请稍后再试。",
+            "error_code": "server_overloaded",
+            "provider_retryable": True,
+            "retryable": True,
+            "attempts": 3,
+        }
+        messages = client.get(f"/api/projects/{project['id']}/messages").json()
+        assert [message["status"] for message in messages] == ["failed", "failed"]
+        assert all(message["error"] == "上游模型当前繁忙；自动重试后仍未完成，请稍后再试。" for message in messages)
+        stored_session = app.state.console_store.agent_session(project["id"])
+        assert stored_session["session_id"] == "sid-overloaded"
+        assert stored_session["status"] == "inactive"
+        assert main.progress[0]["error_code"] == "server_overloaded"
+
+
+def test_main_agent_retry_progress_is_visible_while_the_post_is_still_running(tmp_path: Path):
+    class SlowRetryingMain:
+        backend = "codex"
+
+        def __init__(self):
+            self.progress_sent = threading.Event()
+            self.release = threading.Event()
+
+        def send(self, **kwargs):
+            kwargs["on_progress"]({
+                "status": "retrying", "attempt": 2, "max_attempts": 3,
+                "delay_seconds": 2, "error_code": "server_overloaded",
+                "message": "Selected model is at capacity. Please try a different model.",
+                "session_id": "sid-progress",
+            })
+            self.progress_sent.set()
+            assert self.release.wait(timeout=5)
+            return {
+                "session_id": "sid-progress", "reply": "recovered",
+                "status": "completed", "seconds": 0.1,
+                "read_status": "unknown", "attempts": 2,
+            }
+
+    main = SlowRetryingMain()
+    settings = AppSettings(
+        database_path=tmp_path / "progress.sqlite3",
+        password_hash=hash_password("correct horse battery staple"),
+        cookie_secure=True,
+        allowed_origins={"https://testserver"},
+    )
+    app = create_app(
+        settings=settings,
+        runtime=FakeRuntime(tmp_path / "progress-projects"),
+        main_agent=main,
+    )
+    with TestClient(app, base_url="https://testserver") as poster, TestClient(app, base_url="https://testserver") as observer:
+        poster_csrf = _login(poster)
+        observer_csrf = _login(observer)
+        poster_headers = {"X-CSRF-Token": poster_csrf, "Origin": "https://testserver"}
+        observer_headers = {"X-CSRF-Token": observer_csrf, "Origin": "https://testserver"}
+        project = poster.post(
+            "/api/projects", json={"name": "A", "problem": "alpha"},
+            headers=poster_headers,
+        ).json()
+        result = {}
+
+        def submit():
+            result["response"] = poster.post(
+                f"/api/projects/{project['id']}/messages",
+                json={"text": "hello", "attachment_ids": []},
+                headers=poster_headers,
+            )
+
+        thread = threading.Thread(target=submit)
+        thread.start()
+        assert main.progress_sent.wait(timeout=5)
+        in_flight = observer.get(
+            f"/api/projects/{project['id']}/messages", headers=observer_headers,
+        ).json()
+        assert len(in_flight) == 1
+        assert in_flight[0]["status"] == "retrying"
+        assert "第 2/3 次尝试" in in_flight[0]["error"]
+
+        main.release.set()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert result["response"].status_code == 201
+        completed = observer.get(
+            f"/api/projects/{project['id']}/messages", headers=observer_headers,
+        ).json()
+        assert [message["status"] for message in completed] == ["completed", "completed"]
+        assert completed[1]["text"] == "recovered"
+
+
+def test_concurrent_main_agent_messages_resume_the_session_created_by_the_first_turn(tmp_path: Path):
+    class SerializedMain:
+        backend = "codex"
+
+        def __init__(self):
+            self.calls = []
+            self.first_started = threading.Event()
+            self.release_first = threading.Event()
+
+        def send(self, **kwargs):
+            self.calls.append(kwargs["session_id"])
+            if len(self.calls) == 1:
+                self.first_started.set()
+                assert self.release_first.wait(timeout=5)
+                return {
+                    "session_id": "sid-first", "reply": "first", "status": "completed",
+                    "seconds": 0.1, "read_status": "unknown", "attempts": 1,
+                }
+            return {
+                "session_id": kwargs["session_id"], "reply": "second", "status": "completed",
+                "seconds": 0.1, "read_status": "unknown", "attempts": 1,
+            }
+
+    main = SerializedMain()
+    settings = AppSettings(
+        database_path=tmp_path / "serialized.sqlite3",
+        password_hash=hash_password("correct horse battery staple"),
+        cookie_secure=True,
+        allowed_origins={"https://testserver"},
+    )
+    app = create_app(
+        settings=settings,
+        runtime=FakeRuntime(tmp_path / "serialized-projects"),
+        main_agent=main,
+    )
+    with TestClient(app, base_url="https://testserver") as client:
+        headers = {"X-CSRF-Token": _login(client), "Origin": "https://testserver"}
+        project = client.post(
+            "/api/projects", json={"name": "A", "problem": "alpha"},
+            headers=headers,
+        ).json()
+        responses = {}
+
+        def submit(key, text):
+            responses[key] = client.post(
+                f"/api/projects/{project['id']}/messages",
+                json={"text": text, "attachment_ids": []}, headers=headers,
+            )
+
+        first_thread = threading.Thread(target=submit, args=("first", "one"))
+        second_thread = threading.Thread(target=submit, args=("second", "two"))
+        first_thread.start()
+        assert main.first_started.wait(timeout=5)
+        second_thread.start()
+        time.sleep(0.1)
+        assert main.calls == [None]
+        main.release_first.set()
+        first_thread.join(timeout=5)
+        second_thread.join(timeout=5)
+
+        assert responses["first"].status_code == 201
+        assert responses["second"].status_code == 201
+        assert main.calls == [None, "sid-first"]
+
+
+def test_main_agent_events_are_persisted_and_project_scoped(tmp_path: Path):
+    class StreamingMain:
+        backend = "codex"
+
+        def send(self, **kwargs):
+            for event in [
+                {"type": "turn.started", "detail": "Main Agent 会话已建立"},
+                {"type": "agent.message", "detail": "我先检查项目状态。"},
+                {"type": "tool.started", "tool": "exec_command", "detail": "danus-web-agent status", "call_id": "call-1"},
+                {"type": "tool.completed", "tool": "exec_command", "detail": "exit 0", "status": "completed", "call_id": "call-1"},
+                {"type": "turn.completed", "detail": "Main Agent 已完成本次回复"},
+            ]:
+                kwargs["on_progress"](event)
+            return {
+                "session_id": "sid-events", "reply": "done", "status": "completed",
+                "seconds": 0.1, "read_status": "unknown", "attempts": 1,
+            }
+
+    settings = AppSettings(
+        database_path=tmp_path / "events.sqlite3",
+        password_hash=hash_password("correct horse battery staple"),
+        cookie_secure=True,
+        allowed_origins={"https://testserver"},
+    )
+    app = create_app(
+        settings=settings,
+        runtime=FakeRuntime(tmp_path / "event-projects"),
+        main_agent=StreamingMain(),
+    )
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client)
+        headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        a = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
+        b = client.post("/api/projects", json={"name": "B", "problem": "beta"}, headers=headers).json()
+        response = client.post(
+            f"/api/projects/{a['id']}/messages",
+            json={"text": "hello", "attachment_ids": []}, headers=headers,
+        )
+        assert response.status_code == 201
+
+        events = client.get(f"/api/projects/{a['id']}/main-agent-events").json()["events"]
+        assert [event["type"] for event in events] == [
+            "turn.started", "agent.message", "tool.started", "tool.completed", "turn.completed",
+        ]
+        assert events[2]["tool"] == "exec_command"
+        assert events[2]["detail"] == "danus-web-agent status"
+        assert all("call_id" not in event for event in events)
+        assert all(event["message_id"] == response.json()["message_id"] for event in events)
+        assert client.get(f"/api/projects/{b['id']}/main-agent-events").json() == {"events": [], "last_id": 0}
+        assert client.get("/api/projects/foreign/main-agent-events").status_code == 404
 
 
 def test_read_only_projections_are_authenticated_and_project_scoped(tmp_path: Path):
@@ -646,3 +913,30 @@ def test_orchestration_projection_reads_real_session_guidance_and_tasks(tmp_path
         assert projection["workers"][0]["task"] == "Explore branch A"
         assert projection["master_guidance"]["claim"] == "Split into branches A and B"
         assert projection["elaboration"]["claim"] == "The missing bridge is compactness"
+
+def test_main_agent_event_retention_is_project_scoped(tmp_path: Path):
+    store = ConsoleStore(tmp_path / "retention.sqlite3")
+    store.MAIN_AGENT_EVENT_RETENTION = 3
+    for project_id in ("p1", "p2"):
+        store.add_project({
+            "id": project_id, "name": project_id, "runtime_name": project_id,
+            "problem": "problem", "roles": "high:1", "worker_model": None,
+            "max_parallel_workers": 1, "created_at": 1.0,
+        })
+        store.add_message({
+            "id": f"m-{project_id}", "project_id": project_id, "role": "user",
+            "text": "hello", "status": "submitted", "created_at": 1.0, "error": None,
+        })
+
+    for index in range(5):
+        store.add_main_agent_event(
+            project_id="p1", message_id="m-p1", event_type="agent.message",
+            payload={"detail": str(index)}, created_at=float(index),
+        )
+    store.add_main_agent_event(
+        project_id="p2", message_id="m-p2", event_type="turn.started",
+        payload={"detail": "other project"}, created_at=1.0,
+    )
+
+    assert [event["detail"] for event in store.main_agent_events("p1")] == ["2", "3", "4"]
+    assert [event["detail"] for event in store.main_agent_events("p2")] == ["other project"]

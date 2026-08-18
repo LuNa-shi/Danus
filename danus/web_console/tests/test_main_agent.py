@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,6 +27,74 @@ def _args(tmp_path: Path):
         "context_dir": tmp_path, "session_id": None, "message": "hello",
         "manifest": [], "project_state": {"project_id": "p"}, "attachments": [],
     }
+
+
+def _codex_success(*, session_id: str = "sid-1", message: str = "ok") -> str:
+    return "\n".join([
+        json.dumps({"type": "session_meta", "payload": {"session_id": session_id}}),
+        json.dumps({"type": "event_msg", "payload": {"type": "agent_message", "message": message}}),
+        json.dumps({"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": message}}),
+    ])
+
+
+def test_default_runner_streams_stdout_lines_before_process_completion(tmp_path: Path):
+    lines = []
+    result = MainAgentAdapter._default_runner(
+        [sys.executable, "-c", "print('one', flush=True); print('two', flush=True)"],
+        input="", cwd=str(tmp_path), env=dict(os.environ), timeout=5,
+        on_stdout_line=lines.append,
+    )
+
+    assert result.returncode == 0
+    assert lines == ["one", "two"]
+    assert result.stdout == "one\ntwo\n"
+
+
+def test_default_runner_bounds_captured_stdout_and_stderr(tmp_path: Path):
+    script = (
+        "import sys; "
+        "[(print('x'*200000), print('e'*20000, file=sys.stderr)) for _ in range(100)]"
+    )
+    result = MainAgentAdapter._default_runner(
+        [sys.executable, "-c", script],
+        input="", cwd=str(tmp_path), env=dict(os.environ), timeout=10,
+        on_stdout_line=lambda _line: None,
+    )
+
+    assert result.returncode == 0
+    assert "<CODEX_STDOUT_CAPTURE_TRUNCATED>" in result.stdout
+    assert len(result.stdout) < 14 * 1024 * 1024
+    assert len(result.stderr) <= 100 * 16384
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group signals are POSIX-only")
+def test_default_runner_timeout_terminates_the_entire_process_group(tmp_path: Path):
+    child_pid_file = tmp_path / "child.pid"
+    child_code = "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+    parent_code = (
+        "import pathlib,subprocess,sys,time; "
+        f"child=subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+        f"pathlib.Path({str(child_pid_file)!r}).write_text(str(child.pid)); "
+        "print('started', flush=True); time.sleep(60)"
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        MainAgentAdapter._default_runner(
+            [sys.executable, "-c", parent_code],
+            input="", cwd=str(tmp_path), env=dict(os.environ), timeout=0.15,
+            on_stdout_line=lambda _line: None,
+        )
+
+    child_pid = int(child_pid_file.read_text())
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        stat = Path(f"/proc/{child_pid}/stat")
+        if not stat.exists() or stat.read_text().split()[2] == "Z":
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail(f"timed-out subprocess child {child_pid} is still running")
+
 
 def test_default_backend_is_codex():
     assert MainAgentAdapter().backend == "codex"
@@ -78,7 +149,7 @@ def test_codex_new_command_is_project_scoped_and_readable(tmp_path: Path):
     calls = []
     def runner(cmd, **kwargs):
         calls.append(cmd)
-        return SimpleNamespace(returncode=0, stdout=json.dumps({"type": "session_meta", "payload": {"session_id": "sid-1"}}) + "\n" + json.dumps({"type": "event_msg", "payload": {"type": "agent_message", "message": "ok"}}), stderr="")
+        return SimpleNamespace(returncode=0, stdout=_codex_success(), stderr="")
     adapter = MainAgentAdapter(backend="codex", runner=runner, codex_bin="codex")
     adapter.send(**_args(tmp_path))
     cmd = calls[0]
@@ -96,7 +167,7 @@ def test_codex_default_effort_honors_server_environment(tmp_path: Path, monkeypa
     monkeypatch.setenv("DANUS_CODEX_EFFORT", "xhigh")
     def runner(cmd, **kwargs):
         calls.append((cmd, kwargs))
-        return SimpleNamespace(returncode=0, stdout=json.dumps({"type": "session_meta", "payload": {"session_id": "sid-1"}}) + "\n" + json.dumps({"type": "event_msg", "payload": {"type": "agent_message", "message": "ok"}}), stderr="")
+        return SimpleNamespace(returncode=0, stdout=_codex_success(), stderr="")
 
     MainAgentAdapter(backend="codex", runner=runner, codex_bin="codex").send(**_args(tmp_path))
     cmd, kwargs = calls[0]
@@ -186,7 +257,7 @@ def test_codex_allows_cli_configured_model_when_server_does_not_set_one(tmp_path
 
     def runner(cmd, **kwargs):
         calls.append(cmd)
-        return SimpleNamespace(returncode=0, stdout=json.dumps({"type": "session_meta", "payload": {"session_id": "sid-1"}}) + "\n" + json.dumps({"type": "event_msg", "payload": {"type": "agent_message", "message": "ok"}}), stderr="")
+        return SimpleNamespace(returncode=0, stdout=_codex_success(), stderr="")
 
     MainAgentAdapter(backend="codex", runner=runner, codex_bin="codex").send(**_args(tmp_path))
     assert "--model" not in calls[0]
@@ -199,7 +270,7 @@ def test_codex_builds_direct_provider_from_server_base_url_and_key(tmp_path: Pat
 
     def runner(cmd, **kwargs):
         calls.append(cmd)
-        return SimpleNamespace(returncode=0, stdout=json.dumps({"type": "session_meta", "payload": {"session_id": "sid-1"}}) + "\n" + json.dumps({"type": "event_msg", "payload": {"type": "agent_message", "message": "ok"}}), stderr="")
+        return SimpleNamespace(returncode=0, stdout=_codex_success(), stderr="")
 
     MainAgentAdapter(backend="codex", runner=runner, codex_bin="codex").send(**_args(tmp_path))
     command = calls[0]
@@ -217,6 +288,224 @@ def test_codex_failure_preserves_original_stderr(tmp_path: Path):
     adapter = MainAgentAdapter(backend="codex", runner=runner, codex_bin="codex")
     with pytest.raises(MainAgentError, match="trusted directory"):
         adapter.send(**_args(tmp_path))
+
+
+def test_codex_retries_transient_failure_by_resuming_the_same_thread(tmp_path: Path):
+    calls = []
+    progress = []
+    overloaded = "\n".join([
+        json.dumps({"type": "thread.started", "thread_id": "sid-retry"}),
+        json.dumps({"type": "event_msg", "payload": {
+            "type": "task_complete",
+            "last_agent_message": None,
+            "error": {
+                "message": "Selected model is at capacity. Please try a different model.",
+                "codex_error_info": "server_overloaded",
+            },
+        }}),
+    ])
+    completed = "\n".join([
+        json.dumps({"type": "thread.started", "thread_id": "sid-retry"}),
+        json.dumps({"type": "event_msg", "payload": {"type": "agent_message", "message": "completed after retry"}}),
+        json.dumps({"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "completed after retry"}}),
+    ])
+
+    def runner(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        if len(calls) == 1:
+            return SimpleNamespace(returncode=1, stdout=overloaded, stderr="")
+        return SimpleNamespace(returncode=0, stdout=completed, stderr="")
+
+    adapter = MainAgentAdapter(
+        backend="codex",
+        runner=runner,
+        codex_bin="codex",
+        max_attempts=2,
+        retry_base_seconds=0,
+        sleeper=lambda _: None,
+    )
+    result = adapter.send(**_args(tmp_path), on_progress=progress.append)
+
+    assert result["reply"] == "completed after retry"
+    assert result["session_id"] == "sid-retry"
+    assert result["attempts"] == 2
+    assert len(calls) == 2
+    assert calls[1][0][-3:] == ["resume", "sid-retry", "-"]
+    assert "Continue the interrupted Main Agent turn" in calls[1][1]["input"]
+    assert progress == [{
+        "type": "turn.retry",
+        "status": "retrying",
+        "attempt": 2,
+        "max_attempts": 2,
+        "delay_seconds": 0,
+        "error_code": "server_overloaded",
+        "message": "Selected model is at capacity. Please try a different model.",
+        "detail": "Selected model is at capacity. Please try a different model.",
+        "session_id": "sid-retry",
+    }]
+
+
+def test_codex_does_not_replay_a_turn_after_tool_activity(tmp_path: Path):
+    calls = []
+    overloaded_after_tool = "\n".join([
+        json.dumps({"type": "thread.started", "thread_id": "sid-side-effects"}),
+        json.dumps({"type": "item.completed", "item": {
+            "type": "command_execution", "command": "danus-web-agent assign high task",
+        }}),
+        json.dumps({"type": "event_msg", "payload": {
+            "type": "task_complete",
+            "last_agent_message": None,
+            "error": {
+                "message": "Selected model is at capacity. Please try a different model.",
+                "codex_error_info": "server_overloaded",
+            },
+        }}),
+    ])
+
+    def runner(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=1, stdout=overloaded_after_tool, stderr="")
+
+    adapter = MainAgentAdapter(
+        backend="codex", runner=runner, codex_bin="codex",
+        max_attempts=3, retry_base_seconds=0, sleeper=lambda _: None,
+    )
+    with pytest.raises(MainAgentError, match="Selected model is at capacity") as raised:
+        adapter.send(**_args(tmp_path))
+
+    assert len(calls) == 1
+    assert raised.value.session_id == "sid-side-effects"
+    assert raised.value.retryable is True
+    assert raised.value.safe_to_retry is False
+    assert raised.value.observed_tool_activity is True
+
+
+def test_codex_requires_an_explicit_success_terminal_event(tmp_path: Path):
+    stream = "\n".join([
+        json.dumps({"type": "thread.started", "thread_id": "sid-truncated"}),
+        json.dumps({"type": "event_msg", "payload": {"type": "agent_message", "message": "partial reply"}}),
+    ])
+
+    def runner(cmd, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=stream, stderr="")
+
+    adapter = MainAgentAdapter(
+        backend="codex", runner=runner, codex_bin="codex", max_attempts=1,
+    )
+    with pytest.raises(MainAgentError, match="terminal completion"):
+        adapter.send(**_args(tmp_path))
+
+
+def test_codex_terminal_error_overrides_partial_reply_even_without_message(tmp_path: Path):
+    stream = "\n".join([
+        json.dumps({"type": "thread.started", "thread_id": "sid-partial"}),
+        json.dumps({"type": "event_msg", "payload": {"type": "agent_message", "message": "partial reply"}}),
+        json.dumps({"type": "event_msg", "payload": {
+            "type": "task_complete", "last_agent_message": "partial reply",
+            "error": {"codex_error_info": "server_overloaded"},
+        }}),
+    ])
+
+    def runner(cmd, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=stream, stderr="")
+
+    adapter = MainAgentAdapter(
+        backend="codex", runner=runner, codex_bin="codex",
+        max_attempts=1, retry_base_seconds=0,
+    )
+    with pytest.raises(MainAgentError) as raised:
+        adapter.send(**_args(tmp_path))
+
+    assert raised.value.code == "server_overloaded"
+    assert raised.value.session_id == "sid-partial"
+
+
+def test_codex_response_completed_tool_output_blocks_automatic_retry(tmp_path: Path):
+    calls = []
+    stream = "\n".join([
+        json.dumps({"type": "thread.started", "thread_id": "sid-envelope"}),
+        json.dumps({"type": "response.completed", "response": {"output": [
+            {"type": "function_call", "name": "exec_command", "arguments": "{}"},
+        ]}}),
+        json.dumps({"type": "event_msg", "payload": {
+            "type": "task_complete", "last_agent_message": None,
+            "error": {
+                "message": "Selected model is at capacity.",
+                "codex_error_info": "server_overloaded",
+            },
+        }}),
+    ])
+
+    def runner(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=1, stdout=stream, stderr="")
+
+    adapter = MainAgentAdapter(
+        backend="codex", runner=runner, codex_bin="codex",
+        max_attempts=3, retry_base_seconds=0, sleeper=lambda _: None,
+    )
+    with pytest.raises(MainAgentError) as raised:
+        adapter.send(**_args(tmp_path))
+
+    assert len(calls) == 1
+    assert raised.value.observed_tool_activity is True
+
+
+def test_codex_timeout_preserves_session_and_tool_activity_from_partial_output(tmp_path: Path):
+    stream = "\n".join([
+        json.dumps({"type": "thread.started", "thread_id": "sid-timeout"}),
+        json.dumps({"type": "item.completed", "item": {"type": "command_execution", "command": "status"}}),
+    ])
+
+    def runner(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=10, output=stream)
+
+    adapter = MainAgentAdapter(backend="codex", runner=runner, codex_bin="codex")
+    with pytest.raises(MainAgentError, match="timed out") as raised:
+        adapter.send(**_args(tmp_path))
+
+    assert raised.value.session_id == "sid-timeout"
+    assert raised.value.code == "timeout"
+    assert raised.value.retryable is False
+    assert raised.value.safe_to_retry is False
+    assert raised.value.observed_tool_activity is True
+
+
+def test_codex_exhaustion_surfaces_structured_error_and_preserves_session(tmp_path: Path):
+    calls = []
+    progress = []
+    overloaded = "\n".join([
+        json.dumps({"type": "thread.started", "thread_id": "sid-overloaded"}),
+        json.dumps({"type": "event_msg", "payload": {
+            "type": "task_complete",
+            "last_agent_message": None,
+            "error": {
+                "message": "Selected model is at capacity. api_key=retry-secret-value",
+                "codex_error_info": "server_overloaded",
+            },
+        }}),
+    ])
+
+    def runner(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=1, stdout=overloaded, stderr="")
+
+    adapter = MainAgentAdapter(
+        backend="codex", runner=runner, codex_bin="codex",
+        max_attempts=2, retry_base_seconds=0, sleeper=lambda _: None,
+    )
+    with pytest.raises(MainAgentError, match="Selected model is at capacity") as raised:
+        adapter.send(**_args(tmp_path), on_progress=progress.append)
+
+    assert len(calls) == 2
+    assert calls[1][-3:] == ["resume", "sid-overloaded", "-"]
+    assert raised.value.code == "server_overloaded"
+    assert raised.value.session_id == "sid-overloaded"
+    assert raised.value.retryable is True
+    assert raised.value.safe_to_retry is True
+    assert raised.value.attempts == 2
+    assert "retry-secret-value" not in json.dumps(progress, ensure_ascii=False)
+    assert "<REDACTED>" in json.dumps(progress, ensure_ascii=False)
 
 
 def test_codex_parser_accepts_current_event_message_shape():
@@ -240,11 +529,108 @@ def test_codex_parser_accepts_nested_assistant_content():
     assert MainAgentAdapter._parse_codex(stream) == ("sid-nested", "visible reply")
 
 
+@pytest.mark.parametrize("secret", [
+    "curl -u alice:supersecret https://example.test",
+    "curl -H 'Cookie: session=abc123xyz' https://example.test",
+    "-----BEGIN PRIVATE KEY-----\nMIIBVwIBADANBgkqh\n-----END PRIVATE KEY-----",
+    "postgresql://alice:supersecret@db.internal/app",
+    "gh" + "p_" + "abcdefghijklmnopqrstuvwxyz1234567890",
+    "gl" + "pat-" + "abcdefghijklmnopqrstuvwxyz",
+    "xo" + "xb-" + "123456789012-123456789012-abcdefghijklmnopqrstuvwx",
+    "AI" + "zaSyDUMMYDUMMYDUMMYDUMMYDUMMYDUMMY",
+    "h" + "f_" + "abcdefghijklmnopqrstuvwxyz123456",
+    "np" + "m_" + "abcdefghijklmnopqrstuvwxyz123456",
+    "AK" + "IAIOSFODNN7EXAMPLE",
+    "ey" + "JhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature",
+    '{"headers":{"X-Session":"abc123xyz"}}',
+])
+def test_main_agent_event_redaction_covers_common_credential_shapes(secret: str):
+    rendered = MainAgentAdapter._safe_display_value(secret)
+
+    assert secret not in rendered
+    assert "supersecret" not in rendered
+    assert "abc123xyz" not in rendered
+    assert "MIIBVwIBADANBgkqh" not in rendered
+    assert "<REDACTED" in rendered
+
+
+def test_codex_tool_progress_summaries_never_include_command_arguments_or_file_content():
+    command_events = MainAgentAdapter._codex_progress_events(json.dumps({
+        "type": "item.started",
+        "item": {"type": "command_execution", "command": "echo arbitrary-unclassified-secret"},
+    }))
+    file_events = MainAgentAdapter._codex_progress_events(json.dumps({
+        "type": "item.completed",
+        "item": {"type": "file_change", "changes": "arbitrary-unclassified-secret"},
+    }))
+
+    assert command_events[0]["detail"] == "命令：echo"
+    assert file_events[0]["detail"] == "文件变更状态已更新（具体内容未展示）"
+    assert "arbitrary-unclassified-secret" not in json.dumps(command_events + file_events, ensure_ascii=False)
+
+
+def test_codex_redacts_credentials_from_the_final_reply(tmp_path: Path):
+    stdout = _codex_success(message="api_key=arbitrary-unclassified-secret")
+    adapter = MainAgentAdapter(
+        backend="codex", codex_bin="codex",
+        runner=lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=stdout, stderr=""),
+    )
+
+    result = adapter.send(**_args(tmp_path))
+
+    assert "arbitrary-unclassified-secret" not in result["reply"]
+    assert result["reply"] == "api_key=<REDACTED>"
+
+
+def test_codex_streams_safe_agent_and_tool_events_before_final_reply(tmp_path: Path):
+    events = []
+    lines = [
+        json.dumps({"type": "thread.started", "thread_id": "sid-stream"}),
+        json.dumps({"type": "response_item", "payload": {
+            "type": "reasoning", "summary": ["private reasoning must not be exposed"],
+        }}),
+        json.dumps({"type": "event_msg", "payload": {
+            "type": "agent_message", "message": "我先检查项目状态。",
+        }}),
+        json.dumps({"type": "response_item", "payload": {
+            "type": "function_call", "name": "exec_command",
+            "arguments": json.dumps({"cmd": "danus-web-agent status", "api_key": "must-not-leak"}),
+            "call_id": "call-1",
+        }}),
+        json.dumps({"type": "response_item", "payload": {
+            "type": "function_call_output", "call_id": "call-1",
+            "output": "Process exited with code 0\nAuthorization: Bearer must-not-leak",
+        }}),
+        json.dumps({"type": "event_msg", "payload": {
+            "type": "task_complete", "last_agent_message": "完成。",
+        }}),
+    ]
+
+    def runner(cmd, **kwargs):
+        for line in lines:
+            kwargs["on_stdout_line"](line)
+        return SimpleNamespace(returncode=0, stdout="\n".join(lines), stderr="")
+
+    adapter = MainAgentAdapter(backend="codex", runner=runner, codex_bin="codex")
+    result = adapter.send(**_args(tmp_path), on_progress=events.append)
+
+    assert result["reply"] == "完成。"
+    assert [event["type"] for event in events] == [
+        "turn.started", "agent.message", "tool.started", "tool.completed", "turn.completed",
+    ]
+    assert events[2]["tool"] == "exec_command"
+    assert "danus-web-agent status" in events[2]["detail"]
+    assert "must-not-leak" not in json.dumps(events, ensure_ascii=False)
+    assert "敏感参数已隐藏" in json.dumps(events, ensure_ascii=False)
+    assert "原始输出未展示" in json.dumps(events, ensure_ascii=False)
+    assert "private reasoning" not in json.dumps(events, ensure_ascii=False)
+
+
 def test_codex_resume_keeps_resume_options_before_session(tmp_path: Path):
     calls = []
     def runner(cmd, **kwargs):
         calls.append(cmd)
-        return SimpleNamespace(returncode=0, stdout=json.dumps({"type": "thread.started", "thread_id": "sid-2"}) + "\n" + json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "ok"}}), stderr="")
+        return SimpleNamespace(returncode=0, stdout=_codex_success(session_id="sid-2"), stderr="")
 
     adapter = MainAgentAdapter(backend="codex", runner=runner, codex_bin="codex")
     adapter.send(**(_args(tmp_path) | {"session_id": "sid-1"}))

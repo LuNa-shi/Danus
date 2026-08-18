@@ -1,6 +1,7 @@
 """SQLite persistence owned by the Web Console control plane."""
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
@@ -9,6 +10,8 @@ from typing import Any
 
 
 class ConsoleStore:
+    MAIN_AGENT_EVENT_RETENTION = 5000
+
     def __init__(self, path: Path):
         self.path = Path(path)
         self._lock = threading.RLock()
@@ -59,6 +62,12 @@ class ConsoleStore:
                     message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
                     file_id TEXT NOT NULL REFERENCES files(id), PRIMARY KEY(message_id, file_id)
                 );
+                CREATE TABLE IF NOT EXISTS main_agent_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                    event_type TEXT NOT NULL, payload TEXT NOT NULL, created_at REAL NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS sessions (
                     id TEXT PRIMARY KEY, token_digest TEXT NOT NULL UNIQUE, csrf_digest TEXT NOT NULL,
                     created_at REAL NOT NULL, last_seen REAL NOT NULL, expires_at REAL NOT NULL, revoked_at REAL
@@ -76,6 +85,7 @@ class ConsoleStore:
                     outcome TEXT NOT NULL, created_at REAL NOT NULL, details TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_runs_project_status ON runs(project_id, status);
+                CREATE INDEX IF NOT EXISTS idx_main_agent_events_project_id ON main_agent_events(project_id, id);
                 """
             )
             columns = {row[1] for row in conn.execute("PRAGMA table_info(main_agent_sessions)")}
@@ -226,6 +236,54 @@ class ConsoleStore:
             for row in rows:
                 row["attachment_ids"] = [r["file_id"] for r in conn.execute("SELECT file_id FROM message_attachments WHERE message_id=? ORDER BY file_id", (row["id"],))]
             return rows
+
+    def add_main_agent_event(self, *, project_id: str, message_id: str,
+                             event_type: str, payload: dict[str, Any],
+                             created_at: float | None = None) -> int:
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO main_agent_events(project_id,message_id,event_type,payload,created_at) VALUES(?,?,?,?,?)",
+                (project_id, message_id, event_type,
+                 json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                 created_at if created_at is not None else time.time()),
+            )
+            event_id = int(cursor.lastrowid)
+            conn.execute(
+                "DELETE FROM main_agent_events WHERE project_id=? AND id IN ("
+                "SELECT id FROM main_agent_events WHERE project_id=? "
+                "ORDER BY id DESC LIMIT -1 OFFSET ?)",
+                (project_id, project_id, max(1, int(self.MAIN_AGENT_EVENT_RETENTION))),
+            )
+            return event_id
+
+    def main_agent_events(self, project_id: str, *, after_id: int = 0,
+                          limit: int = 1000) -> list[dict[str, Any]]:
+        bounded_limit = max(1, min(1000, int(limit)))
+        with self._lock, self._connect() as conn:
+            if int(after_id) > 0:
+                rows = conn.execute(
+                    "SELECT id,message_id,event_type,payload,created_at "
+                    "FROM main_agent_events WHERE project_id=? AND id>? ORDER BY id LIMIT ?",
+                    (project_id, int(after_id), bounded_limit),
+                ).fetchall()
+            else:
+                rows = list(reversed(conn.execute(
+                    "SELECT id,message_id,event_type,payload,created_at "
+                    "FROM main_agent_events WHERE project_id=? ORDER BY id DESC LIMIT ?",
+                    (project_id, bounded_limit),
+                ).fetchall()))
+        events = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"])
+            except (json.JSONDecodeError, TypeError):
+                payload = {}
+            events.append({
+                "id": int(row["id"]), "message_id": row["message_id"],
+                "type": row["event_type"], "created_at": row["created_at"],
+                **(payload if isinstance(payload, dict) else {}),
+            })
+        return events
 
     def add_session(self, session: dict[str, Any]) -> None:
         with self._lock, self._connect() as conn:

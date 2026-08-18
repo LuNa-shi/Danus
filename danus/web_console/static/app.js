@@ -7,6 +7,8 @@ const state = {
   projects: [],
   files: [],
   messages: [],
+  mainAgentEvents: [],
+  mainAgentEventLastId: 0,
   workers: [],
   logs: [],
   facts: { nodes: [], edges: [] },
@@ -23,9 +25,31 @@ const state = {
   selectedFactId: null,
   pendingMessage: null,
   timer: null,
+  pendingTimer: null,
   toastTimer: null,
-  refreshing: false,
+  refreshingProject: null,
+  pendingRefreshingProject: null,
 };
+
+function currentPendingMessage() {
+  return state.pendingMessage?.project_id === state.current ? state.pendingMessage : null;
+}
+
+function startPendingPolling() {
+  if (!currentPendingMessage()) return;
+  setComposerBusy(true);
+  window.clearInterval(state.pendingTimer);
+  state.pendingTimer = window.setInterval(() => {
+    refreshPendingMessages().catch(() => {});
+  }, 1500);
+  refreshPendingMessages().catch(() => {});
+}
+
+function stopPendingPolling() {
+  window.clearInterval(state.pendingTimer);
+  state.pendingTimer = null;
+  setComposerBusy(false);
+}
 
 async function api(path, opts = {}) {
   const headers = {
@@ -451,6 +475,7 @@ function statusText(status) {
   return ({
     pending: "正在发送",
     submitted: "Main Agent 处理中",
+    retrying: "上游模型繁忙，正在自动续接",
     completed: "已完成",
     failed: "未完成",
   })[status] || "";
@@ -736,11 +761,16 @@ async function openProject(id) {
     window.clearInterval(state.timer);
     state.timer = null;
   }
+  stopPendingPolling();
+  state.pendingMessage = null;
   destroyFactGraph();
   state.factGraphSignature = null;
   state.selectedFactId = null;
   state.current = id;
   state.activeWorker = null;
+  state.messages = [];
+  state.mainAgentEvents = [];
+  state.mainAgentEventLastId = 0;
   const project = await api(`/api/projects/${id}`);
   if (state.current !== id) return;
   state.project = project;
@@ -749,15 +779,60 @@ async function openProject(id) {
   renderProjectShell(project);
   await refreshProject();
   state.timer = window.setInterval(() => {
-    if (!state.pendingMessage) refreshProject().catch(() => {});
+    if (!currentPendingMessage()) refreshProject().catch(() => {});
   }, 8000);
+}
+
+function mainAgentFailureMarkup(message) {
+  const error = message.error || "请重试，或先检查运行环境";
+  return `<div class="message-error"><strong>Main Agent 没有完成这次回复</strong><span>${esc(error)}</span></div>`;
+}
+
+function mainAgentEventLabel(type) {
+  return ({
+    "turn.started": "会话启动",
+    "agent.message": "Main Agent",
+    "tool.started": "调用工具",
+    "tool.completed": "工具完成",
+    "turn.retry": "自动重试",
+    "turn.completed": "执行完成",
+    "turn.failed": "执行失败",
+  })[type] || "执行事件";
+}
+
+function renderMainAgentEvents(messageId) {
+  const events = state.mainAgentEvents.filter((event) => event.message_id === messageId);
+  if (!events.length) return "";
+  const message = state.messages.find((row) => row.id === messageId);
+  const live = message && ["submitted", "retrying", "pending"].includes(message.status);
+  const rows = events.map((event) => {
+    const type = String(event.type || "event");
+    const label = mainAgentEventLabel(type);
+    const tool = event.tool ? `<strong>${esc(event.tool)}</strong>` : "";
+    const detail = String(event.detail || "");
+    const detailMarkup = detail
+      ? (type === "agent.message" ? `<div class="main-agent-event-message">${renderMarkdown(detail)}</div>` : `<pre>${esc(detail)}</pre>`)
+      : "";
+    return `<li class="main-agent-event ${esc(type.replace(/\./g, "-"))}"><i></i><div><div class="main-agent-event-head"><span>${esc(label)}</span>${tool}<time>${formatTime(event.created_at)}</time></div>${detailMarkup}</div></li>`;
+  }).join("");
+  return `<details class="main-agent-events ${live ? "is-live" : ""}" ${live ? "open" : ""}><summary><span>执行过程</span><small>${events.length} 个事件${live ? " · 实时更新" : ""}</small></summary><ol>${rows}</ol></details>`;
 }
 
 function renderMessages() {
   const chat = $("chat");
   if (!chat) return;
+  const scroll = $("conversation-scroll");
+  const previousScrollTop = scroll?.scrollTop || 0;
+  const followTail = !scroll || scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 72;
   const messages = state.messages.slice();
-  if (state.pendingMessage && !messages.some((message) => message.id === state.pendingMessage.id)) messages.push(state.pendingMessage);
+  const pendingMessage = currentPendingMessage();
+  const persistedPending = pendingMessage && messages.some((message) => (
+    message.id !== pendingMessage.id
+    && message.role === "user"
+    && message.text === pendingMessage.text
+    && Number(message.created_at || 0) >= Number(pendingMessage.created_at || 0) - 5
+  ));
+  if (pendingMessage && !persistedPending && !messages.some((message) => message.id === pendingMessage.id)) messages.push(pendingMessage);
   if (!messages.length) {
     chat.innerHTML = '<div class="chat-empty"><div class="main-agent-avatar large">M</div><p class="eyebrow">MAIN AGENT</p><h2>项目已经准备好了。</h2><p>问一个问题、上传一份材料，或者让 Main Agent 先给出拆解方向。</p><div class="suggestion-row"><button data-suggestion="先分析问题，给出三个互相独立的解决方向。">先拆解问题</button><button data-suggestion="先检查现有材料中最关键的假设。">检查关键假设</button></div></div>';
     chat.querySelectorAll("[data-suggestion]").forEach((button) => button.addEventListener("click", () => {
@@ -769,18 +844,21 @@ function renderMessages() {
   chat.innerHTML = messages.map((message) => {
     const user = message.role === "user";
     const isFailed = message.status === "failed";
-    const pending = message.status === "submitted" || message.status === "pending";
-    const body = user ? `<p>${esc(message.text).replace(/\n/g, "<br>")}</p>` : (message.text ? renderMarkdown(message.text) : `<div class="message-error"><strong>Main Agent 没有完成这次回复</strong><span>${esc(message.error || "请重试，或先检查运行环境")}</span></div>`);
-    return `<article class="message-row ${user ? "user" : "assistant"} ${pending ? "is-pending" : ""} ${isFailed ? "is-failed" : ""}"><div class="message-avatar ${user ? "user-avatar" : "main-agent-avatar"}">${user ? "L" : "M"}</div><div class="message-content"><div class="message-meta"><strong>${user ? "你" : "Main Agent"}</strong><span>${formatTime(message.created_at)}</span>${pending ? `<span class="message-status"><i></i>${statusText(message.status)}</span>` : ""}</div><div class="message-bubble">${body}</div></div></article>`;
+    const pending = message.status === "submitted" || message.status === "pending" || message.status === "retrying";
+    const status = message.status === "retrying" && message.error ? message.error : statusText(message.status);
+    const body = user ? `<p>${esc(message.text).replace(/\n/g, "<br>")}</p>` : (message.text ? renderMarkdown(message.text) : mainAgentFailureMarkup(message));
+    const execution = user ? renderMainAgentEvents(message.id) : "";
+    return `<article class="message-row ${user ? "user" : "assistant"} ${pending ? "is-pending" : ""} ${isFailed ? "is-failed" : ""}"><div class="message-avatar ${user ? "user-avatar" : "main-agent-avatar"}">${user ? "L" : "M"}</div><div class="message-content"><div class="message-meta"><strong>${user ? "你" : "Main Agent"}</strong><span>${formatTime(message.created_at)}</span>${pending ? `<span class="message-status"><i></i>${esc(status)}</span>` : ""}</div><div class="message-bubble">${body}</div>${execution}</div></article>`;
   }).join("");
-  const scroll = $("conversation-scroll");
-  if (scroll) window.requestAnimationFrame(() => { scroll.scrollTop = scroll.scrollHeight; });
+  if (scroll) window.requestAnimationFrame(() => {
+    scroll.scrollTop = followTail ? scroll.scrollHeight : previousScrollTop;
+  });
 }
 
 function renderActivity() {
   const activity = $("main-activity");
   if (!activity) return;
-  activity.hidden = !state.pendingMessage;
+  activity.hidden = !currentPendingMessage();
 }
 
 function memoryKindEntry(kind) {
@@ -804,7 +882,7 @@ function renderMainAgentControl() {
   const unassigned = Array.isArray(snapshot.unassigned_workers) ? snapshot.unassigned_workers : state.workers.filter((worker) => worker.assigned === false).map((worker) => worker.worker);
   const guidance = snapshot.master_guidance || snapshot.guidance || memoryKindEntry("master_guidance");
   const elaboration = snapshot.elaboration || memoryKindEntry("elaboration");
-  const sessionStatus = state.pendingMessage ? "active" : (main.status || snapshot.main_agent_status || (state.messages.some((message) => message.role === "assistant" && message.status === "completed") ? "inactive" : "not_started"));
+  const sessionStatus = currentPendingMessage() ? "active" : (main.status || snapshot.main_agent_status || (state.messages.some((message) => message.role === "assistant" && message.status === "completed") ? "inactive" : "not_started"));
   const activeRun = state.runtime.run;
   const statusLabels = { active: "会话执行中", inactive: "会话可恢复", not_started: "尚未激活", failed: "上次会话失败" };
   const steps = [
@@ -1377,8 +1455,8 @@ function updateRuntime() {
   const status = $("main-status");
   if (status) {
     const sessionStatus = main.status || state.orchestration.main_agent_status;
-    const text = state.pendingMessage ? "Main Agent 编排中" : sessionStatus === "active" ? "Main Agent 会话中" : sessionStatus === "inactive" ? "Main Agent 可恢复" : "Main Agent 尚未激活";
-    status.className = `status-pill ${state.pendingMessage || sessionStatus === "active" ? "working" : "idle"}`;
+    const text = currentPendingMessage() ? "Main Agent 编排中" : sessionStatus === "active" ? "Main Agent 会话中" : sessionStatus === "inactive" ? "Main Agent 可恢复" : "Main Agent 尚未激活";
+    status.className = `status-pill ${currentPendingMessage() || sessionStatus === "active" ? "working" : "idle"}`;
     status.innerHTML = `<i></i>${text}`;
   }
   const runState = $("run-state");
@@ -1392,10 +1470,61 @@ function updateRuntime() {
   if (stop) stop.disabled = !activeRun && !live;
 }
 
+async function refreshPendingMessages() {
+  const pending = currentPendingMessage();
+  if (!pending || !state.current) return;
+  const projectAtStart = pending.project_id;
+  if (state.pendingRefreshingProject === projectAtStart) return;
+  const after = state.mainAgentEventLastId;
+  state.pendingRefreshingProject = projectAtStart;
+  try {
+    const [messagesResult, eventsResult] = await Promise.allSettled([
+      api(`/api/projects/${projectAtStart}/messages`),
+      api(`/api/projects/${projectAtStart}/main-agent-events?after=${after}`),
+    ]);
+    if (state.current !== projectAtStart || state.pendingMessage !== pending) return;
+    let persistedTurnTerminal = false;
+    if (messagesResult.status === "fulfilled") {
+      state.messages = messagesResult.value;
+      if (pending.persisted) {
+        const persisted = state.messages.find((message) => message.id === pending.id);
+        persistedTurnTerminal = Boolean(
+          persisted && !["submitted", "retrying", "pending"].includes(persisted.status)
+        );
+      }
+    }
+    if (eventsResult.status === "fulfilled") {
+      const incoming = eventsResult.value.events || [];
+      if (incoming.length) {
+        const known = new Set(state.mainAgentEvents.map((event) => event.id));
+        state.mainAgentEvents = [...state.mainAgentEvents, ...incoming.filter((event) => !known.has(event.id))];
+      }
+      state.mainAgentEventLastId = Math.max(state.mainAgentEventLastId, Number(eventsResult.value.last_id || 0));
+    }
+    const hasTerminalEvent = state.mainAgentEvents.some((event) => (
+      event.message_id === pending.id && ["turn.completed", "turn.failed"].includes(event.type)
+    ));
+    const hasFollowingAssistant = state.messages.some((message) => (
+      message.role === "assistant" && Number(message.created_at || 0) >= Number(pending.created_at || 0)
+    ));
+    if (persistedTurnTerminal && (hasTerminalEvent || hasFollowingAssistant) && state.pendingMessage === pending) {
+      state.pendingMessage = null;
+      stopPendingPolling();
+    }
+    renderMessages();
+    renderActivity();
+    renderMainAgentControl();
+    updateRuntime();
+  } finally {
+    if (state.pendingRefreshingProject === projectAtStart) state.pendingRefreshingProject = null;
+  }
+}
+
 async function refreshProject() {
-  if (!state.current || state.pendingMessage || state.refreshing) return;
-  state.refreshing = true;
+  if (!state.current || currentPendingMessage()) return;
   const projectAtStart = state.current;
+  if (state.refreshingProject === projectAtStart) return;
+  state.refreshingProject = projectAtStart;
   try {
     const results = await Promise.allSettled([
       api(`/api/projects/${projectAtStart}/files`),
@@ -1408,8 +1537,9 @@ async function refreshProject() {
       api(`/api/projects/${projectAtStart}/reports`),
       api(`/api/projects/${projectAtStart}/outputs`),
       api(`/api/projects/${projectAtStart}/orchestration`),
+      api(`/api/projects/${projectAtStart}/main-agent-events`),
     ]);
-    if (state.current !== projectAtStart) return;
+    if (state.current !== projectAtStart || currentPendingMessage()) return;
     const value = (result, fallback) => result.status === "fulfilled" ? result.value : fallback;
     state.files = value(results[0], []);
     state.messages = value(results[1], []);
@@ -1422,6 +1552,13 @@ async function refreshProject() {
     state.reports = value(results[7], { files: [] });
     state.outputs = value(results[8], { files: [] });
     state.orchestration = value(results[9], {});
+    const eventSnapshot = value(results[10], { events: [], last_id: 0 });
+    state.mainAgentEvents = eventSnapshot.events || [];
+    state.mainAgentEventLastId = Number(eventSnapshot.last_id || 0);
+    const restoredPending = state.messages.slice().reverse().find((message) => (
+      message.role === "user" && ["submitted", "retrying", "pending"].includes(message.status)
+    ));
+    if (restoredPending) state.pendingMessage = { ...restoredPending, project_id: projectAtStart, persisted: true };
     renderMessages();
     renderActivity();
     renderMainAgentControl();
@@ -1432,8 +1569,9 @@ async function refreshProject() {
     renderMemory();
     renderArtifacts();
     updateRuntime();
+    if (restoredPending) startPendingPolling();
   } finally {
-    state.refreshing = false;
+    if (state.refreshingProject === projectAtStart) state.refreshingProject = null;
   }
 }
 
@@ -1448,32 +1586,37 @@ function setComposerBusy(isBusy) {
 
 async function sendMessageText(text, attachmentId = "") {
   const clean = String(text || "").trim();
-  if (!clean || !state.current || state.pendingMessage) return;
-  const localMessage = { id: `local-${Date.now()}`, role: "user", text: clean, status: "pending", created_at: Date.now() / 1000, error: null, attachment_ids: attachmentId ? [attachmentId] : [] };
+  if (!clean || !state.current || currentPendingMessage()) return;
+  const projectAtStart = state.current;
+  const localMessage = { id: `local-${Date.now()}`, project_id: projectAtStart, role: "user", text: clean, status: "pending", created_at: Date.now() / 1000, error: null, attachment_ids: attachmentId ? [attachmentId] : [] };
   state.pendingMessage = localMessage;
   state.messages = [...state.messages, localMessage];
   renderMessages();
   renderActivity();
   renderMainAgentControl();
   updateRuntime();
-  setComposerBusy(true);
   $("message").value = "";
+  startPendingPolling();
   try {
-    await api(`/api/projects/${state.current}/messages`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: clean, attachment_ids: attachmentId ? [attachmentId] : [] }) });
-    state.pendingMessage = null;
-    await refreshProject();
+    await api(`/api/projects/${projectAtStart}/messages`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: clean, attachment_ids: attachmentId ? [attachmentId] : [] }) });
+    if (state.pendingMessage === localMessage) state.pendingMessage = null;
+    if (state.current === projectAtStart) await refreshProject();
   } catch (error) {
-    state.pendingMessage = null;
+    if (state.pendingMessage === localMessage) state.pendingMessage = null;
     localMessage.status = "failed";
     localMessage.error = error.data?.detail || error.message;
-    state.messages = state.messages.filter((message) => message.id !== localMessage.id).concat(localMessage);
-    renderMessages();
-    renderActivity();
-    renderMainAgentControl();
-    notify(error.message || "Main Agent 暂时不可用", "error");
-    await refreshProject().catch(() => {});
+    if (state.current === projectAtStart) {
+      state.messages = state.messages.filter((message) => message.id !== localMessage.id).concat(localMessage);
+      renderMessages();
+      renderActivity();
+      renderMainAgentControl();
+    }
+    if (state.current === projectAtStart) {
+      notify(localMessage.error || "Main Agent 暂时不可用", "error");
+      await refreshProject().catch(() => {});
+    }
   } finally {
-    setComposerBusy(false);
+    if (!currentPendingMessage()) stopPendingPolling();
     renderMainAgentControl();
     updateRuntime();
   }
