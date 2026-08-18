@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ipaddress
 import json
 import sqlite3
@@ -49,6 +50,7 @@ class AppSettings:
     model_catalog_timeout_seconds: float = 5.0
     lifecycle_base_url: str = "http://127.0.0.1:8080"
     lifecycle_hmac_secret: bytes | None = None
+    deadline_poll_seconds: float = 0.25
 
 
 def _error(status: int, detail: str) -> JSONResponse:
@@ -99,7 +101,18 @@ def create_app(
     main_agent: Any | None = None,
     model_catalog: Any | None = None,
 ) -> FastAPI:
-    app = FastAPI(title="Danus Web Console", version="0.1.0")
+    @contextlib.asynccontextmanager
+    async def lifespan(application: FastAPI):
+        task = asyncio.create_task(deadline_supervisor_loop())
+        application.state.deadline_supervisor_task = task
+        try:
+            yield
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    app = FastAPI(title="Danus Web Console", version="0.1.0", lifespan=lifespan)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
@@ -245,6 +258,23 @@ def create_app(
         except (TypeError, ValueError):
             return []
 
+    def lifecycle_result_failures(
+        result: dict[str, Any], *, allowed: set[str],
+    ) -> list[dict[str, Any]]:
+        rows = result.get("workers", []) if isinstance(result, dict) else []
+        return [
+            row for row in rows
+            if isinstance(row, dict) and "result" in row
+            and str(row.get("result")) not in allowed
+        ]
+
+    def unresolved_raw_processes(projection: dict[str, Any]) -> list[str]:
+        return [
+            str(worker.get("worker") or "")
+            for worker in projection.get("workers", [])
+            if worker.get("raw_alive") is True and worker.get("alive") is not True
+        ]
+
     def roster_state(
         project: dict[str, Any], projection: dict[str, Any],
         *, expected: list[str] | None = None,
@@ -259,22 +289,72 @@ def create_app(
         pending = [name for name in expected if name not in alive]
         return expected, alive, pending
 
+    def enforce_expired_deadline(
+        project_id: str, project: dict[str, Any], active: dict[str, Any],
+        projection: dict[str, Any],
+    ) -> dict[str, Any]:
+        workers = projection.get("workers", [])
+        if not any(worker.get("alive") is True for worker in workers):
+            store.update_run(
+                active["id"], status="stopped", stopped_at=time.time(),
+                outcome="deadline_enforced",
+            )
+            return projection
+        try:
+            enforcer = getattr(runtime, "enforce_deadline", runtime.stop_project)
+            result = enforcer(project["runtime_name"])
+            failures = lifecycle_result_failures(
+                result, allowed={"killed", "not-running"},
+            )
+            if failures:
+                raise RuntimeErrorBase(
+                    "deadline force-stop refused: "
+                    + ",".join(str(row.get("worker")) for row in failures)
+                )
+            projection = runtime.status_project(project["runtime_name"])
+        except (RuntimeErrorBase, OSError) as exc:
+            store.update_run(
+                active["id"], status="stopping",
+                outcome=f"deadline_force_failed: {exc}"[:200],
+            )
+            store.audit("run_deadline", "failure", project_id)
+            return projection
+        remaining = [
+            worker for worker in projection.get("workers", [])
+            if worker.get("alive") is True or worker.get("raw_alive") is True
+        ]
+        if remaining:
+            store.update_run(
+                active["id"], status="stopping",
+                outcome="deadline_force_incomplete",
+            )
+            store.audit("run_deadline", "partial_failure", project_id)
+        else:
+            store.update_run(
+                active["id"], status="stopped", stopped_at=time.time(),
+                outcome="deadline_enforced",
+            )
+            store.audit("run_deadline", "success", project_id)
+        return projection
+
     def reconcile_run(project_id: str, project: dict[str, Any], projection: dict[str, Any]) -> dict[str, Any]:
         active = store.active_run(project_id)
         if active is not None:
             workers = projection.get("workers", [])
-            expected, _alive, pending = roster_state(project, projection)
-            if active["status"] in ("starting", "running") and time.time() >= active["deadline"]:
-                try:
-                    runtime.stop_project(project["runtime_name"])
-                except RuntimeErrorBase as exc:
-                    # Do not declare a deadline-complete run while workers may
-                    # still be alive; retain an actionable stopping state.
-                    store.update_run(active["id"], status="stopping", outcome=f"deadline_stop_failed: {exc}"[:200])
+            expected, alive, pending = roster_state(project, projection)
+            if time.time() >= active["deadline"]:
+                return enforce_expired_deadline(
+                    project_id, project, active, projection,
+                )
+            if active["status"] == "stopping" and not any(worker.get("alive") for worker in workers):
+                unresolved = unresolved_raw_processes(projection)
+                if unresolved:
+                    store.update_run(
+                        active["id"], status="stopping",
+                        outcome=("stop_blocked_identity:" + ",".join(unresolved))[:200],
+                    )
                 else:
-                    store.update_run(active["id"], status="stopping", outcome="deadline_stop_requested")
-            elif active["status"] == "stopping" and not any(worker.get("alive") for worker in workers):
-                store.update_run(active["id"], status="stopped", stopped_at=time.time(), outcome="graceful_stop")
+                    store.update_run(active["id"], status="stopped", stopped_at=time.time(), outcome="graceful_stop")
             elif (
                 active["status"] == "starting"
                 and int(active.get("start_attempt_generation") or 0) > 0
@@ -288,9 +368,17 @@ def create_app(
                     attempt_outcome="started", status="running",
                     outcome=f"broker_start_reconciled:{generation}",
                 )
-            elif active["status"] == "running" and workers and not any(worker.get("alive") for worker in workers):
-                outcome = "worker_error" if any(worker.get("state") == "error" for worker in workers) else "workers_exited"
-                store.update_run(active["id"], status="stopped", stopped_at=time.time(), outcome=outcome)
+            elif active["status"] == "running" and expected and pending:
+                if alive:
+                    outcome = "degraded_missing:" + ",".join(pending)
+                    if active.get("outcome") != outcome:
+                        store.update_run(active["id"], status="running", outcome=outcome[:200])
+                        store.audit("run_roster", "degraded", project_id)
+                else:
+                    outcome = "worker_error" if any(worker.get("state") == "error" for worker in workers) else "workers_exited"
+                    store.update_run(active["id"], status="stopped", stopped_at=time.time(), outcome=outcome)
+            elif active["status"] == "running" and expected and not pending and str(active.get("outcome") or "").startswith("degraded_missing:"):
+                store.update_run(active["id"], status="running", outcome="roster_recovered")
         return projection
 
     def lifecycle_url(project_id: str) -> str:
@@ -389,7 +477,22 @@ def create_app(
             return {"status": "running", "run_id": active["id"], "workers": alive}
 
         try:
-            runtime.stop_project(project["runtime_name"])
+            result = runtime.stop_project(project["runtime_name"])
+            failures = lifecycle_result_failures(
+                result, allowed={"stopping (graceful)", "not-running"},
+            )
+            if failures:
+                store.update_run(
+                    active["id"], status="stopping",
+                    outcome=("main_agent_stop_refused:" + ",".join(
+                        str(row.get("worker")) for row in failures
+                    ))[:200],
+                )
+                store.audit("run_stop", "failure", project_id)
+                return JSONResponse({
+                    "detail": "one or more Worker stops were refused",
+                    "workers": failures,
+                }, status_code=409)
         except (RuntimeErrorBase, OSError):
             store.update_run(active["id"], status="stopping", outcome="main_agent_stop_failed")
             store.audit("run_stop", "failure", project_id)
@@ -736,7 +839,13 @@ def create_app(
             projection = reconcile_run(project_id, project, runtime.status_project(project["runtime_name"]))
             active = store.active_run(project_id)
             if active is not None:
-                projection = {**projection, "run": {"id": active["id"], "status": active["status"], "deadline": active["deadline"]}}
+                expected, alive, pending = roster_state(project, projection)
+                projection = {**projection, "run": {
+                    "id": active["id"], "status": active["status"],
+                    "deadline": active["deadline"], "outcome": active.get("outcome"),
+                    "expected_workers": expected, "alive_workers": alive,
+                    "not_running_workers": pending,
+                }}
             return projection_with_project(project, projection)
         except RuntimeErrorBase:
             return _error(502, "runtime projection unavailable")
@@ -1203,5 +1312,23 @@ def create_app(
     async def index():
         from fastapi.responses import FileResponse
         return FileResponse(Path(__file__).with_name("static") / "index.html")
+
+    async def deadline_supervisor_loop() -> None:
+        interval = max(0.05, float(settings.deadline_poll_seconds))
+        while True:
+            for project in store.projects():
+                active = store.active_run(project["id"])
+                if active is None or time.time() < active["deadline"]:
+                    continue
+                async with lock_for(project["id"]):
+                    try:
+                        await asyncio.to_thread(
+                            lambda p=project: reconcile_run(
+                                p["id"], p, runtime.status_project(p["runtime_name"]),
+                            )
+                        )
+                    except (RuntimeErrorBase, OSError):
+                        store.audit("run_deadline", "projection_failure", project["id"])
+            await asyncio.sleep(interval)
 
     return app

@@ -280,8 +280,11 @@ def worker_status(wl: L.WorkerLayout) -> Dict:
                                    "terminated", "created") else "dead"
     config = _read_worker_config(wl)
     task_state = _read_task_state(wl)
+    raw_alive = P.process_alive(pid)
+    identity_status = "matched" if alive else "mismatch" if raw_alive else "dead"
     return {
-        "worker": wl.name, "pid": pid, "alive": alive, "state": state,
+        "worker": wl.name, "pid": pid, "alive": alive, "raw_alive": raw_alive,
+        "process_identity": identity_status, "state": state,
         "persisted_state": persisted_state,
         "identity_verified": alive,
         "round": st.get("round", 0), "age_s": round(age, 1) if age is not None else None,
@@ -359,10 +362,12 @@ def _stop_one(wl: L.WorkerLayout, force: bool) -> str:
     pid = P.read_pid(wl)
     raw_alive = P.process_alive(pid)
     if not P.worker_process_alive(wl):
-        # Refuse to touch a live process whose host identity does not belong to
-        # the target Worker. Clearing only stale Danus metadata is non-destructive.
+        # Retain live mismatched metadata for host reconciliation; clearing it
+        # would hide an unresolved process and permit a false terminal outcome.
+        if raw_alive:
+            return "identity-mismatch"
         P.clear_worker_process_metadata(wl)
-        return "identity-mismatch" if raw_alive else "not-running"
+        return "not-running"
     wl.stop.touch()      # graceful: loop exits at round boundary
     return "stopping (graceful)"
 

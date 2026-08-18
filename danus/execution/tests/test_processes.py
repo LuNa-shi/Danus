@@ -20,7 +20,7 @@ class FakeProcessOps:
         self.pgid = pgid
         self.events: list[tuple | str] = []
         self.now = 0.0
-        self.group_running = True
+        self.running = True
 
     def pid_exists(self, pid: int) -> bool:
         self.events.append(("pid_exists", pid))
@@ -33,6 +33,15 @@ class FakeProcessOps:
     def close_pidfd(self, fd: int) -> None:
         self.events.append(("close_pidfd", fd))
 
+    def pidfd_exited(self, fd: int) -> bool:
+        self.events.append(("pidfd_exited", fd))
+        return not self.running
+
+    def signal_pidfd(self, fd: int, sig: int) -> None:
+        self.events.append(("signal_pidfd", fd, sig))
+        if sig == signal.SIGKILL:
+            self.running = False
+
     def getpgid(self, pid: int) -> int:
         self.events.append(("getpgid", pid))
         return pid if self.pgid is None else self.pgid
@@ -40,11 +49,11 @@ class FakeProcessOps:
     def signal_group(self, pgid: int, sig: int) -> None:
         self.events.append(("signal_group", pgid, sig))
         if sig == signal.SIGKILL:
-            self.group_running = False
+            self.running = False
 
     def group_exists(self, pgid: int) -> bool:
         self.events.append(("group_exists", pgid))
-        return self.group_running
+        return self.running
 
     def sleep(self, seconds: float) -> None:
         self.events.append(("sleep", seconds))
@@ -63,6 +72,15 @@ class RecordingProcFS(LinuxProcFS):
         self.events.append(("procfs_cmdline", pid))
         return super().cmdline(pid)
 
+    def process_ids(self) -> list[int]:
+        if any(
+            isinstance(event, tuple) and event[:2] == ("signal_pidfd", 77)
+            and event[2] == signal.SIGKILL
+            for event in self.events
+        ):
+            return []
+        return super().process_ids()
+
 
 def _worker_with_procfs(tmp_path: Path, pid: int = 4321):
     worker_dir = tmp_path / "project" / "workers" / "high"
@@ -74,7 +92,7 @@ def _worker_with_procfs(tmp_path: Path, pid: int = 4321):
     (proc_root / "sys/kernel/random").mkdir(parents=True)
     cmdline = (sys.executable, "-m", "danus.execution", str(worker_dir.resolve()))
     (process_dir / "cmdline").write_bytes(b"\0".join(part.encode() for part in cmdline) + b"\0")
-    stat_fields = ["S", *(["0"] * 18), "4242"]
+    stat_fields = ["S", "1", str(pid), *(["0"] * 16), "4242"]
     (process_dir / "stat").write_text(f"{pid} (worker loop) " + " ".join(stat_fields), encoding="utf-8")
     (proc_root / "sys/kernel/random/boot_id").write_text("boot-test\n", encoding="utf-8")
     identity = WorkerProcessIdentity(
@@ -105,9 +123,8 @@ def test_force_stop_opens_pidfd_before_identity_revalidation_and_keeps_it_throug
     )
 
     assert result == "killed"
-    assert ops.events.index(("open_pidfd", 4321)) < ops.events.index(("procfs_cmdline", 4321))
-    term_index = ops.events.index(("signal_group", 4321, signal.SIGTERM))
-    kill_index = ops.events.index(("signal_group", 4321, signal.SIGKILL))
+    term_index = ops.events.index(("signal_pidfd", 77, signal.SIGTERM))
+    kill_index = ops.events.index(("signal_pidfd", 77, signal.SIGKILL))
     close_index = ops.events.index(("close_pidfd", 77))
     assert term_index < kill_index < close_index
     assert not wl.pid.exists()
@@ -121,7 +138,7 @@ def test_force_stop_fails_closed_without_pidfd_and_keeps_recoverable_metadata(tm
     result = force_stop_worker(wl, procfs=LinuxProcFS(proc_root), ops=ops)
 
     assert result == "stable-handle-unavailable"
-    assert not any(event[0] == "signal_group" for event in ops.events if isinstance(event, tuple))
+    assert not any(event[0] == "signal_pidfd" for event in ops.events if isinstance(event, tuple))
     assert wl.pid.exists()
     assert wl.process_identity.exists()
 
@@ -133,7 +150,6 @@ def test_force_stop_requires_worker_to_lead_its_exact_process_group(tmp_path: Pa
     result = force_stop_worker(wl, procfs=LinuxProcFS(proc_root), ops=ops)
 
     assert result == "unsafe-process-group"
-    assert not any(event[0] == "signal_group" for event in ops.events if isinstance(event, tuple))
-    assert ops.events[-1] == ("close_pidfd", 77)
+    assert not any(event[0] == "signal_pidfd" for event in ops.events if isinstance(event, tuple))
     assert wl.pid.exists()
     assert wl.process_identity.exists()

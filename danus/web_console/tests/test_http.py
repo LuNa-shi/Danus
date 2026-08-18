@@ -1215,3 +1215,126 @@ def test_main_agent_event_retention_is_project_scoped(tmp_path: Path):
 
     assert [event["detail"] for event in store.main_agent_events("p1")] == ["2", "3", "4"]
     assert [event["detail"] for event in store.main_agent_events("p2")] == ["other project"]
+
+
+def test_deadline_supervisor_enforces_expiry_without_browser_polling(tmp_path: Path):
+    class DeadlineRuntime(FakeRuntime):
+        def __init__(self, root):
+            super().__init__(root)
+            self.deadline_enforced = threading.Event()
+
+        def enforce_deadline(self, runtime_name):
+            self.deadline_enforced.set()
+            self.statuses[runtime_name] = [
+                {**worker, "alive": False, "raw_alive": False, "state": "terminated"}
+                for worker in self.statuses.get(runtime_name, [])
+            ]
+            return {"workers": [
+                {"worker": worker["worker"], "result": "killed"}
+                for worker in self.statuses[runtime_name]
+            ]}
+
+    runtime = DeadlineRuntime(tmp_path / "projects")
+    settings = AppSettings(
+        database_path=tmp_path / "console.sqlite3",
+        password_hash=hash_password("correct horse battery staple"),
+        cookie_secure=True,
+        allowed_origins={"https://testserver"},
+        lifecycle_hmac_secret=_LIFECYCLE_SECRET,
+        deadline_poll_seconds=0.05,
+    )
+    app = create_app(settings=settings, runtime=runtime)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client)
+        headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post(
+            "/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers,
+        ).json()
+        runtime.assign_all(project["runtime_name"])
+        started = client.post(
+            f"/api/projects/{project['id']}/runs",
+            json={"duration_seconds": 1}, headers=headers,
+        )
+        assert started.status_code == 202
+        assert _broker_start(client, project).status_code == 200
+
+        assert runtime.deadline_enforced.wait(timeout=2.5)
+        run = client.get(
+            f"/api/projects/{project['id']}/runs/{started.json()['run_id']}"
+        ).json()
+        assert run["status"] == "stopped"
+        assert run["outcome"] == "deadline_enforced"
+
+
+def test_running_run_reports_degraded_when_any_expected_worker_disappears(tmp_path: Path):
+    app, runtime = _app(tmp_path)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client)
+        headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post(
+            "/api/projects",
+            json={"name": "A", "problem": "alpha", "roles": "high:1,xhigh:1"},
+            headers=headers,
+        ).json()
+        runtime.assign_all(project["runtime_name"])
+        started = client.post(
+            f"/api/projects/{project['id']}/runs",
+            json={"duration_seconds": 60}, headers=headers,
+        )
+        assert _broker_start(client, project).status_code == 200
+        runtime.statuses[project["runtime_name"]][-1].update({
+            "alive": False, "raw_alive": False, "state": "error",
+        })
+
+        projection = client.get(f"/api/projects/{project['id']}/runtime").json()
+        assert projection["run"]["status"] == "running"
+        assert projection["run"]["outcome"].startswith("degraded_missing:")
+        assert projection["run"]["not_running_workers"] == ["xhigh"]
+        assert projection["run"]["alive_workers"] == ["high"]
+        run = client.get(
+            f"/api/projects/{project['id']}/runs/{started.json()['run_id']}"
+        ).json()
+        assert run["outcome"].startswith("degraded_missing:")
+
+
+def test_broker_stop_refusal_keeps_unresolved_raw_process_nonterminal(tmp_path: Path):
+    class RefusingRuntime(FakeRuntime):
+        def stop_project(self, runtime_name):
+            worker = self.statuses[runtime_name][0]
+            worker.update({
+                "alive": False, "raw_alive": True,
+                "process_identity": "mismatch", "state": "stale",
+            })
+            return {"workers": [{"worker": worker["worker"], "result": "identity-mismatch"}]}
+
+    runtime = RefusingRuntime(tmp_path / "projects")
+    settings = AppSettings(
+        database_path=tmp_path / "console.sqlite3",
+        password_hash=hash_password("correct horse battery staple"),
+        cookie_secure=True,
+        allowed_origins={"https://testserver"},
+        lifecycle_hmac_secret=_LIFECYCLE_SECRET,
+    )
+    app = create_app(settings=settings, runtime=runtime)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client)
+        headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post(
+            "/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers,
+        ).json()
+        runtime.assign_all(project["runtime_name"])
+        started = client.post(
+            f"/api/projects/{project['id']}/runs",
+            json={"duration_seconds": 60}, headers=headers,
+        )
+        assert _broker_start(client, project).status_code == 200
+        assert client.post(
+            f"/api/projects/{project['id']}/stop", json={}, headers=headers,
+        ).status_code == 202
+
+        refused = _broker_stop(client, project)
+        assert refused.status_code == 409
+        projection = client.get(f"/api/projects/{project['id']}/runtime").json()
+        assert projection["run"]["status"] == "stopping"
+        assert projection["run"]["outcome"].startswith("main_agent_stop_refused:")
+        assert runtime.statuses[project["runtime_name"]][0]["raw_alive"] is True

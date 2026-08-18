@@ -99,6 +99,11 @@ class DanusRuntimeAdapter:
         self._project_dir(runtime_name)
         return {"workers": self._call(cli.do_stop, runtime_name, force=False)}
 
+    def enforce_deadline(self, runtime_name: str) -> dict[str, Any]:
+        """Hard-stop an expired Run through identity-verified host handles."""
+        self._project_dir(runtime_name)
+        return {"workers": self._call(cli.do_stop, runtime_name, force=True)}
+
     def status_project(self, runtime_name: str) -> dict[str, Any]:
         root = self._project_dir(runtime_name)
         workers = self._call(cli.do_status, runtime_name)

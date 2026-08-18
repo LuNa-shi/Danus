@@ -105,11 +105,12 @@ def _patch_spawn():
 @contextmanager
 def _verified_worker(wl: L.WorkerLayout, pid: int):
     """Persist and mock one explicit identity for a harmless test process."""
+    record = P.DEFAULT_PROCFS.process_record(pid)
     identity = P.WorkerProcessIdentity(
         pid=pid,
-        boot_id="test-boot",
-        start_time=f"test-start-{pid}",
-        cmdline=P.expected_worker_cmdline(wl),
+        boot_id=P.DEFAULT_PROCFS.boot_id(),
+        start_time=str(record["start_time"]),
+        cmdline=tuple(record["cmdline"]),
     )
     wl.pid.write_text(str(pid), encoding="utf-8")
     wl.process_identity.write_text(json.dumps(identity.as_dict()), encoding="utf-8")
@@ -579,8 +580,8 @@ def test_main_force_stop_refuses_live_unrelated_pid_without_signal(tmp: Path):
             assert signals == []
             assert proc.poll() is None
             assert cli._alive(proc.pid) is True
-            assert not wl.pid.exists()
-            assert not wl.process_identity.exists()
+            assert wl.pid.exists()
+            assert wl.process_identity.exists()
             assert not wl.stop.exists()
         finally:
             cli.os.killpg = original_killpg

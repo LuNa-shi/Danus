@@ -199,7 +199,7 @@ class MainAgentAdapter:
 
     def _prompt(self, *, message: str, manifest: list[dict[str, Any]], project_state: dict[str, Any], attachments: list[dict[str, Any]]) -> str:
         repo = Path(__file__).resolve().parents[2]
-        contract = repo / "agents" / "contracts" / "main_agent.md"
+        contract = repo / "agents" / "contracts" / "web_main_agent.md"
         contract_text = contract.read_text(encoding="utf-8") if contract.is_file() else ""
         strategy_transport = resolve_transport(None)
         if strategy_transport == "off":
@@ -217,7 +217,7 @@ class MainAgentAdapter:
         return "\n".join([
             "You are the Danus Main Agent for exactly one Project.",
             "Follow the Main Agent contract below. Retain strategic orchestration authority; do not submit facts directly.",
-            "Use the project-scoped `danus-web-agent` command for status, assignment, and graceful worker lifecycle coordination. It is the only allowed lifecycle command and is pinned to this Project. Do not edit Danus source code or access another Project. Use the Danus MCP tools for scoped memory and Fact Graph oversight; never submit facts as Main Agent.",
+            "Use the exact project-scoped command path in `$DANUS_WEB_AGENT_BIN` for status, assignment, and graceful Worker lifecycle coordination. It is the only allowed lifecycle command and is pinned to this Project. Do not edit Danus source code or access another Project. Use the Danus MCP tools for scoped memory and Fact Graph oversight; never submit facts as Main Agent.",
             strategy_policy,
             "MAIN AGENT CONTRACT:\n" + contract_text,
             "The Web Console supplies this project state and material manifest explicitly.",
@@ -279,33 +279,34 @@ class MainAgentAdapter:
             "DANUS_PROJECT_DIR": str(root), "DANUS_AGENTS_ROOT": str(root.parent),
             "DANUS_PROJECT_SCOPE": root.name,
             "DANUS_WEB_AGENT_BIN": str(repo / "bin" / "danus-web-agent"),
-            "DANUS_ROOT": str(repo),
             # Pin the MCP server to the interpreter running the Web Console when
             # scripts/env.sh did not explicitly provide a Danus runtime Python.
             "DANUS_PY": env.get("DANUS_PY") or sys.executable,
-            # Codex runs from the Project context, not the source checkout. In a
-            # developer launch without bootstrap's installed venv, the scoped
-            # lifecycle CLI and MCP gateway still need to import this checkout.
-            # Do not inherit an arbitrary host PYTHONPATH; expose only Danus.
-            "PYTHONPATH": str(repo),
         })
         if (lifecycle_url is None) != (lifecycle_token is None):
             raise MainAgentError("incomplete lifecycle broker capability")
         if lifecycle_url is not None and lifecycle_token is not None:
             env["DANUS_WEB_LIFECYCLE_URL"] = lifecycle_url
             env["DANUS_WEB_LIFECYCLE_TOKEN"] = lifecycle_token
-        # A project-scoped main session must be able to invoke the repository's
-        # lifecycle CLI, whose wrapper sources scripts/env.sh. Keep the repo bin
-        # directory ahead of the inherited PATH without exposing arbitrary cwd.
-        bin_dirs = [str(repo / "bin")]
+        # Codex receives the broker wrapper only by its exact environment path;
+        # remove the repository bin directory so generic `danus start/stop`
+        # cannot be selected from PATH. Claude has an explicit Bash allowlist,
+        # so it may resolve the wrapper by name without gaining generic commands.
+        repo_bin = (repo / "bin").resolve()
+        path_parts = []
+        for entry in env.get("PATH", "").split(os.pathsep) if env.get("PATH") else []:
+            try:
+                if Path(entry).resolve() == repo_bin:
+                    continue
+            except (OSError, RuntimeError):
+                pass
+            path_parts.append(entry)
+        if self.backend == "claude":
+            path_parts.insert(0, str(repo_bin))
         codex_dir = os.path.dirname(os.path.abspath(self.codex_bin)) if os.path.dirname(self.codex_bin) else ""
-        if codex_dir:
-            bin_dirs.append(codex_dir)
-        path_parts = env.get("PATH", "").split(os.pathsep) if env.get("PATH") else []
-        for bin_dir in reversed(bin_dirs):
-            if bin_dir not in path_parts:
-                env["PATH"] = bin_dir + (os.pathsep + env.get("PATH", "") if env.get("PATH") else "")
-                path_parts.insert(0, bin_dir)
+        if codex_dir and codex_dir not in path_parts:
+            path_parts.insert(0, codex_dir)
+        env["PATH"] = os.pathsep.join(path_parts)
         return env
 
     @staticmethod
@@ -705,7 +706,7 @@ class MainAgentAdapter:
                 f"DANUS_AGENTS_ROOT={q(root.parent)}",
                 f"DANUS_PROJECT_SCOPE={q(root.name)}",
                 f"DANUS_VERIFY_URL={q(env.get('DANUS_VERIFY_URL', ''))}",
-                f"PYTHONPATH={q(env.get('PYTHONPATH', ''))}",
+                f"PYTHONPATH={q(str(Path(__file__).resolve().parents[2]))}",
             ]) + "}",
         ]
         return "mcp_servers.danus={" + ",".join(fields) + "}"
@@ -878,7 +879,7 @@ class MainAgentAdapter:
 
     def _send_claude(self, *, root: Path, session_id: str | None, prompt: str, env: dict[str, str]) -> dict[str, Any]:
         repo = Path(__file__).resolve().parents[2]
-        contract = repo / "agents" / "contracts" / "main_agent.md"
+        contract = repo / "agents" / "contracts" / "web_main_agent.md"
         if not contract.is_file() or not os.access(contract, os.R_OK):
             raise MainAgentError("main agent contract is unavailable")
         if session_id:

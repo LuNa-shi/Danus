@@ -14,7 +14,7 @@ import signal
 import subprocess
 import sys
 import time
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 from . import layout as L
 
@@ -84,6 +84,22 @@ class LinuxProcFS:
             encoding="utf-8"
         ).strip()
 
+    def process_record(self, pid: int) -> dict[str, Any]:
+        parts = (self.root / str(pid) / "stat").read_text(
+            encoding="utf-8"
+        ).rsplit(")", 1)[1].split()
+        return {
+            "pid": pid, "state": parts[0], "ppid": int(parts[1]),
+            "pgid": int(parts[2]), "start_time": parts[19],
+            "cmdline": list(self.cmdline(pid)),
+        }
+
+    def process_ids(self) -> list[int]:
+        try:
+            return [int(path.name) for path in self.root.iterdir() if path.name.isdigit()]
+        except OSError:
+            return []
+
     def process_group_alive(self, pgid: int) -> bool:
         """Return whether procfs contains a non-zombie member of *pgid*."""
         for entry in self.root.iterdir():
@@ -122,6 +138,7 @@ class ProcessOps(Protocol):
     def open_pidfd(self, pid: int) -> int | None: ...
     def close_pidfd(self, fd: int) -> None: ...
     def pidfd_exited(self, fd: int) -> bool: ...
+    def signal_pidfd(self, fd: int, sig: int) -> None: ...
     def getpgid(self, pid: int) -> int: ...
     def signal_group(self, pgid: int, sig: int) -> None: ...
     def group_exists(self, pgid: int) -> bool: ...
@@ -159,6 +176,12 @@ class SystemProcessOps:
         except (OSError, ValueError):
             return True
         return bool(readable)
+
+    def signal_pidfd(self, fd: int, sig: int) -> None:
+        sender = getattr(signal, "pidfd_send_signal", None)
+        if sender is None:
+            raise OSError("pidfd_send_signal unavailable")
+        sender(fd, sig)
 
     def getpgid(self, pid: int) -> int:
         return os.getpgid(pid)
@@ -289,90 +312,142 @@ def _stable_group_alive(
         return ops.group_exists(pgid)
 
 
-def _wait_for_group_exit(
-    pgid: int,
-    pidfd: int,
-    *,
-    timeout: float,
-    poll_interval: float,
-    procfs: LinuxProcFS,
-    ops: ProcessOps,
+def process_group_members(
+    pgid: int, *, procfs: LinuxProcFS = DEFAULT_PROCFS,
+) -> list[dict[str, Any]]:
+    members: list[dict[str, Any]] = []
+    for pid in procfs.process_ids():
+        try:
+            record = procfs.process_record(pid)
+        except (OSError, ValueError, IndexError, UnicodeError):
+            continue
+        if record["pgid"] == pgid and record["state"] != "Z":
+            members.append(record)
+    return sorted(members, key=lambda row: int(row["pid"]))
+
+
+def _freeze_process_group(
+    pgid: int, *, required_leader: WorkerProcessIdentity | None = None,
+    procfs: LinuxProcFS, ops: ProcessOps,
+) -> dict[int, tuple[int, str]]:
+    """Pin and SIGSTOP every member until the group membership is stable."""
+    handles: dict[int, tuple[int, str]] = {}
+    try:
+        for _ in range(8):
+            records = process_group_members(pgid, procfs=procfs)
+            for record in records:
+                pid = int(record["pid"])
+                if pid in handles:
+                    continue
+                fd = ops.open_pidfd(pid)
+                if fd is None:
+                    raise RuntimeError(f"stable handle unavailable for pid {pid}")
+                try:
+                    current = procfs.process_record(pid)
+                except (OSError, ValueError, IndexError) as exc:
+                    ops.close_pidfd(fd)
+                    raise RuntimeError(f"process identity unavailable for pid {pid}") from exc
+                if current["pgid"] != pgid or current["start_time"] != record["start_time"]:
+                    ops.close_pidfd(fd)
+                    raise RuntimeError(f"process identity changed for pid {pid}")
+                if required_leader is not None and pid == required_leader.pid and (
+                    str(current["start_time"]) != required_leader.start_time
+                    or tuple(current["cmdline"]) != required_leader.cmdline
+                ):
+                    ops.close_pidfd(fd)
+                    raise RuntimeError("Worker leader identity changed")
+                handles[pid] = (fd, str(current["start_time"]))
+                ops.signal_pidfd(fd, signal.SIGSTOP)
+            current_pids = {int(row["pid"]) for row in process_group_members(pgid, procfs=procfs)}
+            if current_pids.issubset(handles):
+                return handles
+        raise RuntimeError("process group membership did not stabilize")
+    except Exception:
+        for fd, _start in handles.values():
+            try:
+                ops.signal_pidfd(fd, signal.SIGCONT)
+            except (OSError, ProcessLookupError):
+                pass
+            try:
+                ops.close_pidfd(fd)
+            except OSError:
+                pass
+        raise
+
+
+def _terminate_frozen_handles(
+    handles: dict[int, tuple[int, str]], *, ops: ProcessOps,
+    term_timeout: float, kill_timeout: float, poll_interval: float,
+    on_signal: Callable[[str], None] | None = None,
 ) -> bool:
-    deadline = ops.monotonic() + max(0.0, timeout)
-    while _stable_group_alive(pgid, pidfd, procfs=procfs, ops=ops):
-        if ops.monotonic() >= deadline:
-            return False
-        ops.sleep(max(0.001, min(poll_interval, deadline - ops.monotonic())))
-    return True
+    try:
+        for fd, _start in handles.values():
+            if not ops.pidfd_exited(fd):
+                ops.signal_pidfd(fd, signal.SIGTERM)
+        if on_signal is not None:
+            on_signal("SIGTERM")
+        # SIGTERM is pending while stopped; SIGCONT lets handlers run without a
+        # window for new work before the pending termination is delivered.
+        for fd, _start in handles.values():
+            if not ops.pidfd_exited(fd):
+                ops.signal_pidfd(fd, signal.SIGCONT)
+        deadline = ops.monotonic() + max(0.0, term_timeout)
+        while any(not ops.pidfd_exited(fd) for fd, _ in handles.values()) and ops.monotonic() < deadline:
+            ops.sleep(max(0.001, poll_interval))
+        remaining = [(fd, start) for fd, start in handles.values() if not ops.pidfd_exited(fd)]
+        if remaining:
+            for fd, _start in remaining:
+                ops.signal_pidfd(fd, signal.SIGKILL)
+            if on_signal is not None:
+                on_signal("SIGKILL")
+            deadline = ops.monotonic() + max(0.0, kill_timeout)
+            while any(not ops.pidfd_exited(fd) for fd, _ in remaining) and ops.monotonic() < deadline:
+                ops.sleep(max(0.001, poll_interval))
+        return all(ops.pidfd_exited(fd) for fd, _ in handles.values())
+    finally:
+        for fd, _start in handles.values():
+            try:
+                ops.close_pidfd(fd)
+            except OSError:
+                pass
 
 
 def force_stop_worker(
-    wl: L.WorkerLayout,
-    *,
-    procfs: LinuxProcFS = DEFAULT_PROCFS,
-    ops: ProcessOps = SYSTEM_PROCESS_OPS,
-    term_timeout: float = 5.0,
-    kill_timeout: float = 5.0,
-    poll_interval: float = 0.1,
+    wl: L.WorkerLayout, *, procfs: LinuxProcFS = DEFAULT_PROCFS,
+    ops: ProcessOps = SYSTEM_PROCESS_OPS, term_timeout: float = 5.0,
+    kill_timeout: float = 5.0, poll_interval: float = 0.1,
+    on_signal: Callable[[str], None] | None = None,
 ) -> str:
-    """Stop one verified Worker group without a PID-reuse signal window."""
+    """Stop a verified Worker subtree exclusively through stable pidfds."""
     pid = read_pid(wl)
     if not process_alive(pid, procfs=procfs, ops=ops) or pid is None:
         clear_worker_process_metadata(wl)
         return "not-running"
-
-    # The stable handle is acquired before re-reading procfs identity and remains
-    # open until TERM/wait/KILL completes. No pidfd means no destructive signal.
-    pidfd = ops.open_pidfd(pid)
-    if pidfd is None:
-        if not process_alive(pid, procfs=procfs, ops=ops):
-            clear_worker_process_metadata(wl)
-            return "not-running"
-        return "stable-handle-unavailable"
-
+    current = capture_worker_identity(wl, pid, procfs=procfs, ops=ops)
+    persisted = read_worker_identity(wl)
+    if current is None or persisted is None or persisted != current:
+        return "identity-mismatch"
     try:
-        current = capture_worker_identity(wl, pid, procfs=procfs, ops=ops)
-        persisted = read_worker_identity(wl)
-        if current is None or (persisted is not None and persisted != current):
-            clear_worker_process_metadata(wl)
-            return "identity-mismatch"
-        try:
-            pgid = ops.getpgid(pid)
-        except (ProcessLookupError, PermissionError, OSError):
-            if not process_alive(pid, procfs=procfs, ops=ops):
-                clear_worker_process_metadata(wl)
-                return "not-running"
-            return "unsafe-process-group"
-        if pgid != pid:
-            return "unsafe-process-group"
-
-        try:
-            ops.signal_group(pgid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        except (PermissionError, OSError):
-            return "signal-denied"
-        exited = _wait_for_group_exit(
-            pgid, pidfd, timeout=term_timeout, poll_interval=poll_interval,
-            procfs=procfs, ops=ops,
+        pgid = ops.getpgid(pid)
+    except (ProcessLookupError, PermissionError, OSError):
+        return "not-running" if not process_alive(pid, procfs=procfs, ops=ops) else "unsafe-process-group"
+    if pgid != pid:
+        return "unsafe-process-group"
+    try:
+        handles = _freeze_process_group(
+            pgid, required_leader=current, procfs=procfs, ops=ops,
         )
-        if not exited:
-            try:
-                ops.signal_group(pgid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except (PermissionError, OSError):
-                return "signal-denied"
-            exited = _wait_for_group_exit(
-                pgid, pidfd, timeout=kill_timeout, poll_interval=poll_interval,
-                procfs=procfs, ops=ops,
-            )
-        if not exited:
-            return "kill-failed"
-        clear_worker_process_metadata(wl)
-        return "killed"
-    finally:
-        ops.close_pidfd(pidfd)
+        exited = _terminate_frozen_handles(
+            handles, ops=ops, term_timeout=term_timeout,
+            kill_timeout=kill_timeout, poll_interval=poll_interval,
+            on_signal=on_signal,
+        )
+    except (RuntimeError, OSError, ProcessLookupError, PermissionError):
+        return "stable-handle-unavailable"
+    if not exited or process_group_members(pgid, procfs=procfs):
+        return "kill-failed"
+    clear_worker_process_metadata(wl)
+    return "killed"
 
 
 def _wait_and_reap(process: subprocess.Popen, timeout: float) -> bool:
@@ -384,62 +459,22 @@ def _wait_and_reap(process: subprocess.Popen, timeout: float) -> bool:
 
 
 def terminate_spawned_worker(
-    process: subprocess.Popen,
-    *,
-    procfs: LinuxProcFS = DEFAULT_PROCFS,
-    ops: ProcessOps = SYSTEM_PROCESS_OPS,
-    term_timeout: float = 5.0,
-    kill_timeout: float = 5.0,
-    poll_interval: float = 0.05,
+    process: subprocess.Popen, *, procfs: LinuxProcFS = DEFAULT_PROCFS,
+    ops: ProcessOps = SYSTEM_PROCESS_OPS, term_timeout: float = 5.0,
+    kill_timeout: float = 5.0, poll_interval: float = 0.05,
 ) -> bool:
-    """Terminate and reap the exact newly spawned Worker process group."""
+    """Terminate/reap a newly spawned Worker without numeric group signals."""
     pid = int(process.pid)
     try:
         pgid = ops.getpgid(pid)
-    except (ProcessLookupError, PermissionError, OSError):
-        # A direct unreaped child cannot have its PID reused. Reap if it already
-        # exited; otherwise terminate that exact child rather than guessing a group.
-        if process.poll() is None:
-            process.terminate()
-            if not _wait_and_reap(process, term_timeout):
-                process.kill()
-                _wait_and_reap(process, kill_timeout)
-        return process.poll() is not None
-    if pgid != pid:
-        # spawn_loop uses start_new_session=True; fail closed if that invariant
-        # was not established. Reap the exact direct child but do not claim the
-        # unknown group was safely cleaned up.
-        if process.poll() is None:
-            process.terminate()
-            if not _wait_and_reap(process, term_timeout):
-                process.kill()
-                _wait_and_reap(process, kill_timeout)
-        return False
-
-    try:
-        ops.signal_group(pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    except (PermissionError, OSError):
-        return False
-    reaped = _wait_and_reap(process, term_timeout)
-
-    def live_group_members() -> bool:
-        try:
-            return procfs.process_group_alive(pgid)
-        except OSError:
-            return ops.group_exists(pgid)
-
-    if not reaped or live_group_members():
-        try:
-            ops.signal_group(pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except (PermissionError, OSError):
+        if pgid != pid:
             return False
-        reaped = _wait_and_reap(process, kill_timeout)
-    # Reaping the leader is insufficient if a descendant still owns the group.
-    deadline = ops.monotonic() + max(0.0, kill_timeout)
-    while live_group_members() and ops.monotonic() < deadline:
-        ops.sleep(max(0.001, poll_interval))
-    return reaped and process.poll() is not None and not live_group_members()
+        handles = _freeze_process_group(pgid, procfs=procfs, ops=ops)
+        exited = _terminate_frozen_handles(
+            handles, ops=ops, term_timeout=term_timeout,
+            kill_timeout=kill_timeout, poll_interval=poll_interval,
+        )
+    except (RuntimeError, OSError, ProcessLookupError, PermissionError):
+        return False
+    reaped = _wait_and_reap(process, kill_timeout)
+    return exited and reaped and not process_group_members(pgid, procfs=procfs)

@@ -672,3 +672,28 @@ def test_codex_resume_keeps_resume_options_before_session(tmp_path: Path):
     assert 'approval_policy="never"' not in cmd
     assert "--config" in cmd and any(str(x).startswith("mcp_servers.danus=") for x in cmd)
     assert cmd[-2:] == ["sid-1", "-"]
+
+
+def test_web_main_agent_uses_broker_only_contract_and_hides_generic_repo_bin(tmp_path: Path, monkeypatch):
+    adapter = MainAgentAdapter(backend="codex", codex_bin="/usr/bin/codex")
+    repo = Path(__file__).resolve().parents[3]
+    root = tmp_path / "projects" / "A"
+    root.mkdir(parents=True)
+    monkeypatch.setenv("PATH", f"{repo / 'bin'}:/usr/bin")
+
+    env = adapter._env(
+        root,
+        lifecycle_url="http://127.0.0.1:8080/internal/api/projects/p/lifecycle",
+        lifecycle_token="project-capability",
+    )
+    prompt = adapter._prompt(
+        message="start", manifest=[], project_state={"project_id": "p"}, attachments=[],
+    )
+
+    assert str(repo / "bin") not in env["PATH"].split(os.pathsep)
+    assert env["DANUS_WEB_AGENT_BIN"] == str(repo / "bin" / "danus-web-agent")
+    assert "PYTHONPATH" not in env
+    assert "DANUS_ROOT" not in env
+    assert "Never invoke the generic `danus start`" in prompt
+    assert "$DANUS_WEB_AGENT_BIN start" in prompt
+    assert "danus stop <project>" not in prompt
