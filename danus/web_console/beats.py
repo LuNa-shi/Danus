@@ -59,6 +59,7 @@ class OrchestrationBeatCoordinator:
         self._now = now or time.time
         self._state: dict[str, tuple[str, float, float, float]] = {}
         self._pending: set[str] = set()
+        self._failures: dict[str, tuple[int, float]] = {}
 
     @staticmethod
     def fingerprint(observation: dict[str, Any]) -> str:
@@ -67,6 +68,20 @@ class OrchestrationBeatCoordinator:
 
     def request(self, project_id: str) -> None:
         self._pending.add(project_id)
+
+    def retry_allowed(self, project_id: str) -> bool:
+        failures, next_at = self._failures.get(project_id, (0, 0.0))
+        now = self._now()
+        return now >= next_at
+
+    def record_failure(self, project_id: str) -> int:
+        failures, _ = self._failures.get(project_id, (0, 0.0))
+        failures += 1
+        self._failures[project_id] = (failures, self._now() + min(300.0, 2.0 ** failures))
+        return failures
+
+    def record_success(self, project_id: str) -> None:
+        self._failures.pop(project_id, None)
 
     def cancel_request(self, project_id: str) -> None:
         self._pending.discard(project_id)
@@ -96,14 +111,12 @@ class OrchestrationBeatCoordinator:
         return BeatDecision(project_id, reason, fingerprint, due, consult_due, summary_due)
 
     def defer_cadence(self, project_id: str, *, consult_due: bool, summary_due: bool) -> tuple[float, float]:
+        """Report debt without clearing it; a later genuine beat must carry it."""
         previous = self._state.get(project_id)
-        now = self._now()
         if previous is None:
+            now = self._now()
             return now, now
-        last_consult = now if consult_due else previous[2]
-        last_summary = now if summary_due else previous[3]
-        self._state[project_id] = (previous[0], previous[1], last_consult, last_summary)
-        return last_consult, last_summary
+        return previous[2], previous[3]
 
     def settle(self, project_id: str, observation: dict[str, Any]) -> tuple[str, float, float, float]:
         now = self._now()
@@ -111,6 +124,7 @@ class OrchestrationBeatCoordinator:
         state = (self.fingerprint(observation), now, previous[2] if previous else now, previous[3] if previous else now)
         self._state[project_id] = state
         self.cancel_request(project_id)
+        self.record_success(project_id)
         return state
 
     def complete(self, project_id: str, observation: dict[str, Any], decision: BeatDecision) -> tuple[str, float, float, float]:

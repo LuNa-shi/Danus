@@ -1661,7 +1661,7 @@ def create_app(
                     store.audit("orchestration_beat", "cancelled_inactive_run", project_id)
                     return
                 persisted = store.orchestration_beat_state(project_id)
-                if persisted and persisted.get("status") in {"completed", "cadence_due_no_change"}:
+                if persisted and persisted.get("status") in {"completed", "manual_activation", "cadence_due_no_change"}:
                     beat_coordinator.seed(
                         project_id, fingerprint=persisted["fingerprint"],
                         last_beat_at=persisted["last_beat_at"],
@@ -1721,11 +1721,24 @@ def create_app(
                 store.upsert_agent_session(project_id, result["session_id"], "inactive", time.time(), backend=main_agent_backend)
                 store.add_message({"id": uuid.uuid4().hex, "project_id": project_id, "role": "assistant",
                                    "text": result["reply"], "status": "completed", "created_at": time.time(), "error": None})
+                current_active = store.active_run(project_id)
+                if current_active is None or current_active["id"] != active["id"]:
+                    status = "completed_after_run_end" if current_active is None else "completed_after_run_change"
+                    store.update_orchestration_beat_state(
+                        project_id, fingerprint=decision.fingerprint, status=status, reason=decision.reason,
+                        last_beat_at=time.time(), last_consult_at=(persisted or {}).get("last_consult_at", 0.0),
+                        last_summary_at=(persisted or {}).get("last_summary_at", 0.0),
+                    )
+                    beat_coordinator.forget(project_id)
+                    if current_active is not None:
+                        beat_coordinator.request(project_id)
+                    store.audit("orchestration_beat", status, project_id)
+                    return
                 settled_status = await asyncio.to_thread(runtime.status_project, project["runtime_name"])
                 settled_memory = await asyncio.to_thread(runtime.memory_projection, project["runtime_name"])
                 settled_facts = await asyncio.to_thread(runtime.fact_graph_projection, project["runtime_name"])
                 completed = beat_coordinator.complete(project_id, orchestration_observation(
-                    run=active, status=settled_status, memory=settled_memory, facts=settled_facts,
+                    run=current_active, status=settled_status, memory=settled_memory, facts=settled_facts,
                 ), decision)
                 store.update_orchestration_beat_state(
                     project_id, fingerprint=completed[0], status="completed", reason=decision.reason,
@@ -1734,6 +1747,7 @@ def create_app(
                 store.audit("orchestration_beat", "completed", project_id,
                             details=json.dumps({"reason": decision.reason, "fingerprint": completed[0]}))
         except Exception as exc:
+            failures = beat_coordinator.record_failure(project_id)
             beat_coordinator.request(project_id)
             if beat_id is not None:
                 store.update_message(beat_id, status="failed", error="Main Agent orchestration beat failed")
@@ -1747,7 +1761,7 @@ def create_app(
                     last_consult_at=previous.get("last_consult_at", 0.0),
                     last_summary_at=previous.get("last_summary_at", 0.0),
                 )
-            store.audit("orchestration_beat", "failure", project_id, details=str(exc)[:200])
+            store.audit("orchestration_beat", "failure", project_id, details=json.dumps({"error": str(exc)[:200], "consecutive_failures": failures}))
         finally:
             active_beat_projects.discard(project_id)
 
@@ -1756,7 +1770,7 @@ def create_app(
         while True:
             await asyncio.sleep(interval)
             for project in store.projects():
-                if store.active_run(project["id"]) is None or project["id"] in active_beat_projects:
+                if store.active_run(project["id"]) is None or project["id"] in active_beat_projects or not beat_coordinator.retry_allowed(project["id"]):
                     continue
                 active_beat_projects.add(project["id"])
                 task = asyncio.create_task(execute_orchestration_beat(project))
