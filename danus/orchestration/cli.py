@@ -27,6 +27,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -80,6 +81,70 @@ def _alive(pid: Optional[int]) -> bool:
             return True
         state = result.stdout.strip().split(maxsplit=1)[0] if result.stdout.strip() else ""
         return not state.startswith("Z")
+
+
+def _expected_worker_cmdline(wl: L.WorkerLayout) -> List[str]:
+    return [sys.executable, "-m", "danus.execution", str(wl.dir.resolve())]
+
+
+def _capture_worker_identity(wl: L.WorkerLayout, pid: int) -> Optional[Dict]:
+    """Read the host identity for the exact Danus Worker loop at *pid*.
+
+    Numeric PIDs are reusable and may come from another PID namespace.  A valid
+    identity therefore binds the expected command to the host boot and process
+    start time reported by ``/proc``.  Returning ``None`` is fail-closed: callers
+    must never treat an unverified process as this Worker.
+    """
+    if not pid or not _alive(pid):
+        return None
+    proc = Path(f"/proc/{pid}")
+    try:
+        raw_cmdline = (proc / "cmdline").read_bytes()
+        cmdline = [part.decode("utf-8", errors="surrogateescape")
+                   for part in raw_cmdline.split(b"\0") if part]
+        if cmdline != _expected_worker_cmdline(wl):
+            return None
+        stat_parts = (proc / "stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+        # /proc/<pid>/stat field 22 is process start time.  stat_parts starts at
+        # field 3 (state), hence index 19.
+        start_time = stat_parts[19]
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+    except (OSError, IndexError, UnicodeError):
+        return None
+    if not boot_id or not start_time:
+        return None
+    return {
+        "pid": pid,
+        "boot_id": boot_id,
+        "start_time": start_time,
+        "cmdline": cmdline,
+    }
+
+
+def _read_process_identity(wl: L.WorkerLayout) -> Optional[Dict]:
+    try:
+        parsed = json.loads(wl.process_identity.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _clear_process_identity(wl: L.WorkerLayout) -> None:
+    wl.pid.unlink(missing_ok=True)
+    wl.process_identity.unlink(missing_ok=True)
+
+
+def _worker_alive(wl: L.WorkerLayout) -> bool:
+    pid = _read_pid(wl)
+    if not _alive(pid):
+        return False
+    current = _capture_worker_identity(wl, pid) if pid is not None else None
+    if current is None:
+        return False
+    persisted = _read_process_identity(wl)
+    # Existing projects created before identity persistence are adopted only
+    # when the live host command is an exact match for this Worker directory.
+    return persisted is None or persisted == current
 
 
 def _read_status(wl: L.WorkerLayout) -> Dict:
@@ -227,11 +292,31 @@ def _start_one(wl: L.WorkerLayout) -> str:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return "locked"
-        if _alive(_read_pid(wl)):
+        if _worker_alive(wl):
+            # Migrate a legacy exact-command PID to the durable identity record.
+            if _read_process_identity(wl) is None:
+                pid = _read_pid(wl)
+                identity = _capture_worker_identity(wl, pid) if pid is not None else None
+                if identity is not None:
+                    atomic_write(wl.process_identity, json.dumps(identity, sort_keys=True))
             return "already-running"
+        # A raw live PID with no matching Worker identity is stale (commonly a
+        # namespace-local PID reused by an unrelated host process).  Never let it
+        # suppress a new launch.
+        _clear_process_identity(wl)
         wl.stop.unlink(missing_ok=True)  # clear a stale stop flag
         pid = spawn_loop(wl.dir)
         atomic_write(wl.pid, str(pid))
+        identity = None
+        for _ in range(20):
+            identity = _capture_worker_identity(wl, pid)
+            if identity is not None or not _alive(pid):
+                break
+            time.sleep(0.01)
+        if identity is None:
+            _clear_process_identity(wl)
+            return "start-failed"
+        atomic_write(wl.process_identity, json.dumps(identity, sort_keys=True))
         return "started"
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
@@ -256,9 +341,12 @@ def do_start(target: str, stagger: float = 0.2, root: Optional[Path] = None) -> 
 
 def worker_status(wl: L.WorkerLayout) -> Dict:
     pid = _read_pid(wl)
-    alive = _alive(pid)
+    alive = _worker_alive(wl)
     st = _read_status(wl)
-    state = st.get("state", "—")
+    persisted_state = st.get("state", "—")
+    state = persisted_state
+    if not alive and state in ("running", "retrying", "queued", "idle"):
+        state = "stale"
     now = time.time()
     # While a round is active, age means time in the current round. A stale
     # last_round_at from a previous Run must not make a freshly restarted worker
@@ -282,6 +370,8 @@ def worker_status(wl: L.WorkerLayout) -> Dict:
     task_state = _read_task_state(wl)
     return {
         "worker": wl.name, "pid": pid, "alive": alive, "state": state,
+        "persisted_state": persisted_state,
+        "identity_verified": alive,
         "round": st.get("round", 0), "age_s": round(age, 1) if age is not None else None,
         "last_fact_id": st.get("last_fact_id"), "label": label,
         "task": task_state["task"],
@@ -323,7 +413,7 @@ def do_list(root: Optional[Path] = None) -> List[Dict]:
                 meta = {}
         workers = L.list_workers(project, root)
         live = sum(1 for w in workers
-                   if _alive(_read_pid(L.WorkerLayout(L.worker_dir(project, w, root)))))
+                   if _worker_alive(L.WorkerLayout(L.worker_dir(project, w, root))))
         out.append({"project": project, "workers": len(workers), "live": live,
                     "model": meta.get("model", "—")})
     return out
@@ -353,15 +443,18 @@ def _fmt_status(rows: List[Dict]) -> str:
 
 def _stop_one(wl: L.WorkerLayout, force: bool) -> str:
     pid = _read_pid(wl)
+    raw_alive = _alive(pid)
+    if not _worker_alive(wl):
+        # Refuse to touch a live process whose host identity does not belong to
+        # the target Worker.  Clearing only Danus's stale metadata makes the
+        # Worker recoverable without risking an unrelated process group.
+        _clear_process_identity(wl)
+        return "identity-mismatch" if raw_alive else "not-running"
     if not force:
-        if not _alive(pid):
-            return "not-running"
         wl.stop.touch()      # graceful: loop exits at round boundary
         return "stopping (graceful)"
-    # force: kill the loop's process group (loop + its codex child), then SIGKILL
-    if not _alive(pid):
-        wl.pid.unlink(missing_ok=True)
-        return "not-running"
+    # force: kill the identity-verified loop's process group (loop + codex child),
+    # then SIGKILL if it ignores the clean termination request.
     try:
         pgid = os.getpgid(pid)
         os.killpg(pgid, signal.SIGTERM)
@@ -372,11 +465,14 @@ def _stop_one(wl: L.WorkerLayout, force: bool) -> str:
             break
         time.sleep(0.1)
     if _alive(pid):
-        try:
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-    wl.pid.unlink(missing_ok=True)
+        # Revalidate immediately before the destructive signal.  PID reuse
+        # between SIGTERM and SIGKILL must not target the replacement process.
+        if _worker_alive(wl):
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+    _clear_process_identity(wl)
     return "killed"
 
 

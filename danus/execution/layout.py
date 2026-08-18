@@ -46,6 +46,7 @@ from typing import List, Optional, Tuple
 TASK_FILE = "TASK.md"
 ROLE_FILE = ".role"
 PID_FILE = ".pid"
+PROCESS_IDENTITY_FILE = ".process.json"
 LOCK_FILE = ".pid.lock"
 STOP_FILE = ".stop"
 STATUS_FILE = ".status.json"
@@ -161,6 +162,10 @@ class WorkerLayout:
     @property
     def pid(self) -> Path:
         return self.dir / PID_FILE
+
+    @property
+    def process_identity(self) -> Path:
+        return self.dir / PROCESS_IDENTITY_FILE
 
     @property
     def lock(self) -> Path:
