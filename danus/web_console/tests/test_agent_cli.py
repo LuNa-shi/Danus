@@ -140,3 +140,22 @@ def test_assign_posts_task_to_project_capability_broker(tmp_path: Path, monkeypa
     assert agent_cli.main(["assign", "high", "--task", "prove the lemma"]) == 0
     assert requests == [{"action": "assign", "worker": "high", "task": "prove the lemma"}]
     assert json.loads(capsys.readouterr().out)["status"] == "assigned"
+
+
+def test_artifact_commands_post_explicit_operator_forks(tmp_path: Path, monkeypatch, capsys):
+    root = tmp_path / "projects"; project = root / "A"; project.mkdir(parents=True)
+    monkeypatch.setenv("DANUS_PROJECT_SCOPE", "A"); monkeypatch.setenv("DANUS_AGENTS_ROOT", str(root)); monkeypatch.setenv("DANUS_PROJECT_DIR", str(project))
+    monkeypatch.setenv("DANUS_WEB_LIFECYCLE_URL", "http://127.0.0.1/lifecycle/A"); monkeypatch.setenv("DANUS_WEB_LIFECYCLE_TOKEN", "token")
+    requests = []
+    def open_request(request, *, timeout):
+        requests.append(json.loads(request.data)); return _Response({"status": "ok"})
+    monkeypatch.setattr(agent_cli.urllib.request, "urlopen", open_request)
+    assert agent_cli.main(["finalize", "fact-1", "--paper-id", "paper-1", "--operator-confirmed"]) == 0
+    assert agent_cli.main(["human-summary", "--language", "zh", "--operator-confirmed"]) == 0
+    assert agent_cli.main(["write-paper", "--paper-id", "paper-1", "--fact-id", "fact-1", "--instructions", "brief", "--stop-workers", "--operator-confirmed"]) == 0
+    capsys.readouterr()
+    assert requests == [
+        {"action": "finalize", "fact_ids": ["fact-1"], "paper_id": "paper-1", "operator_confirmed": True},
+        {"action": "human-summary", "language": "zh", "operator_confirmed": True},
+        {"action": "write-paper", "paper_id": "paper-1", "fact_ids": ["fact-1"], "instructions": "brief", "stop_workers": True, "operator_confirmed": True},
+    ]
