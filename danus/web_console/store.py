@@ -32,7 +32,7 @@ class ConsoleStore:
                     id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, runtime_name TEXT NOT NULL UNIQUE,
                     problem TEXT NOT NULL, roles TEXT NOT NULL DEFAULT 'high:3,xhigh:4',
                     worker_model TEXT, max_parallel_workers INTEGER NOT NULL DEFAULT 1,
-                    created_at REAL NOT NULL
+                    initial_direction_confirmed_at REAL, created_at REAL NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS files (
                     id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -103,6 +103,9 @@ class ConsoleStore:
                 conn.execute("ALTER TABLE projects ADD COLUMN worker_model TEXT")
             if "max_parallel_workers" not in project_columns:
                 conn.execute("ALTER TABLE projects ADD COLUMN max_parallel_workers INTEGER NOT NULL DEFAULT 1")
+            if "initial_direction_confirmed_at" not in project_columns:
+                conn.execute("ALTER TABLE projects ADD COLUMN initial_direction_confirmed_at REAL")
+                conn.execute("UPDATE projects SET initial_direction_confirmed_at=created_at")
             run_columns = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
             if "start_attempt_generation" not in run_columns:
                 conn.execute(
@@ -118,12 +121,13 @@ class ConsoleStore:
     def add_project(self, project: dict[str, Any]) -> None:
         with self._lock, self._connect() as conn:
             conn.execute(
-                "INSERT INTO projects(id,name,runtime_name,problem,roles,worker_model,max_parallel_workers,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                "INSERT INTO projects(id,name,runtime_name,problem,roles,worker_model,max_parallel_workers,initial_direction_confirmed_at,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                 (
                     project["id"], project["name"], project["runtime_name"], project["problem"],
                     project.get("roles") or "high:3,xhigh:4",
                     project.get("worker_model") or project.get("model"),
                     int(project.get("max_parallel_workers") or 1),
+                    project.get("initial_direction_confirmed_at"),
                     project["created_at"],
                 ),
             )
@@ -131,6 +135,13 @@ class ConsoleStore:
     def project(self, project_id: str) -> dict[str, Any] | None:
         with self._lock, self._connect() as conn:
             return self._dict(conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone())
+
+    def confirm_initial_direction(self, project_id: str, confirmed_at: float) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE projects SET initial_direction_confirmed_at=COALESCE(initial_direction_confirmed_at, ?) WHERE id=?",
+                (confirmed_at, project_id),
+            )
 
     def projects(self) -> list[dict[str, Any]]:
         with self._lock, self._connect() as conn:

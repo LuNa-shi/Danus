@@ -155,7 +155,7 @@ _LIFECYCLE_SECRET = b"test-lifecycle-hmac-secret"
 
 
 def _app(tmp_path: Path):
-    runtime = FakeRuntime(tmp_path / "projects")
+    runtime = FakeMemoryRuntime(tmp_path / "projects")
     settings = AppSettings(
         database_path=tmp_path / "console.sqlite3",
         password_hash=hash_password("correct horse battery staple"),
@@ -332,6 +332,33 @@ def test_project_run_deadline_and_graceful_stop_are_scoped(tmp_path: Path):
         assert len(b_workers) == 1
         assert b_workers[0]["worker"] == "high"
         assert b_workers[0]["alive"] is False
+
+
+def test_initial_direction_confirmation_gates_assignment(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("DANUS_CONSULT_TRANSPORT", "off")
+    app, runtime = _app(tmp_path)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client)
+        headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post("/api/projects", json={"name": "A", "problem": "alpha", "roles": "high:1"}, headers=headers).json()
+        blocked = _broker_lifecycle(client, project, "assign", worker="high", task="direction")
+        assert blocked.status_code == 409
+        assert "initial direction confirmation" in blocked.json()["detail"]
+        no_guidance = client.post(f"/api/projects/{project['id']}/initial-direction/confirm", json={"confirm": "A"}, headers=headers)
+        assert no_guidance.status_code == 409
+        runtime.memory_entries[project["runtime_name"]] = {"total": 1, "channels": [{"kind": "master_guidance", "entries": [{"claim": "direction", "evidence": "guidance-source: consult-derived"}]}]}
+        mismatch = client.post(f"/api/projects/{project['id']}/initial-direction/confirm", json={"confirm": "A"}, headers=headers)
+        assert mismatch.status_code == 409
+        runtime.memory_entries[project["runtime_name"]]["channels"][0]["entries"][0]["evidence"] = "guidance-source: offline-main-agent"
+        wrong = client.post(f"/api/projects/{project['id']}/initial-direction/confirm", json={"confirm": "wrong"}, headers=headers)
+        assert wrong.status_code == 409
+        confirmed = client.post(f"/api/projects/{project['id']}/initial-direction/confirm", json={"confirm": "A"}, headers=headers)
+        assert confirmed.status_code == 200
+        assert confirmed.json()["initial_direction_confirmed"] is True
+        assigned = _broker_lifecycle(client, project, "assign", worker="high", task="direction")
+        assert assigned.status_code == 200
+        assert runtime.statuses[project["runtime_name"]][0]["assigned"] is True
+        assert runtime.statuses[project["runtime_name"]][0]["task"] == "direction"
 
 
 def test_internal_lifecycle_broker_is_loopback_only_and_project_capability_scoped(
@@ -1774,6 +1801,7 @@ def test_broker_scopes_status_and_assignment_without_shared_python_access(tmp_pa
         project = client.post(
             "/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers,
         ).json()
+        app.state.console_store.confirm_initial_direction(project["id"], time.time())
 
         assigned = _broker_lifecycle(
             client, project, "assign", worker="high", task="prove the scoped lemma",

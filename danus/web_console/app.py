@@ -210,6 +210,7 @@ def create_app(
             "worker_model": config["worker_model"],
             "model": config["model"],
             "max_parallel_workers": config["max_parallel_workers"],
+            "initial_direction_confirmed": project.get("initial_direction_confirmed_at") is not None,
             "config": config,
         }
         if workers is not None:
@@ -246,11 +247,15 @@ def create_app(
 
     def guidance_source(entry: dict[str, Any] | None, transport: str) -> str:
         evidence = str((entry or {}).get("evidence") or "").lower()
-        if "guidance-source: offline-main-agent" in evidence:
-            return "offline-main-agent"
-        if "guidance-source: consult-derived" in evidence:
-            return "consult-derived"
-        return "unknown"
+        markers = {
+            source for source in ("offline-main-agent", "consult-derived")
+            if f"guidance-source: {source}" in evidence
+        }
+        if len(markers) != 1:
+            return "unknown" if not markers else "contract-mismatch"
+        declared = next(iter(markers))
+        expected = "offline-main-agent" if transport == "off" else "consult-derived"
+        return declared if declared == expected else "contract-mismatch"
 
     def worker_is_live(worker: dict[str, Any]) -> bool:
         identity = worker.get("process_identity")
@@ -465,6 +470,8 @@ def create_app(
             except (RuntimeErrorBase, OSError):
                 return _error(502, "project status unavailable")
         if action == "assign":
+            if project.get("initial_direction_confirmed_at") is None:
+                return _error(409, "initial direction confirmation required before assignment")
             task = payload.get("task")
             if worker is None or not isinstance(task, str) or not task.strip():
                 return _error(400, "assign requires worker and non-empty task")
@@ -1361,6 +1368,7 @@ def create_app(
             "session": session_projection,
             "main_agent_status": session_projection["status"],
             "main_agent_backend": session_projection["backend"],
+            "initial_direction_confirmed": project.get("initial_direction_confirmed_at") is not None,
             "workers_total": len(workers),
             "assigned_workers": len(workers) - len(unassigned),
             "unassigned_workers": unassigned,
@@ -1379,6 +1387,34 @@ def create_app(
             "elaboration": latest_memory_entry(memory, "elaboration"),
             "run": run_projection,
         }
+
+    @app.post("/api/projects/{project_id}/initial-direction/confirm")
+    async def confirm_initial_direction(project_id: str, request: Request):
+        if isinstance((auth := auth_required(request)), JSONResponse):
+            return auth
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse):
+            return project
+        try:
+            payload = await request.json()
+        except Exception:
+            return _error(400, "invalid confirmation request")
+        if not isinstance(payload, dict) or payload.get("confirm") != project["name"]:
+            return _error(409, "project-name confirmation required")
+        try:
+            memory = runtime.memory_projection(project["runtime_name"])
+        except RuntimeErrorBase:
+            return _error(502, "guidance projection unavailable")
+        guidance = latest_memory_entry(memory, "master_guidance")
+        transport = strategy_metadata()["transport"]
+        source = guidance_source(guidance, transport)
+        if guidance is None:
+            return _error(409, "initial guidance required before confirmation")
+        if source not in {"offline-main-agent", "consult-derived"}:
+            return _error(409, "guidance provenance does not match configured strategy transport")
+        store.confirm_initial_direction(project_id, time.time())
+        store.audit("initial_direction_confirm", "success", project_id)
+        return {"status": "confirmed", "initial_direction_confirmed": True}
 
     @app.get("/api/projects/{project_id}/messages")
     async def list_messages(project_id: str, request: Request):
