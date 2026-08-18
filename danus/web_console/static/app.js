@@ -31,6 +31,9 @@ const state = {
   pendingRefreshingProject: null,
 };
 
+const START_RUN_MESSAGE = "The operator requested starting the current bounded Project Run. Inspect the current Project state, then use `danus-web-agent start` to activate the assigned Worker swarm through the authenticated lifecycle broker. Report the broker result.";
+const STOP_RUN_MESSAGE = "The operator requested a graceful stop for the current Project Run. Use `danus-web-agent stop` now so the authenticated lifecycle broker performs the stop, then report the result.";
+
 function currentPendingMessage() {
   return state.pendingMessage?.project_id === state.current ? state.pendingMessage : null;
 }
@@ -1463,11 +1466,12 @@ function updateRuntime() {
   if (runState) runState.textContent = activeRun ? `Run ${activeRun.status} · ${live} active · 截止 ${formatTime(activeRun.deadline)}` : live ? `${live} 个 worker 在线` : ready ? `已完成 ${assigned}/${total} 分工` : `等待 Main Agent 分工 · ${assigned}/${total}`;
   const start = $("run-start");
   const stop = $("run-stop");
+  const mainAgentBusy = Boolean(currentPendingMessage());
   if (start) {
-    start.disabled = Boolean(activeRun || live || !ready);
-    start.title = ready ? "启动已完成分工的 Worker swarm" : "先让 Main Agent 完成所有 Worker 的 TASK.md 分工";
+    start.disabled = Boolean(activeRun || live || !ready || mainAgentBusy);
+    start.title = mainAgentBusy ? "等待当前 Main Agent 回复完成" : ready ? "启动已完成分工的 Worker swarm" : "先让 Main Agent 完成所有 Worker 的 TASK.md 分工";
   }
-  if (stop) stop.disabled = !activeRun && !live;
+  if (stop) stop.disabled = !activeRun || mainAgentBusy;
 }
 
 async function refreshPendingMessages() {
@@ -1586,7 +1590,7 @@ function setComposerBusy(isBusy) {
 
 async function sendMessageText(text, attachmentId = "") {
   const clean = String(text || "").trim();
-  if (!clean || !state.current || currentPendingMessage()) return;
+  if (!clean || !state.current || currentPendingMessage()) return false;
   const projectAtStart = state.current;
   const localMessage = { id: `local-${Date.now()}`, project_id: projectAtStart, role: "user", text: clean, status: "pending", created_at: Date.now() / 1000, error: null, attachment_ids: attachmentId ? [attachmentId] : [] };
   state.pendingMessage = localMessage;
@@ -1601,6 +1605,7 @@ async function sendMessageText(text, attachmentId = "") {
     await api(`/api/projects/${projectAtStart}/messages`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: clean, attachment_ids: attachmentId ? [attachmentId] : [] }) });
     if (state.pendingMessage === localMessage) state.pendingMessage = null;
     if (state.current === projectAtStart) await refreshProject();
+    return true;
   } catch (error) {
     if (state.pendingMessage === localMessage) state.pendingMessage = null;
     localMessage.status = "failed";
@@ -1615,6 +1620,7 @@ async function sendMessageText(text, attachmentId = "") {
       notify(localMessage.error || "Main Agent 暂时不可用", "error");
       await refreshProject().catch(() => {});
     }
+    return false;
   } finally {
     if (!currentPendingMessage()) stopPendingPolling();
     renderMainAgentControl();
@@ -1623,11 +1629,12 @@ async function sendMessageText(text, attachmentId = "") {
 }
 
 async function startRun() {
-  if (!state.current) return;
+  if (!state.current || currentPendingMessage()) return;
+  const projectAtStart = state.current;
   try {
-    await api(`/api/projects/${state.current}/runs`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ duration_seconds: 3600 }) });
-    notify("Run intent 已记录；请由 Main Agent 启动 Worker fleet", "success");
-    await refreshProject();
+    await api(`/api/projects/${projectAtStart}/runs`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ duration_seconds: 3600 }) });
+    const activated = state.current === projectAtStart && await sendMessageText(START_RUN_MESSAGE);
+    notify(activated ? "Run intent 已记录；Main Agent 正在启动 Worker fleet" : "Run intent 已记录，但 Main Agent 未能激活", activated ? "success" : "error");
     await refreshProjects();
   } catch (error) {
     notify(error.message || "Run 启动失败", "error");
@@ -1635,11 +1642,12 @@ async function startRun() {
 }
 
 async function stopRun() {
-  if (!state.current) return;
+  if (!state.current || currentPendingMessage()) return;
+  const projectAtStart = state.current;
   try {
-    await api(`/api/projects/${state.current}/stop`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-    notify("已请求优雅停止", "success");
-    await refreshProject();
+    await api(`/api/projects/${projectAtStart}/stop`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    const activated = state.current === projectAtStart && await sendMessageText(STOP_RUN_MESSAGE);
+    notify(activated ? "停止 intent 已记录；Main Agent 正在执行优雅停止" : "停止 intent 已记录，但 Main Agent 未能激活", activated ? "success" : "error");
   } catch (error) {
     notify(error.message || "停止失败", "error");
   }

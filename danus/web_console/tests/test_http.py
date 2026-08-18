@@ -146,15 +146,25 @@ def _login(client: TestClient):
     return response.json()["csrf_token"]
 
 
-def _broker_start(client: TestClient, project: dict, *, secret: bytes = _LIFECYCLE_SECRET):
+def _broker_lifecycle(
+    client: TestClient, project: dict, action: str, *, secret: bytes = _LIFECYCLE_SECRET,
+):
     token = project_lifecycle_capability(secret, project["id"], project["runtime_name"])
     with TestClient(
         client.app, base_url="http://127.0.0.1:8080", client=("127.0.0.1", 50123),
     ) as internal:
         return internal.post(
             f"/internal/api/projects/{project['id']}/lifecycle",
-            json={"action": "start"}, headers={"Authorization": f"Bearer {token}"},
+            json={"action": action}, headers={"Authorization": f"Bearer {token}"},
         )
+
+
+def _broker_start(client: TestClient, project: dict, *, secret: bytes = _LIFECYCLE_SECRET):
+    return _broker_lifecycle(client, project, "start", secret=secret)
+
+
+def _broker_stop(client: TestClient, project: dict, *, secret: bytes = _LIFECYCLE_SECRET):
+    return _broker_lifecycle(client, project, "stop", secret=secret)
 
 
 def test_authentication_cookie_csrf_and_project_boundary(tmp_path: Path):
@@ -232,6 +242,13 @@ def test_project_run_deadline_and_graceful_stop_are_scoped(tmp_path: Path):
         )
         assert stopped.status_code == 202
         assert stopped.json()["status"] == "stop_requested"
+        # Public graceful stop records operator intent only. The browser must
+        # activate the Main Agent, whose authenticated broker request executes it.
+        assert runtime.stopped == []
+        stored = app.state.console_store.run(run["run_id"])
+        assert stored["status"] == "stopping"
+        assert stored["outcome"] == "operator_stop_intent"
+        assert _broker_stop(client, a).status_code == 202
         assert runtime.stopped == [a["runtime_name"]]
         assert runtime.stopped != [b["runtime_name"]]
         b_workers = client.get(f"/api/projects/{b['id']}/runtime").json()["workers"]
@@ -314,6 +331,46 @@ def test_internal_lifecycle_broker_is_loopback_only_and_project_capability_scope
         assert runtime.stopped == [a["runtime_name"]]
 
 
+def test_fresh_start_intent_is_not_promoted_by_preexisting_live_roster(tmp_path: Path):
+    app, runtime = _app(tmp_path)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client)
+        headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post(
+            "/api/projects",
+            json={"name": "A", "problem": "alpha", "roles": "high:1"},
+            headers=headers,
+        ).json()
+        runtime.assign_all(project["runtime_name"])
+        # Simulate a stale/pre-existing worker from outside this fresh run intent.
+        runtime.statuses[project["runtime_name"]][0].update(
+            {"alive": True, "state": "running", "round": 9}
+        )
+
+        intent = client.post(
+            f"/api/projects/{project['id']}/runs",
+            json={"duration_seconds": 60}, headers=headers,
+        ).json()
+        observed = client.get(
+            f"/api/projects/{project['id']}/runs/{intent['run_id']}"
+        ).json()
+
+        assert observed["status"] == "starting"
+        assert observed["start_attempt_generation"] == 0
+        assert observed["start_attempt_outcome"] is None
+        assert runtime.started == []
+
+        # The authenticated Main Agent broker attempt establishes this run's
+        # generation and may then adopt the exact already-running roster.
+        assert _broker_start(client, project).status_code == 200
+        running = client.get(
+            f"/api/projects/{project['id']}/runs/{intent['run_id']}"
+        ).json()
+        assert running["status"] == "running"
+        assert running["start_attempt_generation"] == 1
+        assert running["start_attempt_outcome"] == "started"
+
+
 def test_internal_lifecycle_broker_reports_partial_start_for_incomplete_roster(
     tmp_path: Path,
 ):
@@ -375,6 +432,18 @@ def test_internal_lifecycle_broker_reports_partial_start_for_incomplete_roster(
         ).json()
         assert run["status"] == "starting"
         assert run["outcome"] == "partial_start:xhigh"
+        assert run["start_attempt_generation"] == 1
+        assert run["start_attempt_outcome"] == "partial_start"
+
+        # Only a persisted partial broker attempt may be reconciled to running.
+        runtime.statuses[project["runtime_name"]][1].update(
+            {"alive": True, "state": "running"}
+        )
+        reconciled = client.get(
+            f"/api/projects/{project['id']}/runs/{intent['run_id']}"
+        ).json()
+        assert reconciled["status"] == "running"
+        assert reconciled["outcome"] == "broker_start_reconciled:1"
 
 
 def test_runtime_poll_reconciles_graceful_stop_to_terminal_run(tmp_path: Path):
@@ -388,6 +457,11 @@ def test_runtime_poll_reconciles_graceful_stop_to_terminal_run(tmp_path: Path):
         assert _broker_start(client, project).status_code == 200
         assert client.get(f"/api/projects/{project['id']}/runs/{started['run_id']}").json()["status"] == "running"
         assert client.post(f"/api/projects/{project['id']}/runs/{started['run_id']}/stop", json={}, headers=headers).status_code == 202
+        stopping = client.get(f"/api/projects/{project['id']}/runs/{started['run_id']}").json()
+        assert stopping["status"] == "stopping"
+        assert stopping["outcome"] == "operator_stop_intent"
+        assert runtime.stopped == []
+        assert _broker_stop(client, project).status_code == 202
         terminal = client.get(f"/api/projects/{project['id']}/runs/{started['run_id']}").json()
         assert terminal["status"] == "stopped"
         assert terminal["outcome"] == "graceful_stop"
@@ -479,11 +553,13 @@ def test_runtime_start_failure_is_persisted_without_success_claim(tmp_path: Path
         assert response.json() == {"detail": "project workers could not be started"}
         import sqlite3
         with sqlite3.connect(tmp_path / "console.sqlite3") as db:
-            status, outcome = db.execute(
-                "SELECT status,outcome FROM runs"
+            status, outcome, generation, attempt_outcome = db.execute(
+                "SELECT status,outcome,start_attempt_generation,start_attempt_outcome FROM runs"
             ).fetchone()
         assert status == "starting"
         assert outcome == "start_failed: worker launch failed"
+        assert generation == 1
+        assert attempt_outcome == "failed"
         assert runtime.cleared_deadlines == []
 
 
@@ -962,6 +1038,8 @@ def test_deadline_rejects_new_main_agent_work(tmp_path: Path):
             db.execute("UPDATE runs SET deadline=?", (0,)); db.commit()
         response = client.post(f"/api/projects/{project['id']}/messages", json={"text": "late", "attachment_ids": []}, headers=headers)
         assert response.status_code == 409
+        # Deadline enforcement is the host safety boundary and remains direct.
+        assert runtime.stopped == [project["runtime_name"]]
 
 
 def test_project_deletion_requires_stop_confirmation_and_isolation(tmp_path: Path):

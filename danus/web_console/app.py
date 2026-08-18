@@ -247,8 +247,9 @@ def create_app(
 
     def roster_state(
         project: dict[str, Any], projection: dict[str, Any],
+        *, expected: list[str] | None = None,
     ) -> tuple[list[str], list[str], list[str]]:
-        expected = expected_worker_roster(project, projection)
+        expected = expected if expected is not None else expected_worker_roster(project, projection)
         workers = {
             str(worker.get("worker")): worker
             for worker in projection.get("workers", [])
@@ -274,8 +275,19 @@ def create_app(
                     store.update_run(active["id"], status="stopping", outcome="deadline_stop_requested")
             elif active["status"] == "stopping" and not any(worker.get("alive") for worker in workers):
                 store.update_run(active["id"], status="stopped", stopped_at=time.time(), outcome="graceful_stop")
-            elif active["status"] == "starting" and expected and not pending:
-                store.update_run(active["id"], status="running")
+            elif (
+                active["status"] == "starting"
+                and int(active.get("start_attempt_generation") or 0) > 0
+                and active.get("start_attempt_outcome") == "partial_start"
+                and expected
+                and not pending
+            ):
+                generation = int(active["start_attempt_generation"])
+                store.complete_start_attempt(
+                    active["id"], generation,
+                    attempt_outcome="started", status="running",
+                    outcome=f"broker_start_reconciled:{generation}",
+                )
             elif active["status"] == "running" and workers and not any(worker.get("alive") for worker in workers):
                 outcome = "worker_error" if any(worker.get("state") == "error" for worker in workers) else "workers_exited"
                 store.update_run(active["id"], status="stopped", stopped_at=time.time(), outcome=outcome)
@@ -333,27 +345,32 @@ def create_app(
                 else:
                     store.update_run(active["id"], status="stopping", outcome="deadline_stop_requested")
                 return _error(409, "project run deadline reached")
+            generation = store.begin_start_attempt(active["id"])
+            if generation is None:
+                return _error(409, "project run is not awaiting start")
             try:
                 before = runtime.status_project(project["runtime_name"])
                 expected = expected_worker_roster(project, before)
                 runtime.start_project(project["runtime_name"])
                 projection = runtime.status_project(project["runtime_name"])
             except (RuntimeErrorBase, OSError) as exc:
-                store.update_run(active["id"], status="starting", outcome=f"start_failed: {exc}"[:200])
+                store.complete_start_attempt(
+                    active["id"], generation,
+                    attempt_outcome="failed", status="starting",
+                    outcome=f"start_failed: {exc}"[:200],
+                )
                 store.audit("run_start", "failure", project_id)
                 return _error(502, "project workers could not be started")
-            _after_expected, alive, pending = roster_state(project, projection)
-            if expected:
-                workers = {
-                    str(worker.get("worker")): worker
-                    for worker in projection.get("workers", [])
-                    if worker.get("worker")
-                }
-                alive = [name for name in expected if workers.get(name, {}).get("alive") is True]
-                pending = [name for name in expected if name not in alive]
+            _after_expected, alive, pending = roster_state(
+                project, projection, expected=expected,
+            )
             if not expected or pending:
                 outcome = "partial_start:" + ",".join(pending or ["unknown_roster"])
-                store.update_run(active["id"], status="starting", outcome=outcome[:200])
+                store.complete_start_attempt(
+                    active["id"], generation,
+                    attempt_outcome="partial_start", status="starting",
+                    outcome=outcome[:200],
+                )
                 store.audit("run_start", "partial_failure", project_id)
                 return JSONResponse({
                     "detail": "project workers only partially started",
@@ -363,7 +380,11 @@ def create_app(
                     "alive_workers": alive,
                     "not_running_workers": pending,
                 }, status_code=502)
-            store.update_run(active["id"], status="running", outcome="main_agent_start")
+            store.complete_start_attempt(
+                active["id"], generation,
+                attempt_outcome="started", status="running",
+                outcome="main_agent_start",
+            )
             store.audit("run_start", "success", project_id)
             return {"status": "running", "run_id": active["id"], "workers": alive}
 
@@ -700,15 +721,9 @@ def create_app(
             active = store.active_run(project_id)
             if active is None or active["id"] != run_id:
                 return _error(409, "run is not the active project run")
-            try:
-                result = runtime.stop_project(project["runtime_name"])
-                store.update_run(run_id, status="stopping", outcome="graceful_stop_requested")
-                store.audit("run_stop", "success", project_id)
-                return JSONResponse({"run_id": run_id, "status": "stop_requested"}, status_code=202)
-            except (RuntimeErrorBase, OSError):
-                store.update_run(run_id, status="failed", stopped_at=time.time(), outcome="stop_failed")
-                store.audit("run_stop", "failure", project_id)
-                return _error(502, "project stop could not be completed")
+            store.update_run(run_id, status="stopping", outcome="operator_stop_intent")
+            store.audit("run_stop", "intent_recorded", project_id)
+            return JSONResponse({"run_id": run_id, "status": "stop_requested"}, status_code=202)
 
     @app.get("/api/projects/{project_id}/runtime")
     async def runtime_status(project_id: str, request: Request):
@@ -737,16 +752,12 @@ def create_app(
         if isinstance(project, JSONResponse):
             return project
         async with lock_for(project_id):
-            try:
-                result = runtime.stop_project(project["runtime_name"])
-                active = store.active_run(project_id)
-                if active:
-                    store.update_run(active["id"], status="stopping", outcome="graceful_stop_requested")
-                store.audit("run_stop", "success", project_id)
-                return JSONResponse({"status": "stop_requested"}, status_code=202)
-            except RuntimeErrorBase:
-                store.audit("run_stop", "failure", project_id)
-                return _error(502, "project stop could not be completed")
+            active = store.active_run(project_id)
+            if active is None:
+                return _error(409, "project has no active run intent")
+            store.update_run(active["id"], status="stopping", outcome="operator_stop_intent")
+            store.audit("run_stop", "intent_recorded", project_id)
+            return JSONResponse({"status": "stop_requested"}, status_code=202)
 
     @app.get("/api/projects/{project_id}/files")
     async def list_files(project_id: str, request: Request):
