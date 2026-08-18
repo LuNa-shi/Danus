@@ -20,6 +20,7 @@ from typing import Any, Callable
 from danus.strategy.config import resolve_transport
 
 from .observability import redact_text
+from .protocol import EventKind, normalize_provider_line, normalize_trace
 from .runtime import RuntimeErrorBase
 
 
@@ -476,6 +477,9 @@ class MainAgentAdapter:
 
     @classmethod
     def _codex_progress_events(cls, line: str) -> list[dict[str, Any]]:
+        normalized = normalize_provider_line(line)
+        if normalized and any(event.kind in {EventKind.SESSION_STARTED, EventKind.TURN_STARTED} for event in normalized):
+            return [event.as_dict() for event in normalized]
         try:
             item = json.loads(line)
         except json.JSONDecodeError:
@@ -912,6 +916,8 @@ class MainAgentAdapter:
                 # failed sink aborts the turn instead of silently losing events.
                 on_progress(event)
 
+        if on_progress is not None:
+            on_progress({"type": "process.started", "status": "active", "detail": "Main Agent Process activated"})
         for attempt in range(1, self.max_attempts + 1):
             remaining = deadline - self._clock()
             if remaining <= 0:
@@ -928,8 +934,9 @@ class MainAgentAdapter:
                 partial = getattr(exc, "stdout", None) or getattr(exc, "output", None) or ""
                 if isinstance(partial, bytes):
                     partial = partial.decode("utf-8", errors="replace")
-                actual_id, _ = self._parse_codex(str(partial))
-                observed_tool_activity, _ = self._codex_activity(str(partial))
+                trace = normalize_trace(str(partial))
+                actual_id = trace.session_id
+                observed_tool_activity = trace.tool_activity
                 raise MainAgentError(
                     "main agent turn timed out: total timeout budget exhausted", code="turn_timeout_exhausted",
                     session_id=actual_id or active_session_id,
@@ -942,10 +949,11 @@ class MainAgentAdapter:
                 ) from exc
 
             stdout = getattr(result, "stdout", "") or ""
-            actual_id, reply = self._parse_codex(stdout)
-            failure = self._parse_codex_failure(stdout)
-            terminal_state = self._codex_terminal_state(stdout)
-            observed_tool_activity, parse_uncertain = self._codex_activity(stdout)
+            trace = normalize_trace(stdout)
+            actual_id, reply = trace.session_id, trace.reply
+            failure = trace.failure
+            terminal_state = trace.terminal_state
+            observed_tool_activity, parse_uncertain = trace.tool_activity, trace.parse_uncertain
             chosen_id = actual_id or active_session_id
             if self._clock() > deadline:
                 raise MainAgentError(

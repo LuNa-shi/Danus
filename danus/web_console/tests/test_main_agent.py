@@ -381,7 +381,8 @@ def test_codex_retries_transient_failure_by_resuming_the_same_thread(tmp_path: P
     assert len(calls) == 2
     assert calls[1][0][-3:] == ["resume", "sid-retry", "-"]
     assert "Continue the interrupted Main Agent turn" in calls[1][1]["input"]
-    assert progress == [{
+    assert progress[0] == {"type": "process.started", "status": "active", "detail": "Main Agent Process activated"}
+    assert progress[1:] == [{
         "type": "turn.retry",
         "status": "retrying",
         "attempt": 2,
@@ -667,11 +668,11 @@ def test_codex_streams_safe_agent_and_tool_events_before_final_reply(tmp_path: P
 
     assert result["reply"] == "完成。"
     assert [event["type"] for event in events] == [
-        "turn.started", "agent.progress", "agent.message", "tool.started", "tool.completed", "turn.completed",
+        "process.started", "session.started", "agent.progress", "agent.message", "tool.started", "tool.completed", "turn.completed",
     ]
-    assert events[1]["detail"] == "Safe emitted reasoning summary"
-    assert events[3]["tool"] == "exec_command"
-    assert "danus-web-agent status" in events[3]["detail"]
+    assert events[2]["detail"] == "Safe emitted reasoning summary"
+    assert events[4]["tool"] == "exec_command"
+    assert "danus-web-agent status" in events[4]["detail"]
     assert "must-not-leak" not in json.dumps(events, ensure_ascii=False)
     assert "敏感参数已隐藏" in json.dumps(events, ensure_ascii=False)
     assert "content hidden by safety policy" in json.dumps(events, ensure_ascii=False)
@@ -885,3 +886,22 @@ def test_codex_retries_share_one_absolute_timeout_budget(tmp_path: Path):
     assert raised.value.code == "turn_timeout_exhausted"
     assert calls == pytest.approx([1.0, 0.4])
     assert now[0] <= 1.0
+
+
+def test_normalized_protocol_preserves_session_turn_and_unknown_envelopes():
+    from danus.web_console.protocol import EventKind, normalize_provider_line, normalize_trace
+    assert normalize_provider_line(json.dumps({"type": "thread.started", "thread_id": "s"}))[0].kind == EventKind.SESSION_STARTED
+    assert normalize_provider_line(json.dumps({"type": "turn.started"}))[0].kind == EventKind.TURN_STARTED
+    trace = normalize_trace("\n".join([json.dumps({"type": "thread.started", "thread_id": "s"}), "not-json", json.dumps({"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "ok"}})]))
+    assert trace.session_id == "s" and trace.reply == "ok" and trace.terminal_state == "completed" and trace.parse_uncertain
+
+
+def test_normalized_trace_handles_duplicate_and_reordered_envelopes():
+    from danus.web_console.protocol import normalize_trace
+    lines = [
+        json.dumps({"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "done"}}),
+        json.dumps({"type": "thread.started", "thread_id": "sid"}),
+        json.dumps({"type": "thread.started", "thread_id": "sid"}),
+    ]
+    trace = normalize_trace("\n".join(lines))
+    assert trace.session_id == "sid" and trace.reply == "done" and trace.terminal_state == "completed"

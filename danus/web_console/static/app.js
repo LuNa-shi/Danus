@@ -1111,7 +1111,9 @@ function mainAgentFailureMarkup(message) {
 
 function mainAgentEventLabel(type) {
   return ({
-    "turn.started": "会话启动",
+    "session.started": "Session 可用",
+    "process.started": "Process 已激活",
+    "turn.started": "Turn 开始",
     "agent.progress": "Reasoning / progress summary",
     "agent.message": "Emitted progress",
     "tool.started": "Tool started",
