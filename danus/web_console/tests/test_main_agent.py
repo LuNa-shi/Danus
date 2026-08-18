@@ -514,7 +514,7 @@ def test_codex_timeout_preserves_session_and_tool_activity_from_partial_output(t
         adapter.send(**_args(tmp_path))
 
     assert raised.value.session_id == "sid-timeout"
-    assert raised.value.code == "timeout"
+    assert raised.value.code == "turn_timeout_exhausted"
     assert raised.value.retryable is False
     assert raised.value.safe_to_retry is False
     assert raised.value.observed_tool_activity is True
@@ -871,3 +871,17 @@ def test_progress_sink_failure_aborts_stream_instead_of_silently_losing_audit(tm
             **_args(tmp_path),
             on_progress=lambda event: (_ for _ in ()).throw(RuntimeError("audit sink unavailable")),
         )
+
+
+def test_codex_retries_share_one_absolute_timeout_budget(tmp_path: Path):
+    calls = []; now = [0.0]
+    overloaded = "\n".join([json.dumps({"type": "thread.started", "thread_id": "sid"}), json.dumps({"type": "event_msg", "payload": {"type": "task_complete", "error": {"codex_error_info": "server_overloaded"}}})])
+    def runner(cmd, **kwargs):
+        calls.append(kwargs["timeout"]); now[0] += 0.4
+        return SimpleNamespace(returncode=1, stdout=overloaded, stderr="")
+    def sleep(seconds): now[0] += seconds
+    adapter = MainAgentAdapter(backend="codex", runner=runner, codex_bin="codex", timeout=1.0, max_attempts=3, retry_base_seconds=.2, retry_cap_seconds=.2, sleeper=sleep, clock=lambda: now[0])
+    with pytest.raises(MainAgentError) as raised: adapter.send(**_args(tmp_path))
+    assert raised.value.code == "turn_timeout_exhausted"
+    assert calls == pytest.approx([1.0, 0.4])
+    assert now[0] <= 1.0
