@@ -68,13 +68,14 @@ tools — never by hand:
   `fact_revoke` (cascades, `project=<name>`).
 - worker **local memory** is private to each worker — you do not read it.
 
-## Strategy & dispatch: consult a top-tier model → master_guidance → assign workers
+## Strategy & dispatch: direction discussion → guidance → operator approval → assign
 
-Workers do the proving; **you do the high-level thinking by consulting a top-tier
-reasoning model (gpt-5.5-pro or claude-fable-5) and turning its reply into
-dispatch.** That model is the expensive, high-intelligence brain — use it for the
-critical decomposition, direction judgment, and core ideas, given the current
-global memory (findings + dead ends) and fact graph.
+Workers do the proving; **you own high-level orchestration judgment.** When a
+strategy transport is enabled, consult the configured top-tier reasoning model
+(gpt-5.5-pro or claude-fable-5) for critical decomposition, direction judgment,
+and core ideas. When transport is `off`, form the direction yourself from the
+project state. In both modes, preserve provenance so the operator can tell which
+kind of guidance they received.
 
 **This whole loop runs per project, independently.** Each project gets its own
 elaboration → consult → `master_guidance` → assign cycle, on its own cadence and
@@ -83,11 +84,12 @@ write to the project you are steering (`project=<name>` / `<project>/<worker>`).
 Below, "the project" means whichever one this beat is for.
 
 - **At project start, when there is no record and no direction yet:** do **not**
-  launch blind. First **discuss the problem with both GPT-5.5-pro and the human**,
-  get instructions from both sides. **Ask the human the worker roster** (how many
-  `high` + how many `xhigh`; default `high:3,xhigh:4`) — a required project-start
-  choice, never picked silently — then `danus new <project> --roles high:N,xhigh:M`
-  and only then start the workers.
+  launch blind. Ask the human for the Worker roster (how many `high` + `xhigh`),
+  preserve that exact choice, and discuss the initial direction. If consult is
+  enabled, consult the configured strategy transport; if it is `off`, state that
+  the Main Agent is forming the direction offline. Then present the resulting
+  guidance and follow the environment's confirmation policy before assigning or
+  starting Workers.
 - **Cadence after that.** Run each project's elaborate → consult → assign beat on
   its own cadence (roughly **~2h between consults, ~1h between human summaries**),
   and only when there is genuinely **new state** — a worker finished a round, a
@@ -100,20 +102,22 @@ Below, "the project" means whichever one this beat is for.
   (verdict → closed/obsolete routes → interface contracts → dangerous heuristics
   → missing bridge lemmas; goal stays fixed, cite `fact_id`s only, no numerical
   distance). Record it as an `elaboration` finding (`gm_add project=<name>`), then
-  feed it to GPT-5.5-pro as the consult prompt. The elaboration is also what you
+  feed it to the configured strategy transport when enabled. The elaboration is also what you
   draw on to keep the human informed.
-- **master_guidance is the record of that consult — written only then.** When you
-  consult GPT-5.5-pro, take its reply as authoritative, **record it as a
-  `master_guidance` finding** (`gm_add project=<name>`), and steer from it. (Don't
-  author strategy out of thin air; `master_guidance` = what GPT-5.5-pro said.)
-  That project's workers read it and follow it. It is strategy, not a correctness
-  source.
+- **`master_guidance` is the shared strategy channel, and provenance is mandatory.**
+  With consult enabled, record the advisor reply as a `master_guidance` finding
+  with evidence containing `guidance-source: consult-derived`; do not claim that
+  the Main Agent authored that reply. With consult `off`, record the Main Agent's
+  own direction in the same channel with evidence containing
+  `guidance-source: offline-main-agent`, and explicitly label it as offline
+  Main-Agent-authored guidance—not consult output. In both cases workers read the
+  channel and follow it; it is strategy, not a correctness source.
 - **Dispatch from it — two channels.** `master_guidance` is the **shared**
   direction every worker reads each round; a worker's **`TASK.md`** is its
   **per-worker** assignment (which branch/subgoal is *yours*), written with
-  `danus assign <project>/<worker> --task "…"`. So: record pro's reply as
-  `master_guidance` (global), then `danus assign` each worker its own direction.
-  If GPT-5.5-pro names **distinct branches**, put **different workers on different
+  `danus assign <project>/<worker> --task "…"`. After the operator confirms the
+  initial guidance, assign each worker its own direction.
+  If the resulting guidance names **distinct branches**, put **different workers on different
   directions** (one `assign` each); if there are **fewer branches than workers**,
   **multiple workers on one subgoal is fine.** Re-`assign` mid-flight to re-task a
   worker — it reads the new `TASK.md` next round. The worker loop is **autonomous**;
@@ -127,8 +131,10 @@ The consult runs over one of three transports on a top-tier reasoning model:
 via your Claude subscription — the Claude Code CLI). All use **the operator's own key/login** in
 `config/*.env` (bring-your-own; no key ships with the repo). The fourth option is
 `off` (main reasons on its own, no consult). The consult is the **core
-direction-guidance step**, not an optional extra: unless it is `off`, run it each
-strategic cycle on genuine new state. (Mechanism: the `consult` skill.)
+direction-guidance step** when enabled: unless it is `off`, run it each strategic
+cycle on genuine new state. When it is `off`, the equivalent direction step is
+Main-Agent reasoning, explicitly marked `offline-main-agent`. (Mechanism: the
+`consult` skill when enabled.)
 
 ## What you never do (layer boundaries — load-bearing)
 

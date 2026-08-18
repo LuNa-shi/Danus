@@ -275,16 +275,54 @@ def test_architecture_correct_main_agent_and_project_configuration_are_visible()
         "master_guidance",
         "mainAgentInitializationMessage",
         "configuredStrategyTransport",
-        "不要调用 consult",
+        "先讨论初始方向",
+        "等待用户确认后再 assign",
+        "offline-main-agent",
+        "consult-derived guidance",
+        "guidance_source",
+        'snapshot.guidance_source || "unknown"',
+        "initial_direction_confirmed",
+        "data-confirm-initial-direction",
+        "function confirmInitialDirection",
+        "/initial-direction/confirm",
+        "请选择并确认 Worker roster 后创建项目",
         "max_parallel_workers",
         "worker.assigned",
         "/orchestration`",
     ):
         assert token in app
     assert "danus:rail-widths:v1" in app
+    starter = app[app.index("async function handleStarterSubmit"):app.index("function renderProjectShell")]
+    assert 'roles: "high:1,xhigh:1"' not in starter
+    assert '$("problem").value = text' in starter
     assert ".main-agent-control" in css
     assert ".rail-resizer" in css
     assert ".orchestration-warning" in css
+
+
+def test_initialization_message_covers_off_and_enabled_consult_modes():
+    source = _asset("app.js")
+    script = "\n".join((
+        "const state = {config: {strategy_transport: 'off'}};",
+        "function defaultWorkerModel() { return 'worker-model'; }",
+        "function defaultParallelWorkers() { return 2; }",
+        _javascript_function(source, "configuredStrategyTransport"),
+        source[source.index("function mainAgentInitializationMessage("):source.index("\nasync function createProject", source.index("function mainAgentInitializationMessage("))],
+        "const setup = {problem: 'P', roles: 'high:1,xhigh:1', model: 'm', max_parallel_workers: 2};",
+        "const off = mainAgentInitializationMessage(setup);",
+        "state.config.strategy_transport = 'gpt_pro';",
+        "const enabled = mainAgentInitializationMessage(setup);",
+        "console.log(JSON.stringify({off, enabled}));",
+    ))
+    result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+    messages = json.loads(result.stdout)
+    assert "offline-main-agent" in messages["off"]
+    assert "不得描述为 consult-derived" in messages["off"]
+    assert "consult-derived guidance" in messages["enabled"]
+    for message in messages.values():
+        assert "用户已确认 Worker roster：high:1,xhigh:1" in message
+        assert "等待用户确认后再 assign" in message
+        assert "不要在首次初始化消息中启动 Worker swarm" in message
 
 
 def test_worker_trace_separates_output_and_collapses_tool_calls():
