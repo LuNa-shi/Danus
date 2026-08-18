@@ -22,6 +22,7 @@ from danus import codex
 from danus.execution import layout as L
 
 from .config import ProviderModelCatalog, main_agent_metadata, strategy_metadata
+from .beats import OrchestrationBeatCoordinator, orchestration_observation
 from .runtime import DanusRuntimeAdapter, RuntimeErrorBase, RuntimeSafetyError, validate_runtime_name
 from .files import FileValidationError, file_type, material_root, metadata, normalize_filename, promote_pending, remove_blob, stream_to_pending, validate_bytes
 from .main_agent import MainAgentError, MainAgentAdapter
@@ -51,6 +52,9 @@ class AppSettings:
     lifecycle_base_url: str = "http://127.0.0.1:8080"
     lifecycle_hmac_secret: bytes | None = None
     deadline_poll_seconds: float = 0.25
+    orchestration_poll_seconds: float = 30.0
+    orchestration_consult_interval_seconds: float = 2 * 3600
+    human_summary_interval_seconds: float = 3600.0
 
 
 def _error(status: int, detail: str) -> JSONResponse:
@@ -101,16 +105,32 @@ def create_app(
     main_agent: Any | None = None,
     model_catalog: Any | None = None,
 ) -> FastAPI:
+    active_beat_projects: set[str] = set()
+    beat_execution_tasks: set[asyncio.Task[Any]] = set()
+    beat_coordinator = OrchestrationBeatCoordinator(
+        consult_interval_seconds=settings.orchestration_consult_interval_seconds,
+        summary_interval_seconds=settings.human_summary_interval_seconds,
+    )
+
     @contextlib.asynccontextmanager
     async def lifespan(application: FastAPI):
         task = asyncio.create_task(deadline_supervisor_loop())
+        beat_task = asyncio.create_task(orchestration_beat_loop())
         application.state.deadline_supervisor_task = task
+        application.state.orchestration_beat_task = beat_task
         try:
             yield
         finally:
             task.cancel()
+            beat_task.cancel()
+            for running_beat in list(beat_execution_tasks):
+                running_beat.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+            with contextlib.suppress(asyncio.CancelledError):
+                await beat_task
+            if beat_execution_tasks:
+                await asyncio.gather(*beat_execution_tasks, return_exceptions=True)
 
     app = FastAPI(title="Danus Web Console", version="0.1.0", lifespan=lifespan)
 
@@ -871,6 +891,7 @@ def create_app(
             store.add_run(run)
             try:
                 runtime.write_deadline(project["runtime_name"], deadline)
+                beat_coordinator.request(project_id)
                 store.audit("run_start", "intent_recorded", project_id)
                 return JSONResponse({
                     "run_id": run["id"], "status": "start_requested",
@@ -1371,6 +1392,7 @@ def create_app(
             "main_agent_status": session_projection["status"],
             "main_agent_backend": session_projection["backend"],
             "initial_direction_confirmed": project.get("initial_direction_confirmed_at") is not None,
+            "orchestration_beat": store.orchestration_beat_state(project_id),
             "workers_total": len(workers),
             "assigned_workers": len(workers) - len(unassigned),
             "unassigned_workers": unassigned,
@@ -1558,6 +1580,18 @@ def create_app(
                     "created_at": time.time(), "error": None,
                 })
                 store.audit("message", "success", project_id)
+                active_after_message = store.active_run(project_id)
+                if active_after_message is not None:
+                    try:
+                        manual_status = runtime.status_project(project["runtime_name"])
+                        manual_memory = runtime.memory_projection(project["runtime_name"])
+                        manual_facts = runtime.fact_graph_projection(project["runtime_name"])
+                        manual_state = beat_coordinator.settle(project_id, orchestration_observation(
+                            run=active_after_message, status=manual_status, memory=manual_memory, facts=manual_facts,
+                        ))
+                        store.update_orchestration_beat_state(project_id, fingerprint=manual_state[0], status="manual_activation", reason="operator_message", last_beat_at=manual_state[1], last_consult_at=manual_state[2], last_summary_at=manual_state[3])
+                    except (RuntimeErrorBase, OSError):
+                        store.audit("orchestration_beat", "manual_settle_failure", project_id)
                 return JSONResponse({
                     "message_id": message_id, "reply_id": reply_id, **result,
                 }, status_code=201)
@@ -1615,6 +1649,119 @@ def create_app(
         from fastapi.responses import FileResponse
         return FileResponse(Path(__file__).with_name("static") / "index.html")
 
+    async def execute_orchestration_beat(project: dict[str, Any]) -> None:
+        project_id = project["id"]
+        beat_id = None
+        decision = None
+        persisted = None
+        try:
+            async with lock_for(project_id):
+                active = store.active_run(project_id)
+                if active is None:
+                    store.audit("orchestration_beat", "cancelled_inactive_run", project_id)
+                    return
+                persisted = store.orchestration_beat_state(project_id)
+                if persisted and persisted.get("status") in {"completed", "cadence_due_no_change"}:
+                    beat_coordinator.seed(
+                        project_id, fingerprint=persisted["fingerprint"],
+                        last_beat_at=persisted["last_beat_at"],
+                        last_consult_at=persisted["last_consult_at"],
+                        last_summary_at=persisted["last_summary_at"],
+                    )
+                projection = await asyncio.to_thread(runtime.status_project, project["runtime_name"])
+                memory = await asyncio.to_thread(runtime.memory_projection, project["runtime_name"])
+                facts = await asyncio.to_thread(runtime.fact_graph_projection, project["runtime_name"])
+                observation = orchestration_observation(run=active, status=projection, memory=memory, facts=facts)
+                decision = beat_coordinator.consider(project_id, observation)
+                if not decision.due:
+                    if decision.reason == "cadence_deferred_no_change":
+                        last_consult, last_summary = beat_coordinator.defer_cadence(
+                            project_id, consult_due=decision.consult_due, summary_due=decision.summary_due,
+                        )
+                        previous = persisted or {}
+                        store.update_orchestration_beat_state(
+                            project_id, fingerprint=decision.fingerprint,
+                            status="cadence_due_no_change", reason=decision.reason,
+                            last_beat_at=previous.get("last_beat_at", time.time()),
+                            last_consult_at=last_consult, last_summary_at=last_summary,
+                        )
+                        store.audit("orchestration_beat", "cadence_due_no_change", project_id,
+                                    details=json.dumps({"consult_due": decision.consult_due, "summary_due": decision.summary_due}))
+                    return
+                previous = persisted or {}
+                now = time.time()
+                store.update_orchestration_beat_state(
+                    project_id, fingerprint=decision.fingerprint, status="scheduled", reason=decision.reason,
+                    last_beat_at=previous.get("last_beat_at", 0.0),
+                    last_consult_at=previous.get("last_consult_at", 0.0),
+                    last_summary_at=previous.get("last_summary_at", 0.0),
+                )
+                store.audit("orchestration_beat", "scheduled", project_id,
+                            details=json.dumps({"reason": decision.reason, "fingerprint": decision.fingerprint}))
+                beat_id = uuid.uuid4().hex
+                beat_message = (
+                    f"[Host orchestration beat: {decision.reason}; consult_due={decision.consult_due}; summary_due={decision.summary_due}] "
+                    "Inspect current Worker status, global memory, and Fact Graph. Act only on genuine new state: update provenance-marked "
+                    "guidance when warranted, re-task Workers between rounds, and use the project lifecycle broker for normal lifecycle actions. "
+                    "If verifier-accepted facts complete the Project target, request graceful stop and notify the operator. "
+                    "If summary_due=true, produce the auditable human summary."
+                )
+                store.add_message({"id": beat_id, "project_id": project_id, "role": "system", "text": beat_message,
+                                   "status": "submitted", "created_at": now, "error": None})
+                session = store.agent_session(project_id) or {}
+                session_id = session.get("session_id") if session.get("backend") == main_agent_backend else None
+                store.upsert_agent_session(project_id, session_id, "active", time.time(), backend=main_agent_backend)
+                result = await asyncio.to_thread(lambda: main_agent.send(
+                    context_dir=runtime.project_context_dir(project["runtime_name"]), session_id=session_id,
+                    message=beat_message, manifest=[metadata(row) for row in store.files(project_id)],
+                    project_state={"project_id": project_id, "name": project["name"], "problem": project["problem"]},
+                    attachments=[], lifecycle_url=lifecycle_url(project_id), lifecycle_token=lifecycle_token(project),
+                ))
+                store.update_message(beat_id, status="completed")
+                store.upsert_agent_session(project_id, result["session_id"], "inactive", time.time(), backend=main_agent_backend)
+                store.add_message({"id": uuid.uuid4().hex, "project_id": project_id, "role": "assistant",
+                                   "text": result["reply"], "status": "completed", "created_at": time.time(), "error": None})
+                settled_status = await asyncio.to_thread(runtime.status_project, project["runtime_name"])
+                settled_memory = await asyncio.to_thread(runtime.memory_projection, project["runtime_name"])
+                settled_facts = await asyncio.to_thread(runtime.fact_graph_projection, project["runtime_name"])
+                completed = beat_coordinator.complete(project_id, orchestration_observation(
+                    run=active, status=settled_status, memory=settled_memory, facts=settled_facts,
+                ), decision)
+                store.update_orchestration_beat_state(
+                    project_id, fingerprint=completed[0], status="completed", reason=decision.reason,
+                    last_beat_at=completed[1], last_consult_at=completed[2], last_summary_at=completed[3],
+                )
+                store.audit("orchestration_beat", "completed", project_id,
+                            details=json.dumps({"reason": decision.reason, "fingerprint": completed[0]}))
+        except Exception as exc:
+            beat_coordinator.request(project_id)
+            if beat_id is not None:
+                store.update_message(beat_id, status="failed", error="Main Agent orchestration beat failed")
+                session = store.agent_session(project_id) or {}
+                store.upsert_agent_session(project_id, session.get("session_id"), "inactive", time.time(), backend=main_agent_backend)
+            if decision is not None:
+                previous = persisted or {}
+                store.update_orchestration_beat_state(
+                    project_id, fingerprint=decision.fingerprint, status="failed", reason=decision.reason,
+                    last_beat_at=previous.get("last_beat_at", 0.0),
+                    last_consult_at=previous.get("last_consult_at", 0.0),
+                    last_summary_at=previous.get("last_summary_at", 0.0),
+                )
+            store.audit("orchestration_beat", "failure", project_id, details=str(exc)[:200])
+        finally:
+            active_beat_projects.discard(project_id)
+
+    async def orchestration_beat_loop() -> None:
+        interval = max(0.25, float(settings.orchestration_poll_seconds))
+        while True:
+            await asyncio.sleep(interval)
+            for project in store.projects():
+                if store.active_run(project["id"]) is None or project["id"] in active_beat_projects:
+                    continue
+                active_beat_projects.add(project["id"])
+                task = asyncio.create_task(execute_orchestration_beat(project))
+                beat_execution_tasks.add(task)
+                task.add_done_callback(beat_execution_tasks.discard)
     async def deadline_supervisor_loop() -> None:
         interval = max(0.05, float(settings.deadline_poll_seconds))
         while True:

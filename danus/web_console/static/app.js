@@ -1268,6 +1268,7 @@ function renderMainAgentControl() {
   const guidanceConfirmable = ["offline-main-agent", "consult-derived"].includes(guidanceSource);
   const sessionStatus = currentPendingMessage() ? "active" : (main.status || snapshot.main_agent_status || (state.messages.some((message) => message.role === "assistant" && message.status === "completed") ? "inactive" : "not_started"));
   const activeRun = state.runtime.run;
+  const orchestrationBeat = snapshot.orchestration_beat || null;
   const statusLabels = { active: "会话执行中", inactive: "会话可恢复", not_started: "尚未激活", failed: "上次会话失败" };
   const steps = [
     { label: "问题讨论", done: sessionStatus !== "not_started", hint: sessionStatus === "not_started" ? "等待首次 Main Agent 对话" : "项目会话已建立" },
@@ -1275,6 +1276,7 @@ function renderMainAgentControl() {
     { label: guidanceLabel, done: Boolean(guidance), hint: guidance ? `共享方向已记录 · ${guidanceTransport}` : `等待 ${guidanceLabel} · ${guidanceTransport}` },
     { label: "初始方向确认", done: snapshot.initial_direction_confirmed === true, warning: Boolean(guidance) && snapshot.initial_direction_confirmed !== true, hint: snapshot.initial_direction_confirmed === true ? "操作员已确认，可派工" : "等待操作员明确确认" },
     { label: "Worker 分工", done: total > 0 && assigned === total, warning: assigned < total, hint: `${assigned} / ${total} 已分配` },
+    { label: "主动编排 Beat", done: Boolean(orchestrationBeat), hint: orchestrationBeat ? `${orchestrationBeat.status} · ${orchestrationBeat.reason}` : "等待 host-owned 新状态触发" },
     { label: "监控与汇总", done: Boolean(activeRun), hint: activeRun ? `Run ${activeRun.status}` : "Run 尚未启动" },
   ];
   const runningUnassigned = Boolean(activeRun && total && assigned < total);
