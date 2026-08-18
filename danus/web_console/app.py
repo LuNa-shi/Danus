@@ -815,11 +815,13 @@ def create_app(
             return project
         try:
             payload = await request.json()
-            duration = int(payload["duration_seconds"])
-            if duration <= 0 or duration > 7 * 24 * 3600:
-                raise ValueError("duration_seconds out of range")
-        except (KeyError, TypeError, ValueError):
-            return _error(400, "invalid duration_seconds")
+        except Exception:
+            return _error(400, "duration_seconds must be an integer")
+        duration = payload.get("duration_seconds") if isinstance(payload, dict) else None
+        if isinstance(duration, bool) or not isinstance(duration, int):
+            return _error(400, "duration_seconds must be an integer")
+        if duration <= 0 or duration > 7 * 24 * 3600:
+            return _error(400, "duration_seconds must be between 1 and 604800")
         async with lock_for(project_id):
             try:
                 status_projection = runtime.status_project(project["runtime_name"])
@@ -843,7 +845,8 @@ def create_app(
                     },
                     status_code=409,
                 )
-            started, deadline = time.time(), time.time() + duration
+            started = time.time()
+            deadline = started + duration
             run = {"id": uuid.uuid4().hex, "project_id": project_id, "duration_seconds": duration, "started_at": started, "deadline": deadline, "status": "starting"}
             # Persist the bounded operator intent before exposing it to the
             # Main Agent. Normal Worker spawning is brokered only when that
