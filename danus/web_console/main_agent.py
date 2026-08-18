@@ -916,7 +916,7 @@ class MainAgentAdapter:
             remaining = deadline - self._clock()
             if remaining <= 0:
                 raise MainAgentError(
-                    "main agent turn timed out: total timeout budget exhausted", code="timeout",
+                    "main agent turn timed out: total timeout budget exhausted", code="turn_timeout_exhausted",
                     session_id=active_session_id, attempts=max(0, attempt - 1),
                 )
             try:
@@ -931,7 +931,7 @@ class MainAgentAdapter:
                 actual_id, _ = self._parse_codex(str(partial))
                 observed_tool_activity, _ = self._codex_activity(str(partial))
                 raise MainAgentError(
-                    "main agent turn timed out: total timeout budget exhausted", code="timeout",
+                    "main agent turn timed out: total timeout budget exhausted", code="turn_timeout_exhausted",
                     session_id=actual_id or active_session_id,
                     attempts=attempt, observed_tool_activity=observed_tool_activity,
                 ) from exc

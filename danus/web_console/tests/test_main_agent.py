@@ -514,7 +514,7 @@ def test_codex_timeout_preserves_session_and_tool_activity_from_partial_output(t
         adapter.send(**_args(tmp_path))
 
     assert raised.value.session_id == "sid-timeout"
-    assert raised.value.code == "timeout"
+    assert raised.value.code == "turn_timeout_exhausted"
     assert raised.value.retryable is False
     assert raised.value.safe_to_retry is False
     assert raised.value.observed_tool_activity is True
@@ -883,4 +883,5 @@ def test_codex_retries_share_one_absolute_timeout_budget(tmp_path: Path):
     adapter = MainAgentAdapter(backend="codex", runner=runner, codex_bin="codex", timeout=1.0, max_attempts=3, retry_base_seconds=.2, retry_cap_seconds=.2, sleeper=sleep, clock=lambda: now[0])
     with pytest.raises(MainAgentError) as raised: adapter.send(**_args(tmp_path))
     assert raised.value.code == "turn_timeout_exhausted"
-    assert calls[0] <= 1.0 and len(calls) <= 2
+    assert calls == pytest.approx([1.0, 0.4])
+    assert now[0] <= 1.0
