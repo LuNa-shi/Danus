@@ -1,13 +1,13 @@
 """Typed normalized Main Agent provider protocol."""
 from __future__ import annotations
 from dataclasses import dataclass, field
-from enum import StrEnum
+from enum import Enum
 import json
 from typing import Any
 
 MAX_DETAIL = 4000
 
-class EventKind(StrEnum):
+class EventKind(str, Enum):
     SESSION_STARTED = "session.started"
     PROCESS_STARTED = "process.started"
     TURN_STARTED = "turn.started"
