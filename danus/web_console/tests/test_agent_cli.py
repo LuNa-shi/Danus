@@ -92,6 +92,35 @@ def test_stop_posts_to_host_broker_while_status_remains_project_local(
     assert len(requests) == 2
 
 
+def test_pause_and_resume_post_worker_target_to_host_broker(
+    tmp_path: Path, monkeypatch, capsys,
+):
+    root = tmp_path / "projects"
+    project = root / "A"
+    project.mkdir(parents=True)
+    monkeypatch.setenv("DANUS_PROJECT_SCOPE", "A")
+    monkeypatch.setenv("DANUS_AGENTS_ROOT", str(root))
+    monkeypatch.setenv("DANUS_PROJECT_DIR", str(project))
+    monkeypatch.setenv("DANUS_WEB_LIFECYCLE_URL", "http://127.0.0.1/lifecycle/A")
+    monkeypatch.setenv("DANUS_WEB_LIFECYCLE_TOKEN", "project-capability")
+    requests = []
+
+    def open_request(request, *, timeout):
+        requests.append(json.loads(request.data))
+        return _Response({"status": "accepted"})
+
+    monkeypatch.setattr(agent_cli.urllib.request, "urlopen", open_request)
+
+    assert agent_cli.main(["pause", "high"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"status": "accepted"}
+    assert agent_cli.main(["resume", "high"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"status": "accepted"}
+    assert requests == [
+        {"action": "pause", "worker": "high"},
+        {"action": "resume", "worker": "high"},
+    ]
+
+
 def test_assign_posts_task_to_project_capability_broker(tmp_path: Path, monkeypatch, capsys):
     root = tmp_path / "projects"
     project = root / "A"

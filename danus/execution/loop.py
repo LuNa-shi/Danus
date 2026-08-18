@@ -178,7 +178,7 @@ def _acquire_worker_slot(wl: L.WorkerLayout) -> tuple[object | None, bool]:
             wl, state="queued", queue_reason="waiting for API slot",
             queued_at=time.time(), slot_capacity=capacity,
         )
-        if wl.stop.exists() or _deadline_passed(wl.project_dir):
+        if wl.stop.exists() or wl.pause.exists() or _deadline_passed(wl.project_dir):
             return None, False
         time.sleep(1)
 
@@ -271,6 +271,31 @@ def _cleanup_pid(wl: L.WorkerLayout) -> None:
         pass
 
 
+def _wait_while_paused(wl: L.WorkerLayout) -> None:
+    """Cooperatively wait at a round boundary while pause is requested."""
+    wrote_status = False
+    while wl.pause.exists():
+        if wl.stop.exists() or _deadline_passed(wl.project_dir):
+            return
+        if not wrote_status:
+            write_status(
+                wl,
+                state="paused",
+                pause_requested=True,
+                paused_at=time.time(),
+                next_retry_at=None,
+            )
+            wrote_status = True
+        time.sleep(0.2)
+    if wrote_status:
+        write_status(
+            wl,
+            state="idle",
+            pause_requested=False,
+            resumed_at=time.time(),
+        )
+
+
 def main(worker_dir: str) -> int:
     wdir = Path(worker_dir).resolve()
     if not wdir.is_dir():
@@ -315,11 +340,16 @@ def main(worker_dir: str) -> int:
         while True:
             if wl.stop.exists():
                 wl.stop.unlink(missing_ok=True)
-                write_status(wl, state="stopped")
+                wl.pause.unlink(missing_ok=True)
+                write_status(wl, state="stopped", pause_requested=False)
                 break
             if _deadline_passed(project_dir):
-                write_status(wl, state="deadline")
+                wl.pause.unlink(missing_ok=True)
+                write_status(wl, state="deadline", pause_requested=False)
                 break
+            if wl.pause.exists():
+                _wait_while_paused(wl)
+                continue
             if max_rounds and rnd >= max_rounds:
                 write_status(wl, state="max_rounds")
                 break
@@ -359,6 +389,10 @@ def main(worker_dir: str) -> int:
                 write_status(wl, state="error", error=f"{consec_fail} consecutive failed rounds")
                 return 1
 
+            # A cooperative pause requested during the round must prevent the
+            # next round immediately, before any retry/beat sleep elapses.
+            if wl.pause.exists():
+                continue
             delay = retry_delay or beat
             if delay > 0:
                 time.sleep(delay)

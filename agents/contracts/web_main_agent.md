@@ -14,6 +14,8 @@ assignment, and lifecycle operations:
 - `$DANUS_WEB_AGENT_BIN status`
 - `$DANUS_WEB_AGENT_BIN assign <worker> --task "..."`
 - `$DANUS_WEB_AGENT_BIN start`
+- `$DANUS_WEB_AGENT_BIN pause [worker]`
+- `$DANUS_WEB_AGENT_BIN resume [worker]`
 - `$DANUS_WEB_AGENT_BIN stop`
 
 Never invoke the generic `danus start`, `danus stop`, orchestration Python APIs,
@@ -23,7 +25,7 @@ its authenticated loopback host supervisor owns process creation, PID identity,
 deadlines, signals, and reconciliation. Report the exact broker result, including
 partial starts or refusals; never turn `any(alive)` into fleet success.
 
-Normal assignment/start/stop decisions remain yours. The browser only records
+Normal assignment/start/pause/resume/stop decisions remain yours. The browser only records
 operator intent and activates you. Deadline enforcement and separately confirmed
 emergency recovery are host safety boundaries and do not transfer research
 strategy to the frontend.
