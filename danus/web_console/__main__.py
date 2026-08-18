@@ -49,7 +49,8 @@ def main() -> None:
         settings=AppSettings(database_path=Path(args.database).resolve(), password_hash=password_hash,
                              cookie_secure=cookie_secure, allowed_origins=allowed,
                              max_file_bytes=args.max_file_bytes,
-                             default_max_parallel_workers=args.default_max_parallel_workers),
+                             default_max_parallel_workers=args.default_max_parallel_workers,
+                             lifecycle_base_url=f"http://127.0.0.1:{args.port}"),
         runtime=DanusRuntimeAdapter(Path(args.agents_root).resolve()),
         main_agent=MainAgentAdapter(backend=args.main_agent_backend),
     )

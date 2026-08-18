@@ -261,11 +261,12 @@ def run_round(wl: L.WorkerLayout, role: dict, prompt: str, log_path: Path,
 # --- the loop -------------------------------------------------------------- #
 
 def _cleanup_pid(wl: L.WorkerLayout) -> None:
-    """Remove our own .pid if it still points at us (clean exit only)."""
+    """Remove our own PID and host identity records on clean exit."""
     pf = wl.pid
     try:
         if pf.exists() and pf.read_text().strip() == str(os.getpid()):
             pf.unlink(missing_ok=True)
+            wl.process_identity.unlink(missing_ok=True)
     except OSError:
         pass
 

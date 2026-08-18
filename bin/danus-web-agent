@@ -1,5 +1,59 @@
 #!/usr/bin/env bash
 set -euo pipefail
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-. "$HERE/../scripts/env.sh" >/dev/null 2>&1
-exec "$DANUS_PY" -m danus.web_console.agent_cli "$@"
+
+usage() {
+  cat <<'EOF'
+usage: danus-web-agent {status|assign|start|pause|resume|stop} ...
+  status
+  assign WORKER --task TEXT
+  start
+  pause [WORKER]
+  resume [WORKER]
+  stop
+EOF
+}
+
+if [[ ${1:-} == "--help" || ${1:-} == "-h" ]]; then usage; exit 0; fi
+command=${1:-}; shift || true
+url=${DANUS_WEB_LIFECYCLE_URL:-}
+token=${DANUS_WEB_LIFECYCLE_TOKEN:-}
+[[ -n "$url" && -n "$token" ]] || { echo "Main Agent lifecycle broker is not configured" >&2; exit 2; }
+
+case "$command" in
+  status|start|stop)
+    [[ $# -eq 0 ]] || { usage >&2; exit 2; }
+    payload=$(jq -cn --arg action "$command" '{action:$action}')
+    ;;
+  pause|resume)
+    [[ $# -le 1 ]] || { usage >&2; exit 2; }
+    if [[ $# -eq 1 ]]; then
+      payload=$(jq -cn --arg action "$command" --arg worker "$1" '{action:$action,worker:$worker}')
+    else
+      payload=$(jq -cn --arg action "$command" '{action:$action}')
+    fi
+    ;;
+  assign)
+    [[ $# -eq 3 && $2 == "--task" ]] || { usage >&2; exit 2; }
+    payload=$(jq -cn --arg action assign --arg worker "$1" --arg task "$3" '{action:$action,worker:$worker,task:$task}')
+    ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+response_file=$(mktemp)
+trap 'rm -f "$response_file"' EXIT
+# Feed the capability through curl's config stdin so it never appears in the
+# process argv exposed by /proc/<pid>/cmdline.
+status=$(printf 'header = "Authorization: Bearer %s"\n' "$token" | \
+  curl --config - --silent --show-error --max-time 30 \
+    --output "$response_file" --write-out '%{http_code}' \
+    --request POST --header 'Accept: application/json' \
+    --header 'Content-Type: application/json' \
+    --data "$payload" "$url")
+if [[ $status =~ ^2 ]]; then
+  cat "$response_file"
+  printf '\n'
+  exit 0
+fi
+detail=$(jq -r '.detail // "request rejected"' < "$response_file" 2>/dev/null || echo 'request rejected')
+echo "lifecycle broker rejected $command: $detail" >&2
+exit 1

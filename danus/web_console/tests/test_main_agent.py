@@ -172,7 +172,7 @@ def test_codex_default_effort_honors_server_environment(tmp_path: Path, monkeypa
     MainAgentAdapter(backend="codex", runner=runner, codex_bin="codex").send(**_args(tmp_path))
     cmd, kwargs = calls[0]
     assert 'model_reasoning_effort="xhigh"' in cmd
-    assert kwargs["env"]["DANUS_PY"]
+    assert "DANUS_PY" not in kwargs["env"]
     assert kwargs["env"]["DANUS_PROJECT_SCOPE"] == tmp_path.name
 
 
@@ -184,6 +184,35 @@ def test_codex_environment_passes_server_side_provider_credentials(tmp_path: Pat
 
     assert env["OPENAI_API_KEY"] == "redacted-test-key"
     assert env["OPENAI_BASE_URL"] == "https://example.invalid/v1"
+
+
+def test_main_agent_environment_receives_only_project_scoped_lifecycle_capability(
+    tmp_path: Path, monkeypatch,
+):
+    captured = {}
+    monkeypatch.setenv("DANUS_WEB_LIFECYCLE_HMAC_SECRET", "must-not-leak")
+    monkeypatch.setenv("DANUS_WEB_LIFECYCLE_URL", "http://127.0.0.1/other-project")
+    monkeypatch.setenv("DANUS_WEB_LIFECYCLE_TOKEN", "other-project-token")
+
+    def runner(_cmd, **kwargs):
+        captured.update(kwargs["env"])
+        return SimpleNamespace(returncode=0, stdout=_codex_success(), stderr="")
+
+    adapter = MainAgentAdapter(backend="codex", runner=runner, codex_bin="codex")
+    adapter.send(
+        **_args(tmp_path),
+        lifecycle_url=(
+            "http://127.0.0.1:8080/internal/api/projects/project-a/lifecycle"
+        ),
+        lifecycle_token="project-a-capability",
+    )
+
+    assert captured["DANUS_WEB_LIFECYCLE_URL"].endswith(
+        "/internal/api/projects/project-a/lifecycle"
+    )
+    assert captured["DANUS_WEB_LIFECYCLE_TOKEN"] == "project-a-capability"
+    assert "other-project" not in json.dumps(captured)
+    assert "DANUS_WEB_LIFECYCLE_HMAC_SECRET" not in captured
 
 
 def test_codex_environment_passes_only_explicit_danus_strategy_configuration(tmp_path: Path, monkeypatch):
@@ -232,18 +261,24 @@ def test_main_agent_prompt_never_hardcodes_strategy_model_when_enabled(tmp_path:
     assert "Use the server-configured transport and model" in prompt
 
 
-def test_codex_environment_imports_danus_outside_repo(tmp_path: Path):
+def test_codex_environment_exposes_only_the_self_bootstrapping_broker(tmp_path: Path):
     env = MainAgentAdapter(backend="codex", codex_bin="codex")._env(tmp_path)
 
     result = subprocess.run(
-        [env["DANUS_PY"], "-c", "import danus"],
+        [env["DANUS_WEB_AGENT_BIN"], "--help"],
         cwd=tmp_path,
         env=env,
         capture_output=True,
         text=True,
     )
 
+    assert "DANUS_PY" not in env
+    assert "PYTHONPATH" not in env
     assert result.returncode == 0, result.stderr
+    assert "danus-web-agent" in result.stdout
+    wrapper_text = Path(env["DANUS_WEB_AGENT_BIN"]).read_text(encoding="utf-8")
+    assert '--header "Authorization: Bearer $token"' not in wrapper_text
+    assert "curl --config -" in wrapper_text
 
 
 def test_codex_allows_cli_configured_model_when_server_does_not_set_one(tmp_path: Path, monkeypatch):
@@ -643,3 +678,30 @@ def test_codex_resume_keeps_resume_options_before_session(tmp_path: Path):
     assert 'approval_policy="never"' not in cmd
     assert "--config" in cmd and any(str(x).startswith("mcp_servers.danus=") for x in cmd)
     assert cmd[-2:] == ["sid-1", "-"]
+
+
+def test_web_main_agent_uses_broker_only_contract_and_hides_generic_repo_bin(tmp_path: Path, monkeypatch):
+    adapter = MainAgentAdapter(backend="codex", codex_bin="/usr/bin/codex")
+    repo = Path(__file__).resolve().parents[3]
+    root = tmp_path / "projects" / "A"
+    root.mkdir(parents=True)
+    monkeypatch.setenv("PATH", f"{repo / 'bin'}:/usr/bin")
+
+    env = adapter._env(
+        root,
+        lifecycle_url="http://127.0.0.1:8080/internal/api/projects/p/lifecycle",
+        lifecycle_token="project-capability",
+    )
+    prompt = adapter._prompt(
+        message="start", manifest=[], project_state={"project_id": "p"}, attachments=[],
+    )
+
+    assert str(repo / "bin") not in env["PATH"].split(os.pathsep)
+    assert env["DANUS_WEB_AGENT_BIN"] == str(repo / "bin" / "danus-web-agent")
+    assert "PYTHONPATH" not in env
+    assert "DANUS_ROOT" not in env
+    assert "DANUS_PY" not in env
+    assert str(Path(sys.executable).parent.absolute()) not in env["PATH"].split(os.pathsep)
+    assert "Never invoke the generic `danus start`" in prompt
+    assert "$DANUS_WEB_AGENT_BIN start" in prompt
+    assert "danus stop <project>" not in prompt

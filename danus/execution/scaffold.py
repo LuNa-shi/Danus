@@ -170,10 +170,12 @@ def do_new(project: str, roles: str = "high:3,xhigh:4",
 # spawn_loop — detached launch of one worker's outer loop                     #
 # --------------------------------------------------------------------------- #
 
-def spawn_loop(wdir: Path) -> int:
-    """Launch ``python -m danus.execution <wdir>`` detached in its own process
-    group (``start_new_session=True``) so ``danus stop --force`` can ``killpg``
-    the loop *and* its in-flight codex child. Returns the child pid."""
+def spawn_loop(wdir: Path) -> subprocess.Popen:
+    """Launch one detached Worker loop and return its exact child handle.
+
+    The caller retains the handle long enough to terminate and reap this newly
+    spawned group if post-spawn identity verification fails.
+    """
     wl = L.WorkerLayout(wdir)
     wl.logs.mkdir(parents=True, exist_ok=True)
     logf = open(wl.logs / "loop.log", "a", encoding="utf-8")
@@ -185,4 +187,4 @@ def spawn_loop(wdir: Path) -> int:
         )
     finally:
         logf.close()
-    return proc.pid
+    return proc

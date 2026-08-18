@@ -25,14 +25,23 @@ import argparse
 import fcntl
 import json
 import os
-import signal
-import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from danus.execution import layout as L
+from danus.execution import processes as P
 from danus.execution.scaffold import atomic_write, do_new, spawn_loop
+
+def _reject_web_sandbox_control() -> None:
+    if (
+        os.environ.get("DANUS_ROLE") == "main"
+        and os.environ.get("DANUS_WEB_LIFECYCLE_URL")
+    ):
+        raise SystemExit(
+            "Web Main Agent control must use the project-scoped DANUS_WEB_AGENT_BIN broker"
+        )
 
 __all__ = [
     "do_new", "do_assign", "do_start", "do_status", "worker_status",
@@ -41,45 +50,16 @@ __all__ = [
 
 
 # --------------------------------------------------------------------------- #
-# read helpers                                                                 #
+# execution-owned process helper compatibility aliases                        #
 # --------------------------------------------------------------------------- #
 
-def _read_pid(wl: L.WorkerLayout) -> Optional[int]:
-    pf = wl.pid
-    if not pf.exists():
-        return None
-    try:
-        return int(pf.read_text().strip())
-    except (ValueError, OSError):
-        return None
-
-
-def _alive(pid: Optional[int]) -> bool:
-    if not pid:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # exists but not ours
-    # The pid exists — but a zombie (killed, not yet reaped by its parent) is
-    # effectively dead. Prefer Linux /proc, then use portable ``ps`` on macOS
-    # and other Unix hosts that do not mount procfs.
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
-        state = stat.rsplit(")", 1)[1].split()[0]  # field after "(comm)"
-        return state != "Z"
-    except (OSError, IndexError):
-        try:
-            result = subprocess.run(
-                ["ps", "-o", "stat=", "-p", str(pid)],
-                capture_output=True, text=True, timeout=1, check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return True
-        state = result.stdout.strip().split(maxsplit=1)[0] if result.stdout.strip() else ""
-        return not state.startswith("Z")
+_read_pid = P.read_pid
+_alive = P.process_alive
+_expected_worker_cmdline = P.expected_worker_cmdline
+_capture_worker_identity = P.capture_worker_identity
+_read_process_identity = P.read_worker_identity
+_clear_process_identity = P.clear_worker_process_metadata
+_worker_alive = P.worker_process_alive
 
 
 def _read_status(wl: L.WorkerLayout) -> Dict:
@@ -217,8 +197,8 @@ def do_finalize(project: str, fact_ids: List[str],
 # --------------------------------------------------------------------------- #
 
 def _start_one(wl: L.WorkerLayout) -> str:
-    """Returns 'started' / 'already-running' / 'locked'. Idempotent via an flock
-    on .pid.lock; clears a stale .stop before spawning."""
+    """Return a lifecycle result while holding the Worker launch lock."""
+    _reject_web_sandbox_control()
     wl.dir.mkdir(parents=True, exist_ok=True)
     wl.logs.mkdir(exist_ok=True)
     lock = open(wl.lock, "w")
@@ -227,11 +207,37 @@ def _start_one(wl: L.WorkerLayout) -> str:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return "locked"
-        if _alive(_read_pid(wl)):
+        if P.worker_process_alive(wl):
+            # Migrate a legacy exact-command PID to the durable identity record.
+            if P.read_worker_identity(wl) is None:
+                pid = P.read_pid(wl)
+                identity = P.capture_worker_identity(wl, pid) if pid is not None else None
+                if identity is not None:
+                    P.write_worker_identity(wl, identity)
             return "already-running"
+        # A raw live PID with no matching Worker identity is stale (commonly a
+        # namespace-local PID reused by an unrelated host process). Never let it
+        # suppress a new launch.
+        P.clear_worker_process_metadata(wl)
         wl.stop.unlink(missing_ok=True)  # clear a stale stop flag
-        pid = spawn_loop(wl.dir)
+        process = spawn_loop(wl.dir)
+        pid = int(process.pid)
         atomic_write(wl.pid, str(pid))
+        identity = None
+        for _ in range(20):
+            identity = P.capture_worker_identity(wl, pid)
+            if identity is not None or not P.process_alive(pid):
+                break
+            time.sleep(0.01)
+        if identity is None:
+            # The direct Popen handle identifies this exact new child. Terminate
+            # its whole start_new_session group, reap the leader, and verify the
+            # group is gone before removing recoverable metadata.
+            if P.terminate_spawned_worker(process):
+                P.clear_worker_process_metadata(wl)
+                return "start-failed"
+            return "start-cleanup-failed"
+        P.write_worker_identity(wl, identity)
         return "started"
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
@@ -239,6 +245,7 @@ def _start_one(wl: L.WorkerLayout) -> str:
 
 
 def do_start(target: str, stagger: float = 0.2, root: Optional[Path] = None) -> List[Dict]:
+    _reject_web_sandbox_control()
     dirs = L.target_worker_dirs(target, root)
     if not dirs:
         raise SystemExit(f"no workers for target {target!r}")
@@ -256,9 +263,12 @@ def do_start(target: str, stagger: float = 0.2, root: Optional[Path] = None) -> 
 
 def worker_status(wl: L.WorkerLayout) -> Dict:
     pid = _read_pid(wl)
-    alive = _alive(pid)
+    alive = _worker_alive(wl)
     st = _read_status(wl)
-    state = st.get("state", "—")
+    persisted_state = st.get("state", "—")
+    state = persisted_state
+    if not alive and state in ("running", "retrying", "queued", "idle"):
+        state = "stale"
     now = time.time()
     # While a round is active, age means time in the current round. A stale
     # last_round_at from a previous Run must not make a freshly restarted worker
@@ -280,8 +290,13 @@ def worker_status(wl: L.WorkerLayout) -> Dict:
                                    "terminated", "created") else "dead"
     config = _read_worker_config(wl)
     task_state = _read_task_state(wl)
+    raw_alive = P.process_alive(pid)
+    identity_status = "matched" if alive else "mismatch" if raw_alive else "dead"
     return {
-        "worker": wl.name, "pid": pid, "alive": alive, "state": state,
+        "worker": wl.name, "pid": pid, "alive": alive, "raw_alive": raw_alive,
+        "process_identity": identity_status, "state": state,
+        "persisted_state": persisted_state,
+        "identity_verified": alive,
         "round": st.get("round", 0), "age_s": round(age, 1) if age is not None else None,
         "last_fact_id": st.get("last_fact_id"), "label": label,
         "task": task_state["task"],
@@ -323,7 +338,7 @@ def do_list(root: Optional[Path] = None) -> List[Dict]:
                 meta = {}
         workers = L.list_workers(project, root)
         live = sum(1 for w in workers
-                   if _alive(_read_pid(L.WorkerLayout(L.worker_dir(project, w, root)))))
+                   if _worker_alive(L.WorkerLayout(L.worker_dir(project, w, root))))
         out.append({"project": project, "workers": len(workers), "live": live,
                     "model": meta.get("model", "—")})
     return out
@@ -352,35 +367,24 @@ def _fmt_status(rows: List[Dict]) -> str:
 # --------------------------------------------------------------------------- #
 
 def _stop_one(wl: L.WorkerLayout, force: bool) -> str:
-    pid = _read_pid(wl)
-    if not force:
-        if not _alive(pid):
-            return "not-running"
-        wl.stop.touch()      # graceful: loop exits at round boundary
-        return "stopping (graceful)"
-    # force: kill the loop's process group (loop + its codex child), then SIGKILL
-    if not _alive(pid):
-        wl.pid.unlink(missing_ok=True)
+    _reject_web_sandbox_control()
+    if force:
+        return P.force_stop_worker(wl)
+    pid = P.read_pid(wl)
+    raw_alive = P.process_alive(pid)
+    if not P.worker_process_alive(wl):
+        # Retain live mismatched metadata for host reconciliation; clearing it
+        # would hide an unresolved process and permit a false terminal outcome.
+        if raw_alive:
+            return "identity-mismatch"
+        P.clear_worker_process_metadata(wl)
         return "not-running"
-    try:
-        pgid = os.getpgid(pid)
-        os.killpg(pgid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        pass
-    for _ in range(50):                          # up to ~5s for a clean exit
-        if not _alive(pid):
-            break
-        time.sleep(0.1)
-    if _alive(pid):
-        try:
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-    wl.pid.unlink(missing_ok=True)
-    return "killed"
+    wl.stop.touch()      # graceful: loop exits at round boundary
+    return "stopping (graceful)"
 
 
 def do_stop(target: str, force: bool = False, root: Optional[Path] = None) -> List[Dict]:
+    _reject_web_sandbox_control()
     dirs = L.target_worker_dirs(target, root)
     if not dirs:
         raise SystemExit(f"no workers for target {target!r}")
@@ -392,7 +396,6 @@ def do_stop(target: str, force: bool = False, root: Optional[Path] = None) -> Li
 # --------------------------------------------------------------------------- #
 
 def _task_from_args(args) -> str:
-    import sys
     if args.task is not None:
         return args.task
     if args.file:

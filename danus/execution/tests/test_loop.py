@@ -331,20 +331,24 @@ def test_parse_last_fact_id_missing_file(tmp: Path):
     assert loop._parse_last_fact_id(tmp / "no_such.log") is None   # OSError branch
 
 
-# --- _cleanup_pid: only removes a .pid that points at us ------------------- #
+# --- _cleanup_pid: removes PID + identity only when the PID points at us --- #
 
-def test_cleanup_pid_removes_own(tmp: Path):
+def test_cleanup_pid_removes_own_identity_metadata(tmp: Path):
     wl = _mk_worker(tmp)
     wl.pid.write_text(str(os.getpid()))
+    wl.process_identity.write_text('{"pid": "ours"}')
     loop._cleanup_pid(wl)
     assert not wl.pid.exists()
+    assert not wl.process_identity.exists()
 
 
-def test_cleanup_pid_keeps_foreign(tmp: Path):
+def test_cleanup_pid_keeps_foreign_identity_metadata(tmp: Path):
     wl = _mk_worker(tmp)
     wl.pid.write_text("999999999")            # some other pid
+    wl.process_identity.write_text('{"pid": "foreign"}')
     loop._cleanup_pid(wl)
     assert wl.pid.exists()                     # left intact
+    assert wl.process_identity.exists()
 
 
 def test_cleanup_pid_swallows_oserror(tmp: Path):
@@ -503,8 +507,8 @@ def main() -> None:
         test_main_sigterm_handler,
         test_write_status_corrupt_existing_recovers,
         test_parse_last_fact_id_missing_file,
-        test_cleanup_pid_removes_own,
-        test_cleanup_pid_keeps_foreign,
+        test_cleanup_pid_removes_own_identity_metadata,
+        test_cleanup_pid_keeps_foreign_identity_metadata,
         test_cleanup_pid_swallows_oserror,
         test_main_beat_sleep_between_rounds,
         test_kickoff_mentions_worker_and_project,

@@ -387,3 +387,22 @@ def test_main_agent_polling_recovers_inflight_turns_and_is_project_scoped():
         assert token in app
 
     assert 'notify(localMessage.error || "Main Agent 暂时不可用", "error");' in app
+
+
+def test_run_controls_record_intent_then_activate_main_agent_through_chat_flow():
+    app = _asset("app.js")
+
+    start_body = app.split("async function startRun()", 1)[1].split("async function stopRun()", 1)[0]
+    stop_body = app.split("async function stopRun()", 1)[1].split("async function handleUpload", 1)[0]
+
+    assert "/runs`" in start_body
+    assert "await sendMessageText(START_RUN_MESSAGE)" in start_body
+    assert start_body.index("/runs`") < start_body.index("await sendMessageText(START_RUN_MESSAGE)")
+    assert 'const START_RUN_MESSAGE = "' in app
+    assert "danus-web-agent start" in app
+
+    assert "/stop`" in stop_body
+    assert "await sendMessageText(STOP_RUN_MESSAGE)" in stop_body
+    assert stop_body.index("/stop`") < stop_body.index("await sendMessageText(STOP_RUN_MESSAGE)")
+    assert 'const STOP_RUN_MESSAGE = "' in app
+    assert "danus-web-agent stop" in app

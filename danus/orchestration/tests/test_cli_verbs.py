@@ -22,7 +22,10 @@ import tempfile
 from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 
+import pytest
+
 from danus.execution import layout as L
+from danus.execution import processes as P
 from danus.orchestration import cli
 
 
@@ -62,27 +65,69 @@ def _project_env(tmp: Path, **extra):
         yield
 
 
+class _FakeProcess:
+    def __init__(self, pid: int):
+        self.pid = pid
+
+
 class _FakeSpawn:
-    """Records (wdir) calls; returns our *own* pid so ``_alive`` reports True and
-    ``_start_one`` treats the worker as live — without launching anything."""
+    """Records calls and returns a harmless Popen-shaped test handle."""
 
     def __init__(self):
         self.calls = []
 
     def __call__(self, wdir):
         self.calls.append(Path(wdir))
-        return os.getpid()
+        return _FakeProcess(os.getpid())
 
 
 @contextmanager
 def _patch_spawn():
     fake = _FakeSpawn()
     orig = cli.spawn_loop
+    orig_capture = P.capture_worker_identity
     cli.spawn_loop = fake
+
+    def capture(wl, pid, **_kwargs):
+        return P.WorkerProcessIdentity(
+            pid=pid,
+            boot_id="test-boot",
+            start_time="test-start",
+            cmdline=P.expected_worker_cmdline(wl),
+        )
+
+    P.capture_worker_identity = capture
     try:
         yield fake
     finally:
         cli.spawn_loop = orig
+        P.capture_worker_identity = orig_capture
+
+
+@contextmanager
+def _verified_worker(wl: L.WorkerLayout, pid: int):
+    """Persist and mock one explicit identity for a harmless test process."""
+    record = P.DEFAULT_PROCFS.process_record(pid)
+    identity = P.WorkerProcessIdentity(
+        pid=pid,
+        boot_id=P.DEFAULT_PROCFS.boot_id(),
+        start_time=str(record["start_time"]),
+        cmdline=tuple(record["cmdline"]),
+    )
+    wl.pid.write_text(str(pid), encoding="utf-8")
+    wl.process_identity.write_text(json.dumps(identity.as_dict()), encoding="utf-8")
+    original_capture = P.capture_worker_identity
+
+    def capture(candidate_wl, candidate_pid, **kwargs):
+        if candidate_wl.dir == wl.dir and candidate_pid == pid:
+            return identity
+        return original_capture(candidate_wl, candidate_pid, **kwargs)
+
+    P.capture_worker_identity = capture
+    try:
+        yield identity
+    finally:
+        P.capture_worker_identity = original_capture
 
 
 def _wl(project: str, worker: str) -> L.WorkerLayout:
@@ -134,6 +179,7 @@ def test_stop_one_force_sigkill_fallback(tmp: Path):
     import subprocess
     import sys
     import time
+
     ready = tmp / "handler_ready"
     prog = (
         "import signal, time, sys\n"
@@ -145,7 +191,6 @@ def test_stop_one_force_sigkill_fallback(tmp: Path):
         cli.do_new("P", roles="high:1")
         wl = _wl("P", "high")
         proc = subprocess.Popen([sys.executable, "-c", prog], start_new_session=True)
-        wl.pid.write_text(str(proc.pid))
         try:
             # wait until the child has installed its SIGTERM-ignoring handler
             end = time.time() + 10
@@ -153,9 +198,10 @@ def test_stop_one_force_sigkill_fallback(tmp: Path):
                 time.sleep(0.02)
             assert ready.exists(), "child never signalled readiness"
             assert cli._alive(proc.pid) is True
-            t0 = time.time()
-            res = cli._stop_one(wl, force=True)       # SIGTERM ignored -> SIGKILL fallback
-            assert res == "killed"
+            with _verified_worker(wl, proc.pid):
+                t0 = time.time()
+                result = cli.do_stop("P/high", force=True)
+            assert result == [{"worker": "high", "result": "killed"}]
             assert time.time() - t0 >= 4.5, "should have waited the full SIGTERM grace"
             # confirm it's really gone
             end = time.time() + 5
@@ -163,6 +209,7 @@ def test_stop_one_force_sigkill_fallback(tmp: Path):
                 time.sleep(0.05)
             assert cli._alive(proc.pid) is False
             assert not wl.pid.exists()
+            assert not wl.process_identity.exists()
         finally:
             try:
                 proc.kill()
@@ -174,91 +221,13 @@ def test_stop_one_force_sigkill_fallback(tmp: Path):
                 pass
 
 
-def test_stop_one_force_sigkill_killpg_raises(tmp: Path):
-    """Defensive branch (cli.py 247-248): the final SIGKILL ``os.killpg`` itself
-    raises ProcessLookupError (the process died in the tiny window between the last
-    ``_alive`` check and the kill). It must be swallowed and still return 'killed'.
-    Fully stubbed — ``_alive`` is forced True through the wait loop, ``os.getpgid``
-    is a no-op, and ``os.killpg`` raises; no real process is touched."""
-    with _project_env(tmp):
-        cli.do_new("P", roles="high:1")
-        wl = _wl("P", "high")
-        wl.pid.write_text("2000000000")
-
-        real_alive = cli._alive
-        real_getpgid = cli.os.getpgid
-        real_killpg = cli.os.killpg
-        real_sleep = cli.time.sleep
-
-        cli._alive = lambda pid: True                 # always "alive" -> reaches SIGKILL
-        cli.os.getpgid = lambda pid: 12345
-        def boom_killpg(pgid, sig):
-            raise ProcessLookupError("gone before SIGKILL")
-        cli.os.killpg = boom_killpg
-        cli.time.sleep = lambda s: None               # don't actually wait ~5s
-        try:
-            assert cli._stop_one(wl, force=True) == "killed"
-            assert not wl.pid.exists()
-        finally:
-            cli._alive = real_alive
-            cli.os.getpgid = real_getpgid
-            cli.os.killpg = real_killpg
-            cli.time.sleep = real_sleep
-
-
 def test_alive_proc_read_failure_defaults_alive(tmp: Path):
-    """Race branch (cli.py 70-71): ``os.kill(pid,0)`` succeeds (pid exists) but the
-    ``/proc/<pid>/stat`` read fails (the process vanished between the two calls, or
-    /proc is unavailable). ``_alive`` conservatively returns True. We simulate the
-    race by patching ``cli.Path`` so the /proc read raises OSError, using our own
-    (definitely-live, non-zombie) pid so os.kill succeeds."""
-    real_Path = cli.Path
-
-    class _BoomPath:
-        def __init__(self, *a, **k):
-            pass
-        def read_text(self, *a, **k):
+    """A procfs read failure falls back conservatively after pid existence."""
+    class BrokenProcFS(P.LinuxProcFS):
+        def process_state(self, pid):
             raise OSError("simulated /proc read failure")
 
-    cli.Path = _BoomPath
-    try:
-        assert cli._alive(os.getpid()) is True        # kill ok, /proc read boom -> True
-    finally:
-        cli.Path = real_Path
-
-
-def test_stop_one_force_getpgid_raises(tmp: Path):
-    """Force path where ``os.getpgid`` raises (cli.py 238-239): the process is seen
-    alive by ``_alive`` but disappears before ``getpgid`` — the ProcessLookupError
-    is swallowed, then the wait loop finds it dead and returns 'killed'. We stub
-    ``cli.os.getpgid`` to raise and use a dead pid for the subsequent _alive checks
-    so the loop exits at once."""
-    import types
-    with _project_env(tmp):
-        cli.do_new("P", roles="high:1")
-        wl = _wl("P", "high")
-
-        real_getpgid = cli.os.getpgid
-        real_alive = cli._alive
-        # first _alive (guard) True, then getpgid raises, then loop sees dead
-        state = {"n": 0}
-
-        def fake_alive(pid):
-            state["n"] += 1
-            return state["n"] == 1                     # alive once (the guard), dead after
-
-        def boom_getpgid(pid):
-            raise ProcessLookupError("gone between alive and getpgid")
-
-        wl.pid.write_text("2000000000")
-        cli.os.getpgid = boom_getpgid
-        cli._alive = fake_alive
-        try:
-            assert cli._stop_one(wl, force=True) == "killed"
-            assert not wl.pid.exists()
-        finally:
-            cli.os.getpgid = real_getpgid
-            cli._alive = real_alive
+    assert P.process_alive(os.getpid(), procfs=BrokenProcFS(tmp / "missing-proc")) is True
 
 
 def test_read_status_missing_and_bad_json(tmp: Path):
@@ -323,12 +292,12 @@ def test_worker_status_stuck_label(tmp: Path):
     with _project_env(tmp, DANUS_ROUND_HARD_TIMEOUT="10"):
         cli.do_new("P", roles="high:1")
         wl = _wl("P", "high")
-        wl.pid.write_text(str(os.getpid()))          # our pid => alive
         old = 1.0                                     # epoch ~1970 => hugely stale
         wl.status.write_text(json.dumps(
             {"state": "running", "round": 5, "round_started_at": old,
              "last_round_at": old, "last_fact_id": "F9"}))
-        s = cli.worker_status(wl)
+        with _verified_worker(wl, os.getpid()):
+            s = cli.do_status("P/high")[0]
         assert s["alive"] is True and s["label"] == "stuck?"
         assert s["age_s"] is not None and s["last_fact_id"] == "F9"
 
@@ -337,14 +306,14 @@ def test_worker_status_working_and_dead_labels(tmp: Path):
     with _project_env(tmp):
         cli.do_new("P", roles="high:1")
         wl = _wl("P", "high")
-        # alive + running but fresh => 'working'
+        # identity-verified + retrying but fresh => 'working'
         import time
-        wl.pid.write_text(str(os.getpid()))
         wl.status.write_text(json.dumps(
             {"state": "retrying", "round": 2, "round_started_at": time.time(),
              "last_rc": 1, "last_error": "API rate limited (429)",
              "consecutive_failures": 2, "next_retry_at": time.time() + 30}))
-        working = cli.worker_status(wl)
+        with _verified_worker(wl, os.getpid()):
+            working = cli.do_status("P/high")[0]
         assert working["label"] == "working"
         assert working["age_s"] is not None and working["age_s"] < 2
         assert working["last_rc"] == 1
@@ -414,6 +383,86 @@ def test_do_start_clears_stale_stop(tmp: Path):
         assert not wl.stop.exists()                   # stale stop cleared
 
 
+def test_start_replaces_live_unrelated_pid_instead_of_skipping_worker(tmp: Path):
+    """A reused numeric PID is never sufficient proof that this Worker is alive."""
+    with _project_env(tmp), _patch_spawn() as fake:
+        cli.do_new("P", roles="high:1")
+        wl = _wl("P", "high")
+        wl.pid.write_text(str(os.getpid()), encoding="utf-8")
+
+        captured = P.WorkerProcessIdentity(
+            pid=os.getpid(),
+            boot_id="boot-A",
+            start_time="123",
+            cmdline=P.expected_worker_cmdline(wl),
+        )
+        calls = 0
+
+        def capture(_wl, _pid, **_kwargs):
+            nonlocal calls
+            calls += 1
+            # The first capture inspects the unrelated process referenced by the
+            # stale PID. The second captures the process returned by spawn_loop.
+            return None if calls == 1 else captured
+
+        previous_capture = P.capture_worker_identity
+        P.capture_worker_identity = capture
+        try:
+            assert cli.do_start("P/high") == [{"worker": "high", "result": "started"}]
+            assert fake.calls == [wl.dir]
+            assert json.loads((wl.dir / ".process.json").read_text()) == captured.as_dict()
+        finally:
+            P.capture_worker_identity = previous_capture
+
+
+def test_start_identity_failure_terminates_reaps_and_verifies_spawned_group(tmp: Path):
+    """A failed post-spawn identity check must not orphan the new Worker group."""
+    import subprocess
+    import sys
+    import time
+    from danus.execution import processes
+
+    descendant_file = tmp / "descendant.pid"
+    program = (
+        "import subprocess, sys, time\n"
+        "child = subprocess.Popen(['sleep', '120'])\n"
+        f"open({str(descendant_file)!r}, 'w').write(str(child.pid))\n"
+        "time.sleep(120)\n"
+    )
+    spawned = []
+
+    def spawn(_worker_dir):
+        process = subprocess.Popen(
+            [sys.executable, "-c", program], start_new_session=True,
+        )
+        spawned.append(process)
+        deadline = time.time() + 5
+        while time.time() < deadline and not descendant_file.exists():
+            time.sleep(0.01)
+        assert descendant_file.exists()
+        return process
+
+    with _project_env(tmp):
+        cli.do_new("P", roles="high:1")
+        wl = _wl("P", "high")
+        original_spawn = cli.spawn_loop
+        original_capture = processes.capture_worker_identity
+        cli.spawn_loop = spawn
+        processes.capture_worker_identity = lambda *_args, **_kwargs: None
+        try:
+            assert cli._start_one(wl) == "start-failed"
+        finally:
+            cli.spawn_loop = original_spawn
+            processes.capture_worker_identity = original_capture
+
+        process = spawned[0]
+        descendant_pid = int(descendant_file.read_text(encoding="utf-8"))
+        assert process.poll() is not None
+        assert processes.process_alive(descendant_pid) is False
+        assert not wl.pid.exists()
+        assert not wl.process_identity.exists()
+
+
 def test_do_start_no_workers_raises(tmp: Path):
     with _project_env(tmp), _patch_spawn():
         e = _expect_exit(cli.do_start, "ghost")
@@ -459,34 +508,86 @@ def test_stop_one_not_running_force_cleans_pid(tmp: Path):
         cli.do_new("P", roles="high:1")
         wl = _wl("P", "high")
         wl.pid.write_text("2000000000")               # dead pid
-        assert cli._stop_one(wl, force=True) == "not-running"
-        assert not wl.pid.exists()                     # stale pid removed
+        wl.process_identity.write_text('{"pid": 2000000000}')
+        assert cli.do_stop("P/high", force=True) == [
+            {"worker": "high", "result": "not-running"}
+        ]
+        assert not wl.pid.exists()                     # stale metadata removed
+        assert not wl.process_identity.exists()
 
 
 def test_stop_one_graceful_touches_stop(tmp: Path):
     with _project_env(tmp):
         cli.do_new("P", roles="high:1")
         wl = _wl("P", "high")
-        wl.pid.write_text(str(os.getpid()))            # alive (our pid)
-        assert cli._stop_one(wl, force=False) == "stopping (graceful)"
+        with _verified_worker(wl, os.getpid()):
+            assert cli.do_stop("P/high", force=False) == [
+                {"worker": "high", "result": "stopping (graceful)"}
+            ]
         assert wl.stop.exists()
         wl.stop.unlink()                               # don't leave a stop flag on us
 
 
 def test_stop_one_force_kills_a_real_child(tmp: Path):
-    """Spawn a genuine harmless child (sleep), record its pid, force-stop it, and
-    assert it's reaped as 'killed'. This is a real process we own — safe to kill,
-    never a codex/worker (which the RULES forbid launching)."""
+    """The public force-stop command may kill an explicitly verified harmless child."""
     import subprocess
     with _project_env(tmp):
         cli.do_new("P", roles="high:1")
         wl = _wl("P", "high")
         proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
-        wl.pid.write_text(str(proc.pid))
         try:
-            assert cli._stop_one(wl, force=True) == "killed"
+            with _verified_worker(wl, proc.pid):
+                rc, out = _run_main(["stop", "P/high", "--force"])
+            assert rc == 0 and "high: killed" in out
             assert not wl.pid.exists()
+            assert not wl.process_identity.exists()
         finally:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+
+
+def test_main_force_stop_refuses_live_unrelated_pid_without_signal(tmp: Path):
+    """A stale PID collision is cleared without signalling the unrelated process."""
+    import subprocess
+    with _project_env(tmp):
+        cli.do_new("P", roles="high:1")
+        wl = _wl("P", "high")
+        proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        wl.pid.write_text(str(proc.pid), encoding="utf-8")
+        wl.process_identity.write_text(json.dumps({
+            "pid": proc.pid,
+            "boot_id": "stale-boot",
+            "start_time": "stale-start",
+            "cmdline": cli._expected_worker_cmdline(wl),
+        }), encoding="utf-8")
+        wl.status.write_text(json.dumps({"state": "retrying", "round": 3}), encoding="utf-8")
+
+        status = cli.do_status("P/high")[0]
+        assert status["alive"] is False
+        assert status["identity_verified"] is False
+        assert status["persisted_state"] == "retrying"
+        assert status["state"] == "stale" and status["label"] == "dead"
+
+        original_killpg = cli.os.killpg
+        signals = []
+        cli.os.killpg = lambda pgid, sig: signals.append((pgid, sig))
+        try:
+            rc, out = _run_main(["stop", "P/high", "--force"])
+            assert rc == 0 and "high: identity-mismatch" in out
+            assert signals == []
+            assert proc.poll() is None
+            assert cli._alive(proc.pid) is True
+            assert wl.pid.exists()
+            assert wl.process_identity.exists()
+            assert not wl.stop.exists()
+        finally:
+            cli.os.killpg = original_killpg
             try:
                 proc.kill()
             except OSError:
@@ -785,7 +886,9 @@ def main() -> None:
         test_do_start_project_wide_stagger, test_do_status_no_workers_raises,
         test_do_stop_no_workers_raises, test_stop_one_not_running_graceful,
         test_stop_one_not_running_force_cleans_pid, test_stop_one_graceful_touches_stop,
-        test_stop_one_force_kills_a_real_child, test_do_list_bad_project_json,
+        test_stop_one_force_kills_a_real_child,
+        test_main_force_stop_refuses_live_unrelated_pid_without_signal,
+        test_do_list_bad_project_json,
         test_do_list_missing_project_json, test_task_from_args_file,
         test_finalize_validates_and_writes, test_finalize_dedups_preserving_order,
         test_finalize_rejects_unknown_fact_id, test_finalize_rejects_unknown_project,
@@ -806,3 +909,19 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def test_web_main_agent_environment_cannot_call_raw_lifecycle_apis(tmp: Path, monkeypatch):
+    with _project_env(tmp):
+        cli.do_new("P", roles="high:1")
+        wl = _wl("P", "high")
+        monkeypatch.setenv("DANUS_ROLE", "main")
+        monkeypatch.setenv("DANUS_WEB_LIFECYCLE_URL", "http://127.0.0.1/lifecycle")
+        with pytest.raises(SystemExit, match="DANUS_WEB_AGENT_BIN"):
+            cli.do_start("P")
+        with pytest.raises(SystemExit, match="DANUS_WEB_AGENT_BIN"):
+            cli._start_one(wl)
+        with pytest.raises(SystemExit, match="DANUS_WEB_AGENT_BIN"):
+            cli.do_stop("P")
+        with pytest.raises(SystemExit, match="DANUS_WEB_AGENT_BIN"):
+            cli._stop_one(wl, False)

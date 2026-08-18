@@ -75,7 +75,9 @@ class ConsoleStore:
                 CREATE TABLE IF NOT EXISTS runs (
                     id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
                     duration_seconds INTEGER NOT NULL, started_at REAL NOT NULL, deadline REAL NOT NULL,
-                    status TEXT NOT NULL, stopped_at REAL, outcome TEXT
+                    status TEXT NOT NULL, stopped_at REAL, outcome TEXT,
+                    start_attempt_generation INTEGER NOT NULL DEFAULT 0,
+                    start_attempt_outcome TEXT
                 );
                 CREATE TABLE IF NOT EXISTS login_attempts (
                     key TEXT PRIMARY KEY, failures INTEGER NOT NULL, locked_until REAL NOT NULL
@@ -101,6 +103,13 @@ class ConsoleStore:
                 conn.execute("ALTER TABLE projects ADD COLUMN worker_model TEXT")
             if "max_parallel_workers" not in project_columns:
                 conn.execute("ALTER TABLE projects ADD COLUMN max_parallel_workers INTEGER NOT NULL DEFAULT 1")
+            run_columns = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+            if "start_attempt_generation" not in run_columns:
+                conn.execute(
+                    "ALTER TABLE runs ADD COLUMN start_attempt_generation INTEGER NOT NULL DEFAULT 0"
+                )
+            if "start_attempt_outcome" not in run_columns:
+                conn.execute("ALTER TABLE runs ADD COLUMN start_attempt_outcome TEXT")
 
     @staticmethod
     def _dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -317,6 +326,39 @@ class ConsoleStore:
                 "INSERT INTO runs(id,project_id,duration_seconds,started_at,deadline,status,stopped_at,outcome) VALUES(?,?,?,?,?,?,NULL,NULL)",
                 tuple(run[k] for k in ("id", "project_id", "duration_seconds", "started_at", "deadline", "status")),
             )
+
+    def begin_start_attempt(self, run_id: str) -> int | None:
+        """Atomically mark a Main Agent broker start attempt and return its generation."""
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE runs SET start_attempt_generation=start_attempt_generation+1, "
+                "start_attempt_outcome='attempting' WHERE id=? AND status='starting'",
+                (run_id,),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = conn.execute(
+                "SELECT start_attempt_generation FROM runs WHERE id=?", (run_id,)
+            ).fetchone()
+            return int(row["start_attempt_generation"]) if row is not None else None
+
+    def complete_start_attempt(
+        self,
+        run_id: str,
+        generation: int,
+        *,
+        attempt_outcome: str,
+        status: str,
+        outcome: str,
+    ) -> bool:
+        """Persist one broker attempt result without overwriting a newer generation."""
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE runs SET start_attempt_outcome=?,status=?,outcome=? "
+                "WHERE id=? AND start_attempt_generation=?",
+                (attempt_outcome, status, outcome, run_id, int(generation)),
+            )
+            return cursor.rowcount == 1
 
     def active_run(self, project_id: str) -> dict[str, Any] | None:
         with self._lock, self._connect() as conn:
