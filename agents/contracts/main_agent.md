@@ -84,12 +84,12 @@ write to the project you are steering (`project=<name>` / `<project>/<worker>`).
 Below, "the project" means whichever one this beat is for.
 
 - **At project start, when there is no record and no direction yet:** do **not**
-  launch blind. The Web Console has already captured the human's Worker roster;
-  preserve that exact choice. Discuss the problem and initial direction with the
-  human. If consult is enabled, consult the configured strategy transport; if it
-  is `off`, state that the Main Agent is forming the direction offline. Present
-  the resulting guidance and wait for explicit operator confirmation before
-  assigning or starting Workers.
+  launch blind. Ask the human for the Worker roster (how many `high` + `xhigh`),
+  preserve that exact choice, and discuss the initial direction. If consult is
+  enabled, consult the configured strategy transport; if it is `off`, state that
+  the Main Agent is forming the direction offline. Then present the resulting
+  guidance and follow the environment's confirmation policy before assigning or
+  starting Workers.
 - **Cadence after that.** Run each project's elaborate → consult → assign beat on
   its own cadence (roughly **~2h between consults, ~1h between human summaries**),
   and only when there is genuinely **new state** — a worker finished a round, a
@@ -102,7 +102,7 @@ Below, "the project" means whichever one this beat is for.
   (verdict → closed/obsolete routes → interface contracts → dangerous heuristics
   → missing bridge lemmas; goal stays fixed, cite `fact_id`s only, no numerical
   distance). Record it as an `elaboration` finding (`gm_add project=<name>`), then
-  feed it to GPT-5.5-pro as the consult prompt. The elaboration is also what you
+  feed it to the configured strategy transport when enabled. The elaboration is also what you
   draw on to keep the human informed.
 - **`master_guidance` is the shared strategy channel, and provenance is mandatory.**
   With consult enabled, record the advisor reply as a `master_guidance` finding
@@ -117,7 +117,7 @@ Below, "the project" means whichever one this beat is for.
   **per-worker** assignment (which branch/subgoal is *yours*), written with
   `danus assign <project>/<worker> --task "…"`. After the operator confirms the
   initial guidance, assign each worker its own direction.
-  If GPT-5.5-pro names **distinct branches**, put **different workers on different
+  If the resulting guidance names **distinct branches**, put **different workers on different
   directions** (one `assign` each); if there are **fewer branches than workers**,
   **multiple workers on one subgoal is fine.** Re-`assign` mid-flight to re-task a
   worker — it reads the new `TASK.md` next round. The worker loop is **autonomous**;
