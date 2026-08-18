@@ -695,3 +695,46 @@ def test_worker_tool_summary_is_one_line_and_contains_no_command_or_path_detail(
     assert rendered == "工具活动 · 命令 × 2 · MCP · 1 个失败"
     assert "/tmp/" not in rendered
     assert "cat" not in rendered
+
+
+def test_operator_can_select_preview_and_submit_a_non_default_run_budget():
+    app = _asset("app.js")
+    css = _asset("style.css")
+
+    for token in (
+        "DEFAULT_RUN_BUDGET_SECONDS = 12 * 3600",
+        "const maxSeconds = 7 * 24 * 3600",
+        "function runBudgetSelection",
+        "function renderRunBudget",
+        "function formatDeadline",
+        'id="run-budget-preset"',
+        'value="43200" selected',
+        'id="run-budget-custom-hours"',
+        'id="run-budget-preview"',
+        "预计截止",
+        "已选择",
+        "duration_seconds: budget.seconds",
+    ):
+        assert token in app
+    assert "duration_seconds: 3600" not in app
+    assert ".run-budget-control" in css
+    assert ".run-budget-preview.error" in css
+    assert ".run-budget-control, .lifecycle-controls { grid-template-columns: 1fr" in css
+
+
+def test_custom_run_budget_validation_is_bounded_and_supports_twelve_hours():
+    app = _asset("app.js")
+    function = _javascript_function(app, "runBudgetSelection")
+    cases = [
+        ["43200", "", {"valid": True, "seconds": 43200, "error": ""}],
+        ["custom", "12.5", {"valid": True, "seconds": 45000, "error": ""}],
+        ["custom", "0", {"valid": False, "seconds": None, "error": "Run Budget 必须在 1 分钟到 7 天之间"}],
+        ["custom", "169", {"valid": False, "seconds": None, "error": "Run Budget 必须在 1 分钟到 7 天之间"}],
+    ]
+    script = function + f"\nconsole.log(JSON.stringify({json.dumps(cases[:-2])}.map(([preset, hours]) => runBudgetSelection(preset, hours))));"
+    valid_result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+    assert json.loads(valid_result.stdout) == [case[2] for case in cases[:-2]]
+
+    invalid_script = function + f"\nconsole.log(JSON.stringify({json.dumps(cases[-2:])}.map(([preset, hours]) => runBudgetSelection(preset, hours))));"
+    invalid_result = subprocess.run(["node", "-e", invalid_script], check=True, capture_output=True, text=True)
+    assert json.loads(invalid_result.stdout) == [case[2] for case in cases[-2:]]

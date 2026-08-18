@@ -31,13 +31,18 @@ A file being present does not mean it was read. The UI should show read status o
 
 ## 4. Start a bounded Run
 
-Set the duration in seconds. For a one-hour experiment use:
+Choose a wall-clock **Run Budget** before starting. The console provides 1-hour,
+6-hour, 12-hour, and 24-hour presets plus a bounded custom-hours field. Twelve
+hours is the default documented research budget. The preview shows the selected
+duration and the estimated local deadline before start; invalid or greater-than-
+7-day custom values are rejected.
 
-```text
-3600
-```
-
-Click **Start Run**. The console converts that duration into an absolute Project Run Deadline. It starts only that Project's Workers. Use **Graceful Stop** to request a round-boundary shutdown; restarting later resumes persisted state.
+Click **Start Run**. The server persists the chosen duration and converts it into
+an authoritative absolute Project Run Deadline. While the Run is active, the
+budget control becomes read-only and displays the persisted duration and deadline.
+Pause requests finish the current Worker round; emergency force-stop remains an
+explicitly confirmed safety action. Restarting later preserves Project research
+state rather than silently extending the previous deadline.
 
 ## 5. Talk to the Main Agent
 
