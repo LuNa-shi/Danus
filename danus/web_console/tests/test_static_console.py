@@ -695,3 +695,99 @@ def test_worker_tool_summary_is_one_line_and_contains_no_command_or_path_detail(
     assert rendered == "工具活动 · 命令 × 2 · MCP · 1 个失败"
     assert "/tmp/" not in rendered
     assert "cat" not in rendered
+
+
+def test_operator_can_select_preview_and_submit_a_non_default_run_budget():
+    app = _asset("app.js")
+    css = _asset("style.css")
+
+    for token in (
+        "DEFAULT_RUN_BUDGET_SECONDS = 12 * 3600",
+        "const maxSeconds = 7 * 24 * 3600",
+        "function runBudgetSelection",
+        "function renderRunBudget",
+        "function formatDeadline",
+        'id="run-budget-preset"',
+        'value="43200" selected',
+        'id="run-budget-custom-hours"',
+        'id="run-budget-preview"',
+        "预计截止",
+        "已选择",
+        "activeRun.duration_seconds",
+        "[...preset.options].some",
+        "duration_seconds: budget.seconds",
+    ):
+        assert token in app
+    assert "duration_seconds: 3600" not in app
+    assert ".run-budget-control" in css
+    assert "grid-template-columns: minmax(130px, .55fr) minmax(0, 1.2fr) minmax(180px, 1fr)" in css
+    assert ".run-budget-preview.error" in css
+    assert "@media (max-width: 1100px)" in css
+    assert ".run-budget-control { grid-template-columns: 1fr; gap: 8px; }" in css
+    assert ".run-budget-control, .lifecycle-controls { grid-template-columns: 1fr" in css
+
+
+def test_custom_run_budget_validation_is_bounded_and_supports_twelve_hours():
+    app = _asset("app.js")
+    function = _javascript_function(app, "runBudgetSelection")
+    cases = [
+        ["43200", "", {"valid": True, "seconds": 43200, "error": ""}],
+        ["custom", "12.5", {"valid": True, "seconds": 45000, "error": ""}],
+        ["custom", "0", {"valid": False, "seconds": None, "error": "Run Budget 必须在 1 分钟到 7 天之间"}],
+        ["custom", "169", {"valid": False, "seconds": None, "error": "Run Budget 必须在 1 分钟到 7 天之间"}],
+    ]
+    script = function + f"\nconsole.log(JSON.stringify({json.dumps(cases[:-2])}.map(([preset, hours]) => runBudgetSelection(preset, hours))));"
+    valid_result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+    assert json.loads(valid_result.stdout) == [case[2] for case in cases[:-2]]
+
+    invalid_script = function + f"\nconsole.log(JSON.stringify({json.dumps(cases[-2:])}.map(([preset, hours]) => runBudgetSelection(preset, hours))));"
+    invalid_result = subprocess.run(["node", "-e", invalid_script], check=True, capture_output=True, text=True)
+    assert json.loads(invalid_result.stdout) == [case[2] for case in cases[-2:]]
+
+
+def test_runtime_poll_failure_preserves_last_good_run_budget_and_disables_start():
+    app = _asset("app.js")
+    css = _asset("style.css")
+
+    assert "runtimeError: null" in app
+    assert 'if (results[5].status === "fulfilled")' in app
+    assert "state.runtimeError = results[5].reason" in app
+    assert "state.runtime = value(results[5], {})" not in app
+    assert 'if (runtimeResult.status === "fulfilled")' in app
+    assert "state.runtimeError = runtimeResult.reason" in app
+    assert "显示上次成功获取的 Run Budget 与 Deadline" in app
+    assert "Boolean(state.runtimeError)" in app
+    assert ".run-budget-preview.stale" in css
+
+
+def test_active_run_budget_controls_use_persisted_server_values_after_reload():
+    app = _asset("app.js")
+    functions = "\n".join((
+        _javascript_function(app, "runBudgetSelection"),
+        _javascript_function(app, "formatRunBudget"),
+        _javascript_function(app, "formatDeadline"),
+        _javascript_function(app, "currentRunBudgetSelection"),
+        _javascript_function(app, "renderRunBudget"),
+    ))
+    script = f"""
+const elements = {{
+  'run-budget-preset': {{value: '43200', disabled: false, options: [{{value:'3600'}},{{value:'21600'}},{{value:'43200'}},{{value:'86400'}},{{value:'custom'}}]}},
+  'run-budget-custom-hours': {{value: '', hidden: true, disabled: false}},
+  'run-budget-custom-wrap': {{hidden: true}},
+  'run-budget-preview': {{className: '', textContent: ''}},
+}};
+const $ = (id) => elements[id];
+const state = {{runtime: {{run: {{duration_seconds: 21600, started_at: 100, deadline: 21700}}}}, runtimeError: {{message: 'temporary'}}}};
+{functions}
+renderRunBudget();
+console.log(JSON.stringify(elements));
+"""
+    result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+    elements = json.loads(result.stdout)
+
+    assert elements["run-budget-preset"]["value"] == "21600"
+    assert elements["run-budget-preset"]["disabled"] is True
+    assert elements["run-budget-custom-wrap"]["hidden"] is True
+    assert "已选择 6 小时" in elements["run-budget-preview"]["textContent"]
+    assert "显示上次成功获取的 Run Budget 与 Deadline" in elements["run-budget-preview"]["textContent"]
+    assert "stale" in elements["run-budget-preview"]["className"]

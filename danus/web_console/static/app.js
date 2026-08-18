@@ -26,6 +26,7 @@ const state = {
   reports: { files: [] },
   outputs: { files: [] },
   runtime: {},
+  runtimeError: null,
   config: {},
   orchestration: {},
   activeWorker: null,
@@ -41,10 +42,88 @@ const state = {
   pendingRefreshingProject: null,
   reclaimPlan: null,
   reclaimTarget: "",
+  runBudgetByProject: {},
 };
 
 const START_RUN_MESSAGE = "The operator requested starting the current bounded Project Run. Inspect the current Project state, then use `danus-web-agent start` to activate the assigned Worker swarm through the authenticated lifecycle broker. Report the broker result.";
 const STOP_RUN_MESSAGE = "The operator requested a graceful stop for the current Project Run. Use `danus-web-agent stop` now so the authenticated lifecycle broker performs the stop, then report the result.";
+const DEFAULT_RUN_BUDGET_SECONDS = 12 * 3600;
+
+function runBudgetSelection(presetValue, customHoursValue) {
+  const minSeconds = 60;
+  const maxSeconds = 7 * 24 * 3600;
+  const seconds = presetValue === "custom"
+    ? Math.round(Number(customHoursValue) * 3600)
+    : Number(presetValue);
+  if (!Number.isFinite(seconds) || seconds < minSeconds || seconds > maxSeconds) {
+    return { valid: false, seconds: null, error: "Run Budget 必须在 1 分钟到 7 天之间" };
+  }
+  return { valid: true, seconds, error: "" };
+}
+
+function formatRunBudget(seconds) {
+  const value = Number(seconds || 0);
+  if (!value) return "—";
+  if (value % 86400 === 0) return `${value / 86400} 天`;
+  if (value % 3600 === 0) return `${value / 3600} 小时`;
+  if (value % 60 === 0 && value < 3600) return `${value / 60} 分钟`;
+  return `${Number((value / 3600).toFixed(2))} 小时`;
+}
+
+function currentRunBudgetSelection() {
+  return runBudgetSelection($("run-budget-preset")?.value || String(DEFAULT_RUN_BUDGET_SECONDS), $("run-budget-custom-hours")?.value || "");
+}
+
+function rememberRunBudget(projectId = state.current) {
+  if (!projectId) return;
+  state.runBudgetByProject[projectId] = {
+    preset: $("run-budget-preset")?.value || String(DEFAULT_RUN_BUDGET_SECONDS),
+    customHours: $("run-budget-custom-hours")?.value || "",
+  };
+}
+
+function restoreRunBudgetControls(projectId) {
+  const preset = $("run-budget-preset");
+  const custom = $("run-budget-custom-hours");
+  if (!preset || !custom) return;
+  const remembered = state.runBudgetByProject[projectId] || {};
+  preset.value = remembered.preset || String(DEFAULT_RUN_BUDGET_SECONDS);
+  custom.value = remembered.customHours || "";
+  renderRunBudget();
+}
+
+function renderRunBudget() {
+  const preset = $("run-budget-preset");
+  const custom = $("run-budget-custom-hours");
+  const customWrap = $("run-budget-custom-wrap");
+  const preview = $("run-budget-preview");
+  if (!preset || !custom || !customWrap || !preview) return;
+  const activeRun = state.runtime.run;
+  preset.disabled = Boolean(activeRun);
+  custom.disabled = Boolean(activeRun);
+  if (activeRun) {
+    const duration = Number(activeRun.duration_seconds || Math.max(0, Number(activeRun.deadline || 0) - Number(activeRun.started_at || 0)));
+    const presetValue = String(duration);
+    const hasPreset = [...preset.options].some((option) => option.value === presetValue);
+    preset.value = hasPreset ? presetValue : "custom";
+    custom.value = hasPreset ? "" : String(Number((duration / 3600).toFixed(4)));
+    custom.hidden = hasPreset;
+    customWrap.hidden = hasPreset;
+    preview.className = `run-budget-preview active${state.runtimeError ? " stale" : ""}`;
+    preview.textContent = `已选择 ${formatRunBudget(duration)} · 截止 ${formatDeadline(activeRun.deadline)}${state.runtimeError ? " · 状态刷新失败，显示上次成功获取的 Run Budget 与 Deadline" : ""}`;
+    return;
+  }
+  custom.hidden = preset.value !== "custom";
+  customWrap.hidden = preset.value !== "custom";
+  const budget = currentRunBudgetSelection();
+  if (!budget.valid) {
+    preview.className = "run-budget-preview error";
+    preview.textContent = budget.error;
+    return;
+  }
+  preview.className = `run-budget-preview${state.runtimeError ? " stale" : ""}`;
+  preview.textContent = `${formatRunBudget(budget.seconds)} · 如果现在启动，预计截止 ${formatDeadline(Date.now() / 1000 + budget.seconds)}${state.runtimeError ? " · 运行状态暂不可用" : ""}`;
+}
 
 function lifecycleIntentMessage(action, worker) {
   const target = worker ? ` Worker ${worker}` : " all Workers";
@@ -234,6 +313,14 @@ function bindRailResizer(id, kind) {
 function formatTime(timestamp) {
   if (!timestamp) return "刚刚";
   return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit" }).format(new Date(Number(timestamp) * 1000));
+}
+
+function formatDeadline(timestamp) {
+  if (!timestamp) return "—";
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", timeZoneName: "short",
+  }).format(new Date(Number(timestamp) * 1000));
 }
 
 function formatBytes(bytes) {
@@ -912,6 +999,11 @@ function renderProjectShell(project) {
         <div class="project-header-copy"><p class="eyebrow">PROJECT / ${esc(project.name)}</p><div class="project-title-row"><h1>${esc(project.name)}</h1><span id="main-status" class="status-pill idle"><i></i>Main Agent 待命</span></div><p class="project-problem">${esc(project.problem || "还没有描述问题")}</p><div class="project-config-chips"><span>Worker · ${esc(model)}</span><span>并发 · ${esc(capacity)}</span></div></div>
         <div class="project-header-actions"><button id="workers-logs-open" class="secondary-button workers-logs-button" type="button" aria-expanded="false" aria-controls="worker-rail"><span aria-hidden="true">☷</span>Workers / Logs</button><button id="run-start" class="secondary-button"><span class="button-dot"></span>启动 workers</button><button id="delete-project" class="quiet-button danger-text">删除</button></div>
       </header>
+      <section class="run-budget-control" aria-label="Project Run Budget">
+        <div class="run-budget-copy"><strong>Run Budget</strong><small>为本次 Project Run 选择真实的墙钟时间上限</small></div>
+        <div class="run-budget-fields"><select id="run-budget-preset" aria-label="Run Budget preset"><option value="3600">1 小时</option><option value="21600">6 小时</option><option value="43200" selected>12 小时</option><option value="86400">24 小时</option><option value="custom">自定义</option></select><label id="run-budget-custom-wrap" hidden><input id="run-budget-custom-hours" type="number" min="0.0167" max="168" step="0.25" inputmode="decimal" placeholder="小时，例如 18" hidden><span>小时</span></label></div>
+        <div id="run-budget-preview" class="run-budget-preview" role="status"></div>
+      </section>
       <section class="lifecycle-controls" aria-label="Worker controls">
         <div class="lifecycle-copy"><strong>Worker controls</strong><small>当前项目的全部 Workers</small></div>
         <div class="lifecycle-actions"><button id="run-pause" class="control-button" type="button">本轮后暂停</button><button id="run-resume" class="control-button" type="button">继续运行</button><button id="run-force-stop" class="control-button danger" type="button">立即强制停止</button></div>
@@ -930,6 +1022,7 @@ function renderProjectShell(project) {
     <aside id="worker-drawer" class="worker-drawer" hidden aria-label="Worker details"></aside>
   </div>`;
   bindProjectControls();
+  restoreRunBudgetControls(project.id);
   bindRailResizer("worker-rail-resizer", "worker");
 }
 
@@ -953,6 +1046,13 @@ function bindProjectControls() {
       $("chat-form").requestSubmit();
     }
   });
+  const updateBudget = () => {
+    rememberRunBudget();
+    renderRunBudget();
+    updateRuntime();
+  };
+  $("run-budget-preset").addEventListener("change", updateBudget);
+  $("run-budget-custom-hours").addEventListener("input", updateBudget);
   $("workers").addEventListener("click", (event) => {
     const card = event.target.closest("[data-worker]");
     if (card) openWorkerDrawer(card.dataset.worker);
@@ -988,6 +1088,10 @@ async function openProject(id) {
   state.selectedFactId = null;
   state.current = id;
   state.activeWorker = null;
+  state.workers = [];
+  state.runtime = {};
+  state.runtimeError = null;
+  state.orchestration = {};
   state.logs = [];
   state.logMetaByWorker = {};
   state.logErrorsByWorker = {};
@@ -1960,24 +2064,28 @@ function updateRuntime() {
   const progressText = stopping
     ? gracefulStopProgressText(progress)
     : activeRun
-      ? `Run ${activeRun.status} · ${progress.live_workers}/${progress.expected_workers} identity-matched live · 截止 ${formatTime(activeRun.deadline)}`
+      ? `Run ${activeRun.status} · Budget ${formatRunBudget(activeRun.duration_seconds)} · ${progress.live_workers}/${progress.expected_workers} identity-matched live · 截止 ${formatDeadline(activeRun.deadline)}`
       : live
         ? `${live} 个 identity-matched Worker 在线`
         : ready ? `已完成 ${assigned}/${total} 分工` : `等待 Main Agent 分工 · ${assigned}/${total}`;
   const runState = $("run-state");
   if (runState) runState.textContent = progressText;
   const detail = $("run-progress-detail");
-  if (detail) detail.textContent = activeRun
-    ? `${progress.stop_pending_workers} stop pending · ${progress.stopped_workers} stopped · ${progress.stale_workers} stale`
-    : "主 agent 负责正常方向与分工；此处仅显示 host-observed lifecycle state。";
+  if (detail) detail.textContent = state.runtimeError
+    ? "运行状态刷新失败；显示上次成功获取的 Run Budget 与 Deadline。"
+    : activeRun
+      ? `${progress.stop_pending_workers} stop pending · ${progress.stopped_workers} stopped · ${progress.stale_workers} stale`
+      : "主 agent 负责正常方向与分工；此处仅显示 host-observed lifecycle state。";
   const bar = $("run-progress-bar");
   if (bar) bar.style.width = `${progress.expected_workers ? Math.min(100, Math.round((progress.stopped_workers / progress.expected_workers) * 100)) : 0}%`;
   const start = $("run-start");
   const mainAgentBusy = Boolean(currentPendingMessage());
+  const budget = currentRunBudgetSelection();
   if (start) {
-    start.disabled = Boolean(activeRun || live || !ready || mainAgentBusy);
-    start.title = mainAgentBusy ? "等待当前 Main Agent 回复完成" : ready ? "启动已完成 Main Agent 分工的 Worker swarm" : "先让 Main Agent 完成所有 Worker 的 TASK.md 分工";
+    start.disabled = Boolean(activeRun || live || !ready || mainAgentBusy || !budget.valid || Boolean(state.runtimeError));
+    start.title = state.runtimeError ? "运行状态暂不可用；保留上次 Run Budget 与 Deadline 并禁止重复启动" : !budget.valid ? budget.error : mainAgentBusy ? "等待当前 Main Agent 回复完成" : ready ? `以 ${formatRunBudget(budget.seconds)} Run Budget 启动 Worker swarm` : "先让 Main Agent 完成所有 Worker 的 TASK.md 分工";
   }
+  renderRunBudget();
   renderLifecycleControls();
 }
 
@@ -2021,7 +2129,12 @@ async function refreshPendingMessages() {
       const projection = workersResult.value;
       state.workers = Array.isArray(projection) ? projection : (projection.workers || []);
     }
-    if (runtimeResult.status === "fulfilled") state.runtime = runtimeResult.value;
+    if (runtimeResult.status === "fulfilled") {
+      state.runtime = runtimeResult.value;
+      state.runtimeError = null;
+    } else {
+      state.runtimeError = runtimeResult.reason;
+    }
     if (orchestrationResult.status === "fulfilled") state.orchestration = orchestrationResult.value;
     if (logsResult.status === "fulfilled" && logsResult.value && logWorkerAtStart) {
       applyLogProjection(logsResult.value, logWorkerAtStart);
@@ -2079,7 +2192,12 @@ async function refreshProject() {
     state.workers = Array.isArray(workersResult) ? workersResult : (workersResult.workers || []);
     state.facts = value(results[3], { nodes: [], edges: [] });
     state.memory = value(results[4], { total: 0, channels: [] });
-    state.runtime = value(results[5], {});
+    if (results[5].status === "fulfilled") {
+      state.runtime = results[5].value;
+      state.runtimeError = null;
+    } else {
+      state.runtimeError = results[5].reason;
+    }
     if (logWorkerAtStart && results[6].status === "fulfilled") {
       applyLogProjection(results[6].value, logWorkerAtStart);
     } else if (logWorkerAtStart) {
@@ -2162,11 +2280,18 @@ async function sendMessageText(text, attachmentId = "") {
 
 async function startRun() {
   if (!state.current || currentPendingMessage()) return;
+  const budget = currentRunBudgetSelection();
+  if (!budget.valid) {
+    renderRunBudget();
+    notify(budget.error, "error");
+    return;
+  }
+  rememberRunBudget();
   const projectAtStart = state.current;
   try {
-    const intent = await api(`/api/projects/${projectAtStart}/runs`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ duration_seconds: 3600 }) });
+    const intent = await api(`/api/projects/${projectAtStart}/runs`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ duration_seconds: budget.seconds }) });
     const activated = state.current === projectAtStart && await sendMessageText(
-      `${START_RUN_MESSAGE} Run id: ${intent.run_id || "unknown"}. Do not claim success for a partial fleet.`,
+      `${START_RUN_MESSAGE} Run id: ${intent.run_id || "unknown"}. Run Budget: ${formatRunBudget(intent.duration_seconds || budget.seconds)}. Absolute deadline: ${formatDeadline(intent.deadline)}. Do not claim success for a partial fleet.`,
     );
     notify(activated ? "Run intent 已记录；Main Agent 正在启动 Worker fleet" : "Run intent 已记录，但 Main Agent 未能激活", activated ? "success" : "error");
     await refreshProjects();

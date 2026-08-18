@@ -6,6 +6,7 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
 from starlette.testclient import TestClient
 
 from danus.execution import layout as L
@@ -247,6 +248,40 @@ def test_authentication_cookie_csrf_and_project_boundary(tmp_path: Path):
         assert len(runtime.created) == 1
 
 
+@pytest.mark.parametrize(
+    ("value", "detail"),
+    [
+        (True, "duration_seconds must be an integer"),
+        ("43200", "duration_seconds must be an integer"),
+        (12.5, "duration_seconds must be an integer"),
+        (0, "duration_seconds must be between 1 and 604800"),
+        (-1, "duration_seconds must be between 1 and 604800"),
+        (604801, "duration_seconds must be between 1 and 604800"),
+    ],
+)
+def test_project_run_budget_rejects_invalid_types_and_bounds(
+    tmp_path: Path, value, detail: str,
+):
+    app, runtime = _app(tmp_path)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client)
+        project = client.post(
+            "/api/projects", json={"name": "A", "problem": "alpha", "roles": "high:1"},
+            headers={"X-CSRF-Token": csrf, "Origin": "https://testserver"},
+        ).json()
+        runtime.assign_all(project["runtime_name"])
+
+        response = client.post(
+            f"/api/projects/{project['id']}/runs",
+            json={"duration_seconds": value},
+            headers={"X-CSRF-Token": csrf, "Origin": "https://testserver"},
+        )
+
+        assert response.status_code == 400
+        assert response.json() == {"detail": detail}
+        assert client.get(f"/api/projects/{project['id']}/runtime").json().get("run") is None
+
+
 def test_project_run_deadline_and_graceful_stop_are_scoped(tmp_path: Path):
     app, runtime = _app(tmp_path)
     with TestClient(app, base_url="https://testserver") as client:
@@ -268,7 +303,11 @@ def test_project_run_deadline_and_graceful_stop_are_scoped(tmp_path: Path):
         assert start.status_code == 202
         run = start.json()
         assert run["status"] == "start_requested"
+        assert run["duration_seconds"] == 43200
         assert 43190 <= run["deadline"] - time.time() <= 43210
+        projected_run = client.get(f"/api/projects/{a['id']}/runtime").json()["run"]
+        assert projected_run["duration_seconds"] == 43200
+        assert projected_run["started_at"] <= projected_run["deadline"]
         # The browser records the bounded run intent; only the project Main
         # Agent may request the normal Worker start through the host broker.
         assert runtime.started == []

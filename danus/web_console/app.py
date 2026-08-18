@@ -815,11 +815,13 @@ def create_app(
             return project
         try:
             payload = await request.json()
-            duration = int(payload["duration_seconds"])
-            if duration <= 0 or duration > 7 * 24 * 3600:
-                raise ValueError("duration_seconds out of range")
-        except (KeyError, TypeError, ValueError):
-            return _error(400, "invalid duration_seconds")
+        except Exception:
+            return _error(400, "duration_seconds must be an integer")
+        duration = payload.get("duration_seconds") if isinstance(payload, dict) else None
+        if isinstance(duration, bool) or not isinstance(duration, int):
+            return _error(400, "duration_seconds must be an integer")
+        if duration <= 0 or duration > 7 * 24 * 3600:
+            return _error(400, "duration_seconds must be between 1 and 604800")
         async with lock_for(project_id):
             try:
                 status_projection = runtime.status_project(project["runtime_name"])
@@ -843,7 +845,8 @@ def create_app(
                     },
                     status_code=409,
                 )
-            started, deadline = time.time(), time.time() + duration
+            started = time.time()
+            deadline = started + duration
             run = {"id": uuid.uuid4().hex, "project_id": project_id, "duration_seconds": duration, "started_at": started, "deadline": deadline, "status": "starting"}
             # Persist the bounded operator intent before exposing it to the
             # Main Agent. Normal Worker spawning is brokered only when that
@@ -852,7 +855,11 @@ def create_app(
             try:
                 runtime.write_deadline(project["runtime_name"], deadline)
                 store.audit("run_start", "intent_recorded", project_id)
-                return JSONResponse({"run_id": run["id"], "status": "start_requested", "deadline": deadline}, status_code=202)
+                return JSONResponse({
+                    "run_id": run["id"], "status": "start_requested",
+                    "duration_seconds": duration, "started_at": started,
+                    "deadline": deadline,
+                }, status_code=202)
             except (RuntimeErrorBase, OSError) as exc:
                 # A failed deadline write must not leave an active intent that
                 # appears safe to start later.
@@ -920,6 +927,8 @@ def create_app(
                 progress = worker_progress(projection.get("workers", []))
                 projection = {**projection, "run": {
                     "id": active["id"], "status": active["status"],
+                    "duration_seconds": active["duration_seconds"],
+                    "started_at": active["started_at"],
                     "deadline": active["deadline"], "outcome": active.get("outcome"),
                     "expected_worker_names": expected, "alive_worker_names": alive,
                     "alive_workers": alive, "not_running_workers": pending, **progress,
