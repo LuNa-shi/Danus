@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import ipaddress
 import json
+import re
 import sqlite3
 import secrets
 import threading
@@ -1326,6 +1327,103 @@ def create_app(
             return runtime.memory_projection(project["runtime_name"])
         except RuntimeErrorBase:
             return _error(502, "memory projection unavailable")
+
+    @app.get("/api/projects/{project_id}/finalize/suggestions")
+    async def finalize_suggestions(project_id: str, request: Request):
+        if isinstance((auth := auth_required(request)), JSONResponse): return auth
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse): return project
+        try: return runtime.finalize_suggestions(project["runtime_name"])
+        except (RuntimeErrorBase, OSError): return _error(502, "finalize suggestions unavailable")
+
+    @app.post("/api/projects/{project_id}/finalize")
+    async def finalize_target(project_id: str, request: Request):
+        current = auth_required(request)
+        if isinstance(current, JSONResponse): return current
+        if not csrf_ok(request, current): return _error(403, "csrf validation failed")
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse): return project
+        payload = await request.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get("fact_ids"), list) or not payload["fact_ids"]:
+            return _error(400, "fact_ids are required")
+        paper_id = payload.get("paper_id")
+        if paper_id is not None and (not isinstance(paper_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", paper_id)):
+            return _error(400, "invalid paper_id")
+        try:
+            result = runtime.finalize_target(project["runtime_name"], [str(fid) for fid in payload["fact_ids"]], paper_id)
+            store.audit("finalize", "success", project_id, details=json.dumps(result))
+            return result
+        except (RuntimeErrorBase, OSError, ValueError) as exc:
+            store.audit("finalize", "failure", project_id, details=str(exc)[:200])
+            return _error(409, str(exc)[:200])
+
+    @app.post("/api/projects/{project_id}/human-summary")
+    async def human_summary_action(project_id: str, request: Request):
+        current = auth_required(request)
+        if isinstance(current, JSONResponse): return current
+        if not csrf_ok(request, current): return _error(403, "csrf validation failed")
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse): return project
+        payload = await request.json()
+        if not isinstance(payload, dict) or payload.get("confirm") != project["name"]: return _error(409, "project-name confirmation required")
+        try:
+            result = await asyncio.to_thread(runtime.write_human_summary, project["runtime_name"], payload.get("language"))
+            store.audit("human_summary", "success", project_id, details=json.dumps(result)[:2000]); return result
+        except (RuntimeErrorBase, OSError) as exc: store.audit("human_summary", "failure", project_id, details=str(exc)[:200]); return _error(502, "human summary failed")
+
+    @app.post("/api/projects/{project_id}/write-paper")
+    async def write_paper_action(project_id: str, request: Request):
+        current = auth_required(request)
+        if isinstance(current, JSONResponse): return current
+        if not csrf_ok(request, current): return _error(403, "csrf validation failed")
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse): return project
+        payload = await request.json()
+        if not isinstance(payload, dict) or payload.get("confirm") != project["name"]: return _error(409, "project-name confirmation required")
+        stop_workers = payload.get("stop_workers")
+        if not isinstance(stop_workers, bool): return _error(400, "stop_workers fork is required")
+        try:
+            result = await asyncio.to_thread(runtime.write_paper_artifact, project["runtime_name"], paper_id=payload.get("paper_id"), stop_workers=stop_workers, fact_ids=payload.get("fact_ids"), instructions=payload.get("instructions"))
+            store.audit("write_paper", "success", project_id, details=json.dumps({"paper_id": payload.get("paper_id"), "stop_workers": stop_workers})[:2000]); return result
+        except (RuntimeErrorBase, OSError, ValueError) as exc: store.audit("write_paper", "failure", project_id, details=str(exc)[:200]); return _error(502, "paper generation failed")
+
+    @app.post("/api/projects/{project_id}/artifacts-actions")
+    async def artifact_action_intent(project_id: str, request: Request):
+        current = auth_required(request)
+        if isinstance(current, JSONResponse): return current
+        if not csrf_ok(request, current): return _error(403, "csrf validation failed")
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse): return project
+        payload = await request.json()
+        action = payload.get("action") if isinstance(payload, dict) else None
+        if action not in {"human-summary", "write-paper"}:
+            return _error(400, "unsupported artifact action")
+        if action == "write-paper" and payload.get("stop_workers") not in {True, False}:
+            return _error(400, "stop_workers confirmation is required")
+        store.audit("artifact_action_intent", "recorded", project_id, details=json.dumps({"action": action, "stop_workers": payload.get("stop_workers")}))
+        return {"status": "intent_recorded", "action": action, "message": "已记录操作意图；请在 Main Agent 会话中确认并执行"}
+
+    @app.get("/api/projects/{project_id}/artifacts")
+    async def artifacts_projection(project_id: str, request: Request):
+        if isinstance((auth := auth_required(request)), JSONResponse): return auth
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse): return project
+        try:
+            if hasattr(runtime, "artifacts_projection"):
+                return runtime.artifacts_projection(project["runtime_name"])
+            return {"files": [*runtime.reports_projection(project["runtime_name"]).get("files", []), *runtime.outputs_projection(project["runtime_name"]).get("files", [])]}
+        except RuntimeErrorBase: return _error(502, "artifact projection unavailable")
+
+    @app.get("/api/projects/{project_id}/artifacts/{artifact_path:path}")
+    async def artifact_download(project_id: str, artifact_path: str, request: Request):
+        if isinstance((auth := auth_required(request)), JSONResponse): return auth
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse): return project
+        try:
+            body, content_type = runtime.artifact_bytes(project["runtime_name"], artifact_path)
+            from fastapi.responses import Response
+            return Response(body, media_type=content_type, headers={"Content-Disposition": f'inline; filename="{Path(artifact_path).name}"'})
+        except (RuntimeErrorBase, RuntimeError, OSError, ValueError): return _error(404, "artifact not found")
 
     @app.get("/api/projects/{project_id}/reports")
     async def reports_projection(project_id: str, request: Request):
