@@ -947,6 +947,12 @@ class MainAgentAdapter:
             terminal_state = self._codex_terminal_state(stdout)
             observed_tool_activity, parse_uncertain = self._codex_activity(stdout)
             chosen_id = actual_id or active_session_id
+            if self._clock() > deadline:
+                raise MainAgentError(
+                    "main agent turn timed out: total timeout budget exhausted",
+                    code="turn_timeout_exhausted", session_id=chosen_id,
+                    attempts=attempt, observed_tool_activity=observed_tool_activity,
+                )
             if getattr(result, "returncode", 1) == 0 and reply and failure is None and terminal_state == "completed":
                 if not chosen_id:
                     raise MainAgentError(
