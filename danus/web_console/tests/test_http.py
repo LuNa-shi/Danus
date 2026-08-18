@@ -151,6 +151,23 @@ class FakeMemoryRuntime(FakeRuntime):
         return self.memory_entries.get(runtime_name, {"total": 0, "channels": []})
 
 
+    def artifacts_projection(self, runtime_name):
+        root = self.project_context_dir(runtime_name)
+        rows = []
+        for path in sorted(root.rglob("*")):
+            if path.is_file() and not path.is_symlink():
+                rel = str(path.relative_to(root)); rows.append({"path": rel, "name": path.name, "size": path.stat().st_size, "kind": "target" if path.name == "TARGET.md" else "report" if rel.startswith("report/") else "paper" if rel.startswith(("paper/", "papers/")) else "output"})
+        return {"files": rows}
+
+    def artifact_bytes(self, runtime_name, relative):
+        root = self.project_context_dir(runtime_name); path = root / relative
+        if Path(relative).is_absolute() or ".." in Path(relative).parts or path.is_symlink() or not path.is_file(): raise RuntimeError("not found")
+        return path.read_bytes(), "text/plain"
+
+    def finalize_suggestions(self, runtime_name): return {"suggested": ["fact_a"]}
+    def finalize_target(self, runtime_name, fact_ids, paper_id=None): return {"target_file": "TARGET.md", "target_fact_ids": fact_ids, "paper_id": paper_id}
+    def write_human_summary(self, runtime_name, language=None): return {"status": "ok", "report_md_path": "report/report.md", "language": language or "English"}
+    def write_paper_artifact(self, runtime_name, **kwargs): return {"status": "ok", "paper_id": kwargs.get("paper_id"), "stop_workers": kwargs.get("stop_workers")}
 _LIFECYCLE_SECRET = b"test-lifecycle-hmac-secret"
 
 
@@ -1922,9 +1939,66 @@ def test_failed_orchestration_beat_is_retried_and_audited(tmp_path: Path):
             if main.calls >= 2: break
             time.sleep(.02)
         assert main.calls >= 2
-        projection = client.get(f"/api/projects/{project['id']}/orchestration").json()
+        for _ in range(100):
+            projection = client.get(f"/api/projects/{project['id']}/orchestration").json()
+            if projection.get("orchestration_beat", {}).get("status") == "completed": break
+            time.sleep(.01)
         assert projection["orchestration_beat"]["status"] == "completed"
         assert projection["orchestration_beat"]["fingerprint"]
         messages = client.get(f"/api/projects/{project['id']}/messages").json()
         assert any(row["status"] == "failed" and row["role"] == "system" for row in messages)
         assert any(row["text"] == "recovered" for row in messages)
+
+
+def test_artifact_projection_is_project_scoped_and_secure(tmp_path: Path):
+    runtime = FakeMemoryRuntime(tmp_path / "projects")
+    settings = AppSettings(database_path=tmp_path / "db.sqlite3", password_hash=hash_password("correct horse battery staple"), cookie_secure=True, allowed_origins={"https://testserver"})
+    app = create_app(settings=settings, runtime=runtime)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        a = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
+        b = client.post("/api/projects", json={"name": "B", "problem": "beta"}, headers=headers).json()
+        root = Path(a["runtime_name"])
+        project_dir = runtime.project_context_dir(a["runtime_name"])
+        (project_dir / "TARGET.md").write_text("fact_a\n")
+        (project_dir / "report").mkdir(); (project_dir / "report" / "report.md").write_text("safe report")
+        (project_dir / "paper").mkdir(); (project_dir / "paper" / "main.tex").write_text("\\documentclass{article}")
+        (project_dir / "papers" / "thmB").mkdir(parents=True); (project_dir / "papers" / "thmB" / "main.pdf").write_bytes(b"pdf")
+        (project_dir / "report" / "internal-link").symlink_to(project_dir / "PROBLEM.md")
+        projection = client.get(f"/api/projects/{a['id']}/artifacts").json()
+        paths = {row["path"] for row in projection["files"]}
+        assert {"TARGET.md", "report/report.md", "paper/main.tex", "papers/thmB/main.pdf"} <= paths
+        assert all(row["path"] != "TARGET.md" for row in client.get(f"/api/projects/{b['id']}/artifacts").json()["files"])
+        assert client.get(f"/api/projects/{a['id']}/artifacts/report/report.md").text == "safe report"
+        assert all(row["path"] != "report/internal-link" for row in client.get(f"/api/projects/{a['id']}/artifacts").json()["files"])
+        assert client.get(f"/api/projects/{a['id']}/artifacts/../TARGET.md").status_code in {400, 404}
+        assert client.get(f"/api/projects/{a['id']}/artifacts/%2e%2e%2fTARGET.md").status_code in {400, 404}
+
+
+def test_finalize_suggestions_and_approved_target_are_csrf_and_project_scoped(tmp_path: Path):
+    runtime = FakeMemoryRuntime(tmp_path / "projects")
+    settings = AppSettings(database_path=tmp_path / "db.sqlite3", password_hash=hash_password("correct horse battery staple"), cookie_secure=True, allowed_origins={"https://testserver"})
+    app = create_app(settings=settings, runtime=runtime)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
+        assert client.get(f"/api/projects/{project['id']}/finalize/suggestions").json()["suggested"] == ["fact_a"]
+        assert client.post(f"/api/projects/{project['id']}/finalize", json={"fact_ids": ["fact_a"]}, headers={"Origin": "https://testserver"}).status_code == 403
+        response = client.post(f"/api/projects/{project['id']}/finalize", json={"confirm": "A", "fact_ids": ["fact_a"], "paper_id": "thmA"}, headers=headers)
+        assert response.status_code == 200 and response.json()["paper_id"] == "thmA"
+        assert client.post(f"/api/projects/{project['id']}/finalize", json={"confirm": "A", "fact_ids": ["fact_a"], "paper_id": "../escape"}, headers=headers).status_code == 400
+
+
+def test_summary_and_paper_actions_require_explicit_operator_forks(tmp_path: Path):
+    runtime = FakeMemoryRuntime(tmp_path / "projects")
+    settings = AppSettings(database_path=tmp_path / "db.sqlite3", password_hash=hash_password("correct horse battery staple"), cookie_secure=True, allowed_origins={"https://testserver"})
+    app = create_app(settings=settings, runtime=runtime)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
+        assert client.post(f"/api/projects/{project['id']}/human-summary", json={"confirm": "wrong"}, headers=headers).status_code == 409
+        summary = client.post(f"/api/projects/{project['id']}/human-summary", json={"confirm": "A", "language": "Chinese"}, headers=headers)
+        assert summary.status_code == 200 and summary.json()["report_md_path"] == "report/report.md"
+        assert client.post(f"/api/projects/{project['id']}/write-paper", json={"confirm": "A"}, headers=headers).status_code == 400
+        paper = client.post(f"/api/projects/{project['id']}/write-paper", json={"confirm": "A", "paper_id": "thmA", "stop_workers": False}, headers=headers)
+        assert paper.status_code == 200 and paper.json()["stop_workers"] is False

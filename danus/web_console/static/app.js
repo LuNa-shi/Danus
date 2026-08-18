@@ -1875,10 +1875,42 @@ function renderMemory() {
   }).join("") || `<div class="insight-empty"><span>◎</span><strong>共享记忆为空</strong><p>${liveWorkers ? `${liveWorkers} 个 worker 正在工作；首次 gm_add 后这里会按频道实时归档。` : "plans、obstacles、proof attempts 和 verification 记录会汇总到这里。"}</p></div>`;
 }
 
+function artifactTypeLabel(file) {
+  const kind = String(file.kind || "output");
+  return { target: "TARGET.md", report: "human-summary", "verification-ledger": "Verification Ledger", paper: "Paper", output: "Output" }[kind] || "Artifact";
+}
+async function artifactAction(action, options = {}) {
+  if (!state.current || !state.project) return;
+  const confirmation = window.prompt(`输入「${state.project.name}」确认 ${action}`);
+  if (confirmation !== state.project.name) return;
+  try {
+    if (action === "finalize") {
+      const rawFacts = window.prompt("输入要记录的已验证 Fact IDs（逗号分隔）") || "";
+      const fact_ids = rawFacts.split(",").map((value) => value.trim()).filter(Boolean);
+      if (!fact_ids.length) return;
+      const paper_id = (window.prompt("Paper ID（默认论文留空）") || "").trim() || null;
+      await api(`/api/projects/${state.current}/finalize`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirm: confirmation, fact_ids, paper_id }) });
+    } else {
+      const endpoint = action === "human-summary" ? "human-summary" : "write-paper";
+      if (action === "human-summary") {
+        options.language = (window.prompt("报告语言（留空使用项目默认）") || "").trim() || null;
+      } else {
+        options.paper_id = (window.prompt("Paper ID（默认论文留空）") || "").trim() || null;
+        const selected = (window.prompt("可选：论文 Fact IDs（逗号分隔）") || "").split(",").map((value) => value.trim()).filter(Boolean);
+        options.fact_ids = selected.length ? selected : null;
+        options.instructions = (window.prompt("可选：论文写作说明") || "").trim() || null;
+      }
+      await api(`/api/projects/${state.current}/${endpoint}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirm: confirmation, ...options }) });
+    }
+    notify("产物工作流已完成；正在刷新产物", "success"); await refreshProjectData();
+  } catch (error) { notify(error.message || "产物操作失败", "error"); }
+}
+function artifactHref(file) { return `/api/projects/${encodeURIComponent(state.current)}/artifacts/${String(file.path || file.name || "").split("/").map(encodeURIComponent).join("/")}`; }
+
 function renderArtifacts() {
   const files = [...(state.reports.files || []), ...(state.outputs.files || [])];
   $("artifact-count").textContent = String(files.length);
-  $("artifacts").innerHTML = files.map((file) => `<div class="artifact-row"><span>↗</span><span><strong>${esc(file.name)}</strong><small>${formatBytes(file.size)}</small></span></div>`).join("") || '<p class="muted">还没有报告或输出。</p>';
+  $("artifacts").innerHTML = `<div class="artifact-actions"><button type="button" data-artifact-action="finalize">记录 TARGET.md</button><button type="button" data-artifact-action="human-summary">生成人类可读报告</button><button type="button" data-artifact-action="write-paper">生成论文（保持 Workers）</button></div>` + (files.map((file) => `<div class="artifact-row"><span>↗</span><span><strong>${esc(artifactTypeLabel(file))}</strong><small>${esc(file.path || file.name)} · ${formatBytes(file.size)}</small></span><a href="${esc(artifactHref(file))}" target="_blank" rel="noreferrer">查看 / 下载</a></div>`).join("") || '<p class="muted">还没有报告或输出。</p>');
 }
 
 function runtimeProgress() {
@@ -2195,8 +2227,7 @@ async function refreshProject() {
       logWorkerAtStart
         ? api(workerLogUrl(projectAtStart, logWorkerAtStart))
         : Promise.resolve(null),
-      api(`/api/projects/${projectAtStart}/reports`),
-      api(`/api/projects/${projectAtStart}/outputs`),
+      api(`/api/projects/${projectAtStart}/artifacts`),
       api(`/api/projects/${projectAtStart}/orchestration`),
       api(`/api/projects/${projectAtStart}/main-agent-events`),
     ]);
@@ -2219,10 +2250,11 @@ async function refreshProject() {
     } else if (logWorkerAtStart) {
       recordLogError(results[6].reason, logWorkerAtStart);
     }
-    state.reports = value(results[7], { files: [] });
-    state.outputs = value(results[8], { files: [] });
-    state.orchestration = value(results[9], {});
-    const eventSnapshot = value(results[10], { events: [], last_id: 0 });
+    const artifacts = value(results[7], { files: [] });
+    state.reports = { files: artifacts.files || [] };
+    state.outputs = { files: [] };
+    state.orchestration = value(results[8], {});
+    const eventSnapshot = value(results[9], { events: [], last_id: 0 });
     state.mainAgentEvents = eventSnapshot.events || [];
     state.mainAgentEventLastId = Number(eventSnapshot.last_id || 0);
     const restoredPending = state.messages.slice().reverse().find((message) => (
@@ -2366,6 +2398,8 @@ async function deleteProject() {
 
 document.addEventListener("click", (event) => {
   if (event.target.closest("[data-confirm-initial-direction]")) confirmInitialDirection();
+  const artifactButton = event.target.closest("[data-artifact-action]");
+  if (artifactButton) artifactAction(artifactButton.dataset.artifactAction, artifactButton.dataset.artifactAction === "write-paper" ? { stop_workers: window.confirm("生成论文前停止 Workers？确定=停止，取消=保持运行") } : {});
 });
 
 $("project-list").addEventListener("click", (event) => {

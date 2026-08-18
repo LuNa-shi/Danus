@@ -650,6 +650,102 @@ class DanusRuntimeAdapter:
             channels.append({**summary, "entries": detail.get("entries", [])[:6]})
         return {"total": total, "channels": channels}
 
+    def write_human_summary(self, runtime_name: str, language: str | None = None) -> dict[str, Any]:
+        from danus.human_summary.server import summary_write
+        return summary_write(project=str(self._project_dir(runtime_name)), language=language)
+
+    def write_paper_artifact(self, runtime_name: str, *, paper_id: str | None = None,
+                             stop_workers: bool = False, fact_ids: list[str] | None = None,
+                             instructions: str | None = None) -> dict[str, Any]:
+        from danus.write_paper.server import paper_write
+        result = paper_write(project=str(self._project_dir(runtime_name)), paper_id=paper_id,
+                             stop_workers=False, fact_ids=fact_ids, instructions=instructions)
+        if stop_workers and result.get("status") == "ok":
+            result["graceful_stop_requested"] = True
+            result["graceful_stop"] = "host supervisor must execute the confirmed stop intent"
+        return result
+
+    def finalize_suggestions(self, runtime_name: str) -> dict[str, Any]:
+        from danus.core import FactGraph
+        from danus.write_paper import assemble
+        root = self._project_dir(runtime_name)
+        return {"suggested": assemble._terminal_facts(FactGraph(root))}
+
+    def finalize_target(self, runtime_name: str, fact_ids: list[str], paper_id: str | None = None) -> dict[str, Any]:
+        from danus.core import FactGraph
+        from danus.write_paper import assemble
+        root = self._project_dir(runtime_name)
+        graph = FactGraph(root)
+        unknown = [fid for fid in fact_ids if not graph.exists(fid)]
+        if unknown: raise RuntimeOperationError(f"unknown verified fact id(s): {', '.join(unknown)}")
+        if not fact_ids: raise RuntimeOperationError("at least one verified fact is required")
+        path = assemble.write_target_fact_ids(root, list(dict.fromkeys(fact_ids)), paper_id)
+        return {"target_file": str(path.relative_to(root)), "target_fact_ids": list(dict.fromkeys(fact_ids)), "paper_id": paper_id}
+
+    def artifacts_projection(self, runtime_name: str, *, limit: int = 1000) -> dict[str, Any]:
+        root = self._project_dir(runtime_name)
+        candidates = [root / "TARGET.md", root / "report", root / "paper", root / "papers", root / "outputs", root / "reports"]
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            paths = [candidate] if candidate.is_file() else sorted(candidate.rglob("*")) if candidate.is_dir() else []
+            for path in paths:
+                if len(rows) >= limit or path.is_symlink() or not path.is_file():
+                    continue
+                try:
+                    relative = path.relative_to(root)
+                    resolved = path.resolve()
+                    if resolved != path or str(relative) in seen or root not in resolved.parents:
+                        continue
+                    size = path.stat().st_size
+                except (OSError, ValueError):
+                    continue
+                rel = str(relative)
+                seen.add(rel)
+                lower = rel.lower()
+                kind = "target" if relative.name == "TARGET.md" else "verification-ledger" if relative.name.upper() in {"VERIFY_LEDGER.MD", "REFERENCE_LEDGER.MD"} else "report" if rel.startswith("report/") or rel.startswith("reports/") else "paper" if rel.startswith("paper/") or rel.startswith("papers/") else "output"
+                rows.append({"path": rel, "name": relative.name, "size": size, "kind": kind, "content_type": "application/pdf" if lower.endswith(".pdf") else "text/plain" if lower.endswith((".md", ".txt", ".log")) else "text/latex" if lower.endswith((".tex", ".ltx")) else "application/octet-stream"})
+        return {"files": rows}
+
+    def artifact_bytes(self, runtime_name: str, relative: str, *, max_bytes: int = 2 * 1024 * 1024) -> tuple[bytes, str]:
+        root = self._project_dir(runtime_name)
+        relative_path = Path(relative)
+        allowed = relative == "TARGET.md" or relative_path.parts[0] in {"report", "paper", "papers", "outputs", "reports"}
+        if not allowed or not relative or relative_path.is_absolute() or "\\" in relative or any(part in {"", ".", ".."} for part in relative_path.parts):
+            raise RuntimeOperationError("invalid artifact path")
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        dir_fd = os.open(root, directory_flags)
+        opened_dirs = [dir_fd]
+        try:
+            for part in relative_path.parts[:-1]:
+                dir_fd = os.open(part, directory_flags, dir_fd=dir_fd)
+                opened_dirs.append(dir_fd)
+            file_fd = os.open(relative_path.name, file_flags, dir_fd=dir_fd)
+            try:
+                info = os.fstat(file_fd)
+                if not stat_module.S_ISREG(info.st_mode):
+                    raise RuntimeOperationError("artifact not found")
+                if info.st_size > max_bytes:
+                    raise RuntimeOperationError("artifact too large")
+                chunks = []
+                remaining = max_bytes + 1
+                while remaining > 0:
+                    chunk = os.read(file_fd, min(65536, remaining))
+                    if not chunk: break
+                    chunks.append(chunk); remaining -= len(chunk)
+                body = b"".join(chunks)
+                if len(body) > max_bytes: raise RuntimeOperationError("artifact too large")
+            finally:
+                os.close(file_fd)
+        except OSError as exc:
+            raise RuntimeOperationError("artifact not found") from exc
+        finally:
+            for opened in reversed(opened_dirs):
+                os.close(opened)
+        suffix = relative_path.suffix.lower()
+        return body, "application/pdf" if suffix == ".pdf" else "text/plain; charset=utf-8" if suffix in {".md", ".txt", ".log"} else "text/latex; charset=utf-8" if suffix in {".tex", ".ltx"} else "application/octet-stream"
+
     def reports_projection(self, runtime_name: str) -> dict[str, Any]:
         return {"files": self._safe_relative_files(runtime_name, "reports")}
 

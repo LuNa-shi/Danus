@@ -222,7 +222,7 @@ class MainAgentAdapter:
         return "\n".join([
             "You are the Danus Main Agent for exactly one Project.",
             "Follow the Main Agent contract below. Retain strategic orchestration authority; do not submit facts directly.",
-            "Use the exact project-scoped command path in `$DANUS_WEB_AGENT_BIN` for status, assignment, and Worker lifecycle coordination (`start`, `pause`, `resume`, and graceful `stop`). It is the only allowed lifecycle command and is pinned to this Project. Do not edit Danus source code or access another Project. Use the Danus MCP tools for scoped memory and Fact Graph oversight; never submit facts as Main Agent.",
+            "Use the exact project-scoped command path in `$DANUS_WEB_AGENT_BIN` for status, assignment, Worker lifecycle coordination (`start`, `pause`, `resume`, and graceful `stop`), and operator-confirmed artifact operations (`finalize`, `human-summary`, `write-paper`). It is the only allowed lifecycle command and is pinned to this Project. Do not edit Danus source code or access another Project. Use the Danus MCP tools for scoped memory and Fact Graph oversight; never submit facts as Main Agent.",
             strategy_policy,
             "MAIN AGENT CONTRACT:\n" + contract_text,
             "The Web Console supplies this project state and material manifest explicitly.",
@@ -1015,7 +1015,7 @@ class MainAgentAdapter:
         }}}
         new_session = session_id is None
         sid = session_id or str(uuid.uuid4())
-        allowed = ["Read", "Glob", "Grep", "Bash(danus-web-agent status)", "Bash(danus-web-agent assign *)", "Bash(danus-web-agent start)", "Bash(danus-web-agent pause *)", "Bash(danus-web-agent resume *)", "Bash(danus-web-agent stop)",
+        allowed = ["Read", "Glob", "Grep", "Bash(danus-web-agent status)", "Bash(danus-web-agent assign *)", "Bash(danus-web-agent start)", "Bash(danus-web-agent pause *)", "Bash(danus-web-agent resume *)", "Bash(danus-web-agent stop)", "Bash(danus-web-agent finalize *)", "Bash(danus-web-agent human-summary *)", "Bash(danus-web-agent write-paper *)",
                    "mcp__danus__gm_add", "mcp__danus__gm_search",
                    "mcp__danus__fact_search", "mcp__danus__fact_revoke",
                    "mcp__danus__search_arxiv_theorems"]

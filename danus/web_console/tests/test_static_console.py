@@ -327,6 +327,12 @@ def test_initialization_message_covers_off_and_enabled_consult_modes():
         assert "不要在首次初始化消息中启动 Worker swarm" in message
 
 
+def test_artifacts_are_typed_and_viewable():
+    app = _asset("app.js")
+    for token in ("function artifactTypeLabel", "function artifactHref", "TARGET.md", "human-summary", "paper", "查看 / 下载"):
+        assert token in app
+
+
 def test_worker_trace_separates_output_and_collapses_tool_calls():
     app = _asset("app.js")
     css = _asset("style.css")

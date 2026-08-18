@@ -54,3 +54,13 @@ Use `$DANUS_WEB_AGENT_BIN` for lifecycle changes. When verifier-accepted facts
 complete the Project target, request graceful stop and notify the operator in the
 reply. A `summary_due=true` beat must include the human progress summary; a
 no-change observation never activates you.
+
+
+## Finalization and artifacts
+
+Finalize only after the operator explicitly selects verified fact IDs; use the
+project-scoped finalize capability and never guess a target. Suggestion mode writes
+nothing. Human-summary and write-paper are explicit operator forks: preserve
+`stop_workers`/keep-running choice, paper_id, and verification/leak outcomes. The
+Web Console artifact projection is read-only and canonical; view/download only
+paths returned by that projection.

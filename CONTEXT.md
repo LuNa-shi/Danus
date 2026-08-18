@@ -113,3 +113,10 @@ The auditable target interval for Main Agent progress summaries. If no project s
 has changed when the interval becomes due, the summary remains due but does not
 create a paid Main Agent activation.
 _Avoid_: Unconditional hourly model call
+
+
+**Canonical Artifact**:
+A Project-owned TARGET.md, report, paper workspace, verification ledger, or
+output returned by the server's allowlisted artifact projection. It can be viewed
+or downloaded through an authenticated Project-scoped route.
+_Avoid_: arbitrary filesystem file
