@@ -1,7 +1,9 @@
 """Static Web Console regressions for layout and worker observability."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
+import subprocess
 
 
 STATIC = Path(__file__).resolve().parents[1] / "static"
@@ -9,6 +11,35 @@ STATIC = Path(__file__).resolve().parents[1] / "static"
 
 def _asset(name: str) -> str:
     return (STATIC / name).read_text(encoding="utf-8")
+
+
+
+
+def _javascript_function(source: str, name: str) -> str:
+    start = source.index(f"function {name}(")
+    brace = source.index("{", start)
+    depth = 0
+    for index in range(brace, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start:index + 1]
+    raise AssertionError(f"unterminated JavaScript function: {name}")
+
+
+def _render_markdown(value: str) -> str:
+    source = _asset("app.js")
+    script = "\n".join((
+        _javascript_function(source, "esc"),
+        source[source.index("function inlineMarkdown("):source.index("function renderProjectList(")],
+        f"console.log(JSON.stringify(renderMarkdown({json.dumps(value)})));",
+    ))
+    result = subprocess.run(
+        ["node", "-e", script], check=True, capture_output=True, text=True,
+    )
+    return json.loads(result.stdout)
 
 
 def test_desktop_layout_prioritizes_main_conversation_width():
@@ -546,3 +577,50 @@ def test_run_start_records_intent_then_activates_main_agent_instead_of_browser_o
     assert "danus-web-agent start" in app
     assert "Do not claim success for a partial fleet" in app
     assert 'notify("Worker fleet 已启动"' not in app
+
+def test_main_agent_polling_does_not_rebuild_unchanged_chat_or_replay_entry_animation():
+    app = _asset("app.js")
+    css = _asset("style.css")
+
+    assert "function replaceMarkupIfChanged" in app
+    assert "if (!replaceMarkupIfChanged(chat, markup)) return;" in app
+    message_rule = css[css.index(".message-row {"):css.index("}", css.index(".message-row {"))]
+    assert "animation:" not in message_rule
+
+
+def test_project_lifecycle_bar_only_exposes_simple_project_wide_controls():
+    app = _asset("app.js")
+
+    assert 'id="lifecycle-worker-target"' not in app
+    assert 'id="run-stop"' not in app
+    assert 'id="run-reclaim"' not in app
+    assert 'id="run-pause"' in app
+    assert 'id="run-resume"' in app
+    assert 'id="run-force-stop"' in app
+    assert "当前项目的全部 Workers" in app
+
+
+def test_main_agent_progress_is_left_aligned_and_markdown_lists_share_message_styles():
+    css = _asset("style.css")
+
+    assert ".message-row.user .main-agent-events" in css
+    assert "text-align: left" in css
+    assert ".main-agent-event-message ul" in css
+    assert ".main-agent-event-message ol" in css
+    assert ".main-agent-event-message li" in css
+
+
+def test_markdown_lists_support_common_markers_nesting_and_continuation_lines():
+    rendered = _render_markdown(
+        "- 第一项\n"
+        "  续行说明\n"
+        "  - 子项 A\n"
+        "+ 第二项\n"
+        "• 第三项\n"
+        "1) 有序一\n"
+        "2、 有序二"
+    )
+
+    assert "<ul><li>第一项<br>续行说明<ul><li>子项 A</li></ul></li>" in rendered
+    assert "<li>第二项</li><li>第三项</li></ul>" in rendered
+    assert "<ol><li>有序一</li><li>有序二</li></ol>" in rendered
