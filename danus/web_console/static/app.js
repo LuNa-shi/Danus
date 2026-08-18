@@ -954,9 +954,9 @@ function configuredStrategyTransport() {
 function mainAgentInitializationMessage({ problem, roles, model, max_parallel_workers: capacity }) {
   const strategy = configuredStrategyTransport();
   const strategyStep = strategy === "off"
-    ? "Strategy consult：off（部署策略；不要调用 consult，由 Main Agent 自己形成 elaboration 与 master_guidance）"
-    : `Strategy consult：${strategy}（只使用服务端配置的 transport/model，不要硬编码模型）`;
-  return `请按 Danus Main Agent operating contract 初始化这个项目。\n\n项目问题：${problem}\n用户已确认 Worker roster：${roles}\nWorker 模型：${model || defaultWorkerModel() || "服务端默认"}\n资源并发上限：${capacity || defaultParallelWorkers()}（这只是 Control Plane 资源限制，不改变你的策略权力）\n${strategyStep}\n\n请先执行 Danus 的真实启动顺序：检查项目状态 → 形成 elaboration → 写入 master_guidance → 通过项目级 lifecycle CLI 为每个 Worker 写入不同或明确复用的 TASK.md。不要直接做数学，也不要启动 Worker swarm；完成后在回复中列出你实际执行成功的编排动作、每个 Worker 的任务和下一次监控条件。`;
+    ? "Strategy consult：off（不要调用 consult；由 Main Agent 自己形成 elaboration 与 offline-main-agent guidance，并明确这是离线自拟方向，不得描述为 consult-derived）"
+    : `Strategy consult：${strategy}（形成 elaboration 后使用服务端配置的 consult，记录 consult-derived guidance；不要硬编码模型）`;
+  return `请按 Danus Main Agent operating contract 初始化这个项目。\n\n项目问题：${problem}\n用户已确认 Worker roster：${roles}\nWorker 模型：${model || defaultWorkerModel() || "服务端默认"}\n资源并发上限：${capacity || defaultParallelWorkers()}（这只是 Control Plane 资源限制，不改变你的策略权力）\n${strategyStep}\n\n请先执行 Danus 的真实启动顺序：检查项目状态 → 先讨论初始方向与策略分叉（必要时向操作员提问）→ 形成 elaboration → 写入带有正确 provenance 的 guidance。先向操作员展示方向、依据和 consult/off 状态，等待用户确认后再 assign；不要在首次初始化消息中启动 Worker swarm。确认后再通过项目级 lifecycle CLI 为每个 Worker 写入不同或明确复用的 TASK.md，并在回复中列出实际执行成功的编排动作、每个 Worker 的任务和下一次监控条件。`;
 }
 
 async function createProject(payload) {
@@ -1269,13 +1269,17 @@ function renderMainAgentControl() {
   const unassigned = Array.isArray(snapshot.unassigned_workers) ? snapshot.unassigned_workers : state.workers.filter((worker) => worker.assigned === false).map((worker) => worker.worker);
   const guidance = snapshot.master_guidance || snapshot.guidance || memoryKindEntry("master_guidance");
   const elaboration = snapshot.elaboration || memoryKindEntry("elaboration");
+  const guidanceSource = snapshot.guidance_source || (configuredStrategyTransport() === "off" ? "offline-main-agent" : "consult-derived");
+  const guidanceTransport = snapshot.guidance_transport || configuredStrategyTransport();
+  const guidanceLabels = { "offline-main-agent": "offline Main-Agent guidance", "consult-derived": "consult-derived guidance", unknown: "guidance with unknown provenance" };
+  const guidanceLabel = guidanceLabels[guidanceSource] || guidanceLabels.unknown;
   const sessionStatus = currentPendingMessage() ? "active" : (main.status || snapshot.main_agent_status || (state.messages.some((message) => message.role === "assistant" && message.status === "completed") ? "inactive" : "not_started"));
   const activeRun = state.runtime.run;
   const statusLabels = { active: "会话执行中", inactive: "会话可恢复", not_started: "尚未激活", failed: "上次会话失败" };
   const steps = [
     { label: "问题讨论", done: sessionStatus !== "not_started", hint: sessionStatus === "not_started" ? "等待首次 Main Agent 对话" : "项目会话已建立" },
     { label: "战略提炼", done: Boolean(elaboration), hint: elaboration ? "已有 elaboration" : "等待真实策略记录" },
-    { label: "Master guidance", done: Boolean(guidance), hint: guidance ? "共享方向已记录" : "尚无共享方向" },
+    { label: guidanceLabel, done: Boolean(guidance), hint: guidance ? `共享方向已记录 · ${guidanceTransport}` : `等待 ${guidanceLabel} · ${guidanceTransport}` },
     { label: "Worker 分工", done: total > 0 && assigned === total, warning: assigned < total, hint: `${assigned} / ${total} 已分配` },
     { label: "监控与汇总", done: Boolean(activeRun), hint: activeRun ? `Run ${activeRun.status}` : "Run 尚未启动" },
   ];
@@ -1285,7 +1289,7 @@ function renderMainAgentControl() {
   container.innerHTML = `<div class="main-agent-control-head"><div class="main-agent-identity"><span class="main-agent-avatar">M</span><div><p class="eyebrow">MAIN AGENT · STRATEGIC ORCHESTRATOR</p><h2>负责 strategy、master guidance、派工与汇总</h2></div></div><div class="main-agent-session ${esc(sessionStatus)}"><i></i><span>${esc(statusLabels[sessionStatus] || sessionStatus)}</span><small>${esc(backend)}</small></div></div>
     <div class="orchestration-steps">${steps.map((step) => `<div class="orchestration-step ${step.done ? "is-done" : ""} ${step.warning ? "is-warning" : ""}"><span class="step-mark">${step.done ? "✓" : step.warning ? "!" : "·"}</span><span><strong>${esc(step.label)}</strong><small>${esc(step.hint)}</small></span></div>`).join("")}</div>
     ${runningUnassigned ? `<div class="orchestration-warning"><strong>当前 Run 在 Main Agent 完成分工前就启动了</strong><span>未分配：${esc(unassigned.join("、") || `${total - assigned} 个 workers`)}。这不是有效的 Danus 策略循环；请先在中间对话要求 Main Agent 完成 consult / guidance / assign。</span></div>` : ""}
-    ${guidance ? `<details class="main-guidance"><summary><span>最新 master guidance</span><small>由 Main Agent 的策略流程写入，不是前端生成</small></summary><div>${renderMarkdown(orchestrationText(guidance))}</div></details>` : ""}`;
+    ${guidance ? `<details class="main-guidance"><summary><span>最新 ${esc(guidanceLabel)}</span><small>guidance_source=${esc(guidanceSource)} · 由 Main Agent 的策略流程写入，不是前端生成</small></summary><div>${renderMarkdown(orchestrationText(guidance))}</div></details>` : ""}`;
 }
 
 function renderWorkers() {
