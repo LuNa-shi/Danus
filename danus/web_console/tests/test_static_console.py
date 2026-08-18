@@ -756,3 +756,36 @@ def test_runtime_poll_failure_preserves_last_good_run_budget_and_disables_start(
     assert "显示上次成功获取的 Run Budget 与 Deadline" in app
     assert "Boolean(state.runtimeError)" in app
     assert ".run-budget-preview.stale" in css
+
+
+def test_active_run_budget_controls_use_persisted_server_values_after_reload():
+    app = _asset("app.js")
+    functions = "\n".join((
+        _javascript_function(app, "runBudgetSelection"),
+        _javascript_function(app, "formatRunBudget"),
+        _javascript_function(app, "formatDeadline"),
+        _javascript_function(app, "currentRunBudgetSelection"),
+        _javascript_function(app, "renderRunBudget"),
+    ))
+    script = f"""
+const elements = {{
+  'run-budget-preset': {{value: '43200', disabled: false, options: [{{value:'3600'}},{{value:'21600'}},{{value:'43200'}},{{value:'86400'}},{{value:'custom'}}]}},
+  'run-budget-custom-hours': {{value: '', hidden: true, disabled: false}},
+  'run-budget-custom-wrap': {{hidden: true}},
+  'run-budget-preview': {{className: '', textContent: ''}},
+}};
+const $ = (id) => elements[id];
+const state = {{runtime: {{run: {{duration_seconds: 21600, started_at: 100, deadline: 21700}}}}, runtimeError: {{message: 'temporary'}}}};
+{functions}
+renderRunBudget();
+console.log(JSON.stringify(elements));
+"""
+    result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+    elements = json.loads(result.stdout)
+
+    assert elements["run-budget-preset"]["value"] == "21600"
+    assert elements["run-budget-preset"]["disabled"] is True
+    assert elements["run-budget-custom-wrap"]["hidden"] is True
+    assert "已选择 6 小时" in elements["run-budget-preview"]["textContent"]
+    assert "显示上次成功获取的 Run Budget 与 Deadline" in elements["run-budget-preview"]["textContent"]
+    assert "stale" in elements["run-budget-preview"]["className"]
