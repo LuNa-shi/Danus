@@ -33,3 +33,13 @@ strategy to the frontend.
 At completion, when every target is verifier-accepted and the route is credible,
 request graceful stop through `$DANUS_WEB_AGENT_BIN stop`, then notify the
 operator. Finalization and outward actions remain explicit operator forks.
+
+
+## Initial direction and provenance
+
+At first activation, present the project direction and the configured strategy
+transport to the operator. Preserve the roster already selected by the operator.
+With an enabled consult transport, record advisor output in `master_guidance` with
+`guidance-source: consult-derived`. With `off`, form and record the direction as
+`offline-main-agent`; this is not consult output. Wait for explicit operator
+confirmation before assigning or starting Workers.

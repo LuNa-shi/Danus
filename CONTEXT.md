@@ -87,3 +87,15 @@ _Avoid_: Global upload, implicit file use
 **Fact Graph**:
 A Project's dependency graph of verifier-accepted claims. It is isolated to that Project and is the authoritative source of verified results; the console may display it but does not directly mutate it.
 _Avoid_: Memory, notes
+
+
+**Guidance Provenance**:
+The operator-visible origin of a Main Agent strategic direction: `consult-derived`
+when produced by the configured strategy transport, or `offline-main-agent` when
+formed by Main Agent judgment while consult is off.
+_Avoid_: consult result for offline guidance
+
+**Initial Direction Confirmation**:
+The operator's explicit approval of the Main Agent's first strategic direction
+before Worker assignment or start.
+_Avoid_: browser approval of individual Worker tasks

@@ -134,9 +134,9 @@ this one's).
 | `dead_end` | usually false | worker | why a path failed; if killed by a counterexample it can be verifiable |
 | `direction` | false | worker | "worth exploring X" — an unverifiable judgment |
 | `obstacle` | false | worker | "X seems to block this route" — an unverifiable judgment |
-| `master_guidance` | false | **main agent (via GPT-5.5-pro)** | the periodic high-intelligence strategic steer: critical decomposition, direction judgment, core thinking. Authoritative — workers heed it (but it is still not a correctness source). |
+| `master_guidance` | false | **main agent, with explicit provenance** | the periodic high-intelligence strategic steer: critical decomposition, direction judgment, core thinking. It is consult-derived when evidence contains `guidance-source: consult-derived`, or offline Main-Agent-authored when evidence contains `guidance-source: offline-main-agent`. Authoritative for worker direction — but it is still not a correctness source. |
 | `verification` | false | the worker's `fact_submit` (auto) | a trace of a verification outcome: the verdict, plus `fact_id` (on accept) or `repair_hints` (on reject). Logged automatically by `fact_submit` so the verifier's feedback is not lost — the verifier itself stays stateless. Siblings read these to learn from rejections. |
-| `elaboration` | false | **main agent** | the periodic, high-signal-to-noise progress synthesis the main agent writes before consulting GPT-5.5-pro: mathematical verdict, closed/obsolete routes, interface contracts, dangerous heuristics, missing bridge lemmas (§2.4). It is the *input* prepared for the pro consult; `master_guidance` is pro's *reply*. Same cadence. |
+| `elaboration` | false | **main agent** | the periodic, high-signal-to-noise progress synthesis the main agent writes before the next strategy step: mathematical verdict, closed/obsolete routes, interface contracts, dangerous heuristics, missing bridge lemmas (§2.4). It is the input to an enabled consult, or the basis for offline Main-Agent guidance when consult is off. |
 
 Process-only categories (`branch_states`, `events`) stay in
 **local memory**, not here — they are not findings. `verification_reports` is
@@ -173,18 +173,18 @@ operates per-claim on the shared store.
 
 ### 2.3 master_guidance — the strategic channel
 
-The main agent operates and schedules N parallel workers. On a fixed cadence
-(e.g. hourly, or whenever all workers finish a round) it consults **GPT-5.5-pro**
-for the most critical decomposition, direction judgment, and core thinking
-(high intelligence, expensive ⇒ periodic, not per-round). It records the result
-as a `master_guidance` entry. Workers read `master_guidance` and follow it as
-authoritative steering. (Consequence for skills, decided later: this concentrates
-the expensive intelligence at the strategic level, shrinking per-worker peer
-consults.)
+The main agent operates and schedules N parallel workers. On genuine new state it
+prepares an `elaboration`, then either consults the configured strategy transport
+or reasons offline when transport is `off`. It records the resulting direction as
+a `master_guidance` entry with explicit provenance in evidence:
+`guidance-source: consult-derived` or `guidance-source: offline-main-agent`.
+Workers read `master_guidance` and follow it as authoritative steering. The
+operator sees this provenance and confirms the initial direction before dispatch.
 
 **Operations.** `append(kind, claim, evidence, verifiable, author, links, **extra) -> id`,
 `set_status(id, status, fact_id=None)`, `read(kind)` (entries, status folded),
 `search(query, kinds, limit)` (BM25).
+
 
 ### 2.4 elaboration — the synthesis channel (input to the pro consult)
 
@@ -201,7 +201,9 @@ main-agent skill**, not in code.
 
 The elaboration is recorded as an `elaboration` entry (`claim` = the one-line
 verdict, `evidence` = the full templated body, `links` = cited `fact_id`s), then
-handed to GPT-5.5-pro; pro's reply becomes the next `master_guidance` (§2.3).
+handed to the configured strategy transport when enabled; its result, or the
+Main Agent's explicit offline direction when transport is off, becomes the next
+`master_guidance` (§2.3).
 Instead of peer workers reviewing each other, the main agent distills the shared
 state and a single high-intelligence model reasons over it. Operationally it is
 also what the main agent draws on to keep the human informed.
@@ -375,7 +377,8 @@ is prose.
 
 ## 5. Usage logic (typical round)
 
-1. **Main agent**, periodically: consult GPT-5.5-pro → append a `master_guidance`
+1. **Main agent**, periodically: prepare an elaboration → consult the configured
+   transport when enabled (or reason offline) → append a provenance-marked `master_guidance`
    entry to global memory.
 2. **Worker**, each round:
    - read `master_guidance` + recent global memory (others' findings, dead ends)

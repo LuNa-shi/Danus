@@ -51,7 +51,8 @@ new state:
    closed routes, dangers, the missing bridge lemmas). *(the `elaboration` skill)*
 2. **Consult** — send that to a strong model. *(the `consult` skill; `gpt_pro`
    by default, `claude_api`, `claude_code`, or `off`)*
-3. **Assign** — record the reply as `master_guidance` and give each worker its
+3. **Confirm & assign** — record the provenance-marked direction as `master_guidance`,
+   wait for operator confirmation, then give each worker its
    per-round task (`danus assign`).
 4. **Monitor** — watch `danus status` / the dashboard; repeat when there is new
    state.
@@ -138,3 +139,12 @@ before acting, then records the decision.
 
 See `cli-and-tools.md` for the exact verbs and tools, `operations.md` for services
 and recovery, and `security-and-trust.md` before you rely on a result.
+
+
+### Initial strategy confirmation
+
+Project initialization preserves the operator-selected Worker roster and first
+shows the Main Agent's direction before dispatch. If strategy transport is enabled,
+`master_guidance` is labeled `consult-derived`; with `DANUS_CONSULT_TRANSPORT=off`,
+it is labeled `offline-main-agent` and must not be presented as consult output. The
+operator confirms the direction before the Main Agent assigns or starts Workers.
