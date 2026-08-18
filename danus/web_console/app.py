@@ -63,7 +63,7 @@ def _error(status: int, detail: str) -> JSONResponse:
 
 
 def _public_main_agent_error(exc: MainAgentError) -> str:
-    if exc.code == "timeout" and not exc.safe_to_retry:
+    if exc.code in {"timeout", "turn_timeout_exhausted"} and not exc.safe_to_retry:
         return "Main Agent 执行超时；可能已有部分操作完成。请先检查执行记录，不要直接重试，以免重复操作。"
     if exc.retryable and not exc.safe_to_retry:
         return "上游中断发生在执行过程中；已保留会话。请先检查执行记录，再发送明确后续指令，避免重复操作。"

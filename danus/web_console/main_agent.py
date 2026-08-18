@@ -53,7 +53,8 @@ class MainAgentAdapter:
                  effort: str | None = None, timeout: float = 900.0,
                  max_attempts: int | None = None, retry_base_seconds: float | None = None,
                  retry_cap_seconds: float | None = None,
-                 sleeper: Callable[[float], None] | None = None):
+                 sleeper: Callable[[float], None] | None = None,
+                 clock: Callable[[], float] | None = None):
         if backend not in {"codex", "claude"}:
             raise ValueError("main-agent backend must be codex or claude")
         self.backend = backend
@@ -61,7 +62,7 @@ class MainAgentAdapter:
         self.codex_bin = codex_bin if codex_bin != "codex" else os.environ.get("DANUS_CODEX_BIN") or self._resolve_codex()
         self.model = model
         self.effort = effort
-        self.timeout = timeout
+        self.timeout = timeout if math.isfinite(timeout) and timeout > 0 else 900.0
         configured_attempts = max_attempts if max_attempts is not None else self._int_env("DANUS_WEB_MAIN_AGENT_MAX_ATTEMPTS", 3)
         configured_base = retry_base_seconds if retry_base_seconds is not None else self._float_env("DANUS_WEB_MAIN_AGENT_RETRY_BASE_SECONDS", 2.0)
         configured_cap = retry_cap_seconds if retry_cap_seconds is not None else self._float_env("DANUS_WEB_MAIN_AGENT_RETRY_CAP_SECONDS", 8.0)
@@ -70,6 +71,7 @@ class MainAgentAdapter:
         self.retry_cap_seconds = configured_cap if math.isfinite(configured_cap) and configured_cap >= 0 else 8.0
         self._runner = runner or self._default_runner
         self._sleeper = sleeper or time.sleep
+        self._clock = clock or time.monotonic
 
     @staticmethod
     def _int_env(name: str, default: int) -> int:
@@ -880,7 +882,8 @@ class MainAgentAdapter:
             "Do not repeat completed side effects. Inspect current Project state before any "
             "write, finish the remaining orchestration work, and return the final operator reply."
         )
-        started = time.monotonic()
+        started = self._clock()
+        deadline = started + self.timeout
         active_session_id = session_id
         active_prompt = prompt
         last_progress_signature: tuple[Any, ...] | None = None
@@ -893,11 +896,11 @@ class MainAgentAdapter:
             for event in self._codex_progress_events(line):
                 call_id = str(event.get("call_id") or "")
                 if event.get("type") == "tool.started" and call_id:
-                    tool_started_at[call_id] = time.monotonic()
+                    tool_started_at[call_id] = self._clock()
                 elif event.get("type") == "tool.completed" and call_id in tool_started_at:
-                    event["duration_seconds"] = round(time.monotonic() - tool_started_at.pop(call_id), 3)
+                    event["duration_seconds"] = round(self._clock() - tool_started_at.pop(call_id), 3)
                 if event.get("type") in {"turn.completed", "turn.failed"}:
-                    event["duration_seconds"] = round(time.monotonic() - started, 3)
+                    event["duration_seconds"] = round(self._clock() - started, 3)
                 signature = (
                     event.get("type"), event.get("tool"), event.get("detail"),
                     event.get("status"), event.get("call_id"),
@@ -910,10 +913,16 @@ class MainAgentAdapter:
                 on_progress(event)
 
         for attempt in range(1, self.max_attempts + 1):
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                raise MainAgentError(
+                    "main agent turn timed out: total timeout budget exhausted", code="timeout",
+                    session_id=active_session_id, attempts=max(0, attempt - 1),
+                )
             try:
                 result = self._runner(
                     command(active_session_id), input=active_prompt, cwd=str(root),
-                    env=env, timeout=self.timeout, on_stdout_line=emit_stdout_line,
+                    env=env, timeout=remaining, on_stdout_line=emit_stdout_line,
                 )
             except subprocess.TimeoutExpired as exc:
                 partial = getattr(exc, "stdout", None) or getattr(exc, "output", None) or ""
@@ -922,7 +931,7 @@ class MainAgentAdapter:
                 actual_id, _ = self._parse_codex(str(partial))
                 observed_tool_activity, _ = self._codex_activity(str(partial))
                 raise MainAgentError(
-                    "main agent turn timed out", code="timeout",
+                    "main agent turn timed out: total timeout budget exhausted", code="timeout",
                     session_id=actual_id or active_session_id,
                     attempts=attempt, observed_tool_activity=observed_tool_activity,
                 ) from exc
@@ -946,7 +955,7 @@ class MainAgentAdapter:
                 return {
                     "session_id": chosen_id,
                     "reply": self._redact_display_text(reply, max(1, len(reply) + 1)),
-                    "status": "completed", "seconds": round(time.monotonic() - started, 1),
+                    "status": "completed", "seconds": round(self._clock() - started, 1),
                     "read_status": "unknown", "attempts": attempt,
                 }
 
@@ -971,7 +980,19 @@ class MainAgentAdapter:
                         "detail": safe_retry_detail,
                         "session_id": chosen_id,
                     })
+                remaining = deadline - self._clock()
+                if remaining <= delay:
+                    raise MainAgentError(
+                        "main agent turn timed out: total timeout budget exhausted", code="turn_timeout_exhausted",
+                        session_id=chosen_id, attempts=attempt,
+                        retryable=False, safe_to_retry=False,
+                    )
                 self._sleeper(delay)
+                if deadline - self._clock() <= 0:
+                    raise MainAgentError(
+                        "main agent turn timed out: total timeout budget exhausted", code="turn_timeout_exhausted",
+                        session_id=chosen_id, attempts=attempt,
+                    )
                 active_session_id = chosen_id
                 active_prompt = continuation
                 continue
