@@ -477,6 +477,10 @@ class MainAgentAdapter:
 
     @classmethod
     def _codex_progress_events(cls, line: str) -> list[dict[str, Any]]:
+        from .protocol import parse_provider_line
+        raw_item = parse_provider_line(line)
+        if raw_item is None or str(raw_item.get("type") or "") not in {"thread.started", "turn.started", "session_meta", "response_item", "item.started", "item.completed", "event_msg"}:
+            return []
         normalized = normalize_provider_line(line)
         if normalized and any(event.kind in {EventKind.SESSION_STARTED, EventKind.TURN_STARTED} for event in normalized):
             return [event.as_dict() for event in normalized]
@@ -556,7 +560,7 @@ class MainAgentAdapter:
 
         if kind in {"thread.started", "turn.started"}:
             events.append({
-                "type": "turn.started", "detail": "Main Agent 会话已建立",
+                "type": "session.started", "detail": "Main Agent Session available",
                 "session_id": item.get("thread_id") or payload.get("session_id") or payload.get("id"),
             })
         elif kind == "turn.completed":
@@ -607,7 +611,7 @@ class MainAgentAdapter:
         events: list[dict[str, Any]] = []
         if kind == "system" and item.get("subtype") == "init":
             events.append({
-                "type": "turn.started", "detail": "Main Agent 会话已建立",
+                "type": "session.started", "detail": "Main Agent Session available",
                 "session_id": item.get("session_id"),
             })
         elif kind == "assistant":
@@ -945,6 +949,8 @@ class MainAgentAdapter:
                         event["duration_seconds"] = round(time.monotonic() - started_at, 3)
                     on_progress(event)
 
+            if on_progress is not None:
+                on_progress({"type": "process.started", "status": "active", "detail": "Main Agent Process activated"})
             result = self._runner(
                 cmd, input=prompt, cwd=str(root), env=env, timeout=self.timeout,
                 on_stdout_line=emit_stdout_line,

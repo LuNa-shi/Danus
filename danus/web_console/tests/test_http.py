@@ -2018,3 +2018,13 @@ def test_internal_artifact_actions_require_confirmation_and_forward_forks(tmp_pa
         response = client.post(url, json={"action":"write-paper", "paper_id":"p2", "fact_ids":[], "stop_workers":True, "operator_confirmed":True}, headers=headers)
         assert response.status_code == 200 and response.json()["graceful_stop"]["workers"][0]["alive"] is False
         assert runtime.stopped == [project["runtime_name"]]
+
+
+def test_main_agent_event_store_rejects_unknown_and_unbounded_payloads(tmp_path: Path):
+    store = ConsoleStore(tmp_path / "events.sqlite3")
+    store.add_project({"id": "p", "name": "P", "runtime_name": "P", "problem": "x", "roles": "high:1", "worker_model": None, "max_parallel_workers": 1, "created_at": 1.0})
+    store.add_message({"id": "m", "project_id": "p", "role": "user", "text": "x", "status": "completed", "created_at": 1.0, "error": None})
+    with pytest.raises(ValueError, match="unknown"):
+        store.add_main_agent_event(project_id="p", message_id="m", event_type="provider.unknown", payload={})
+    with pytest.raises(ValueError, match="too large"):
+        store.add_main_agent_event(project_id="p", message_id="m", event_type="agent.message", payload={"detail": "x" * 13000})

@@ -265,11 +265,21 @@ class ConsoleStore:
     def add_main_agent_event(self, *, project_id: str, message_id: str,
                              event_type: str, payload: dict[str, Any],
                              created_at: float | None = None) -> int:
+        from .protocol import EventKind
+        allowed = {kind.value for kind in EventKind}
+        if event_type not in allowed:
+            raise ValueError("unknown Main Agent event kind")
+        if not isinstance(payload, dict) or len(payload) > 32:
+            raise ValueError("invalid Main Agent event payload")
+        payload = {str(key)[:80]: value for key, value in payload.items()}
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        if len(encoded) > 12000:
+            raise ValueError("Main Agent event payload too large")
         with self._lock, self._connect() as conn:
             cursor = conn.execute(
                 "INSERT INTO main_agent_events(project_id,message_id,event_type,payload,created_at) VALUES(?,?,?,?,?)",
                 (project_id, message_id, event_type,
-                 json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                 encoded,
                  created_at if created_at is not None else time.time()),
             )
             event_id = int(cursor.lastrowid)

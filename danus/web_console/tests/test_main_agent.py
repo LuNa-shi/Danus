@@ -754,14 +754,14 @@ def test_claude_streams_safe_tool_results_and_turn_events(tmp_path: Path):
 
     assert result["reply"] == "done"
     assert [event["type"] for event in events] == [
-        "turn.started", "agent.message", "tool.started", "tool.completed", "turn.completed",
+        "process.started", "session.started", "agent.message", "tool.started", "tool.completed", "turn.completed",
     ]
-    assert events[2]["call_id"] == "tool-1"
     assert events[3]["call_id"] == "tool-1"
-    assert events[3]["tool"] == "Bash"
-    assert events[3]["duration_seconds"] >= 0
-    assert '"status": "running"' in events[3]["detail"]
-    assert events[4]["duration_seconds"] == 0.125
+    assert events[4]["call_id"] == "tool-1"
+    assert events[4]["tool"] == "Bash"
+    assert events[4]["duration_seconds"] >= 0
+    assert '"status": "running"' in events[4]["detail"]
+    assert events[5]["duration_seconds"] == 0.125
 
 
 def test_exec_command_detail_unwraps_shell_launchers_before_redaction():
