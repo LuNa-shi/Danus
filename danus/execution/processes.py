@@ -326,6 +326,30 @@ def process_group_members(
     return sorted(members, key=lambda row: int(row["pid"]))
 
 
+def processes_with_argv_path(
+    root: Path, *, procfs: LinuxProcFS = DEFAULT_PROCFS,
+) -> list[dict[str, Any]]:
+    """Enumerate processes with an explicit argv path inside a trusted root."""
+    root = root.resolve()
+    matches: list[dict[str, Any]] = []
+    for pid in procfs.process_ids():
+        try:
+            record = procfs.process_record(pid)
+        except (OSError, ValueError, IndexError, UnicodeError):
+            continue
+        for argument in record.get("cmdline", []):
+            if not isinstance(argument, str) or not argument.startswith("/"):
+                continue
+            try:
+                candidate = Path(argument).resolve()
+            except (OSError, RuntimeError):
+                continue
+            if candidate == root or root in candidate.parents:
+                matches.append({"pid": pid})
+                break
+    return sorted(matches, key=lambda row: int(row["pid"]))
+
+
 def _freeze_process_group(
     pgid: int, *, required_leader: WorkerProcessIdentity | None = None,
     procfs: LinuxProcFS, ops: ProcessOps,
@@ -477,6 +501,28 @@ def force_stop_worker(
         return "kill-failed"
     clear_worker_process_metadata(wl)
     return "killed"
+
+
+def terminate_orphan_process_group(
+    pgid: int, *, procfs: LinuxProcFS = DEFAULT_PROCFS,
+    ops: ProcessOps = SYSTEM_PROCESS_OPS, term_timeout: float = 5.0,
+    kill_timeout: float = 1.0, poll_interval: float = 0.05,
+) -> dict[str, Any]:
+    """Freeze and terminate exact orphan members only through stable pidfds."""
+    members = process_group_members(pgid, procfs=procfs)
+    if not members:
+        return {"outcome": "not-running", "pids": [], "signals_sent": []}
+    signals_sent: list[str] = []
+    handles = _freeze_process_group(pgid, procfs=procfs, ops=ops)
+    pids = sorted(handles)
+    exited = _terminate_frozen_handles(
+        handles, ops=ops, term_timeout=term_timeout,
+        kill_timeout=kill_timeout, poll_interval=poll_interval,
+        on_signal=signals_sent.append,
+    )
+    if not exited or process_group_members(pgid, procfs=procfs):
+        raise RuntimeError("orphan process group did not terminate")
+    return {"outcome": "terminated", "pids": pids, "signals_sent": signals_sent}
 
 
 def _wait_and_reap(process: subprocess.Popen, timeout: float) -> bool:

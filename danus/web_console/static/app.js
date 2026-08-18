@@ -11,6 +11,9 @@ const state = {
   mainAgentEventLastId: 0,
   workers: [],
   logs: [],
+  logMetaByWorker: {},
+  logErrorsByWorker: {},
+  logsRefreshing: null,
   facts: { nodes: [], edges: [] },
   memory: { total: 0, channels: [] },
   reports: { files: [] },
@@ -29,10 +32,18 @@ const state = {
   toastTimer: null,
   refreshingProject: null,
   pendingRefreshingProject: null,
+  reclaimPlan: null,
+  reclaimTarget: "",
 };
 
 const START_RUN_MESSAGE = "The operator requested starting the current bounded Project Run. Inspect the current Project state, then use `danus-web-agent start` to activate the assigned Worker swarm through the authenticated lifecycle broker. Report the broker result.";
 const STOP_RUN_MESSAGE = "The operator requested a graceful stop for the current Project Run. Use `danus-web-agent stop` now so the authenticated lifecycle broker performs the stop, then report the result.";
+
+function lifecycleIntentMessage(action, worker) {
+  const target = worker ? ` Worker ${worker}` : " all Workers";
+  const command = `danus-web-agent ${action}${worker ? ` ${worker}` : ""}`;
+  return `The operator requested ${action} for${target}. Inspect current Project state, then use \`${command}\` through the authenticated host lifecycle broker. Preserve existing assignments and report the exact broker result.`;
+}
 
 function currentPendingMessage() {
   return state.pendingMessage?.project_id === state.current ? state.pendingMessage : null;
@@ -240,26 +251,69 @@ function roleDescription(worker) {
   return role.startsWith("xhigh") ? "深度推理 · lemma 验证" : "快速探索 · 反例与线索";
 }
 
+function processIdentityLabel(worker) {
+  const identity = String(worker?.process_identity || "unknown").toLowerCase();
+  return ({
+    matched: "matched · 已验证",
+    mismatch: "mismatch · PID 不匹配",
+    dead: "dead · 无存活进程",
+    unknown: "unknown · 无法验证",
+  })[identity] || `${identity} · 未知状态`;
+}
+
+function processIdentityClass(worker) {
+  const identity = String(worker?.process_identity || "unknown").toLowerCase();
+  return ["matched", "mismatch", "dead", "unknown"].includes(identity) ? identity : "unknown";
+}
+
+function workerDesiredState(worker) {
+  if (worker?.stop_requested) return { key: "stopped", label: "Graceful stop requested" };
+  if (worker?.pause_requested) return { key: "paused", label: "Pause after round requested" };
+  const desired = String(worker?.desired_state || "running").toLowerCase();
+  return ({
+    stopped: { key: "stopped", label: "Graceful stop requested" },
+    paused: { key: "paused", label: "Pause after round requested" },
+    running: { key: "running", label: "Running" },
+  })[desired] || { key: desired, label: desired };
+}
+
+function workerPid(worker) {
+  const pid = Number(worker?.pid);
+  return Number.isInteger(pid) && pid > 0 ? String(pid) : "—";
+}
+
 function workerStatus(worker) {
   const stateName = String(worker?.state || "").toLowerCase();
+  const persistedState = String(worker?.persisted_state || "").toLowerCase();
+  const recordedActiveState = stateName === "stale" ? persistedState : stateName;
   const labelName = String(worker?.label || "").toLowerCase();
+  if (worker?.process_identity === "mismatch") return { label: "PID 不匹配", className: "error" };
+  if (!worker?.alive && ["running", "retrying"].includes(recordedActiveState)) {
+    return { label: recordedActiveState === "retrying" ? "重试状态已过期" : "运行状态已过期", className: "attention" };
+  }
+  if (worker?.alive && worker?.stop_requested) return { label: "本轮后停止", className: "stopping" };
+  if (worker?.alive && worker?.pause_requested) return { label: "本轮后暂停", className: "pausing" };
   if (worker?.alive) {
     if (stateName === "queued") return { label: "等待 API", className: "queued" };
     if (stateName === "retrying") return { label: String(worker?.last_error || "").includes("429") ? "限流退避" : "等待重试", className: "attention" };
     if (labelName === "stuck?") return { label: "需要关注", className: "attention" };
     return { label: "执行中", className: "working" };
   }
+  if (worker?.process_identity === "unknown" && ["running", "retrying"].includes(stateName)) {
+    return { label: "进程身份未知", className: "attention" };
+  }
   const labels = {
     created: "已配置",
-    idle: "空闲",
+    idle: worker?.pause_requested ? "已暂停" : "空闲",
     stopped: "已停止",
     deadline: "到达期限",
     max_rounds: "达到轮次",
     terminated: "已终止",
+    reclaimed: "已回收",
     error: "出错",
     dead: "离线",
   };
-  const className = stateName === "error" ? "error" : ["deadline", "max_rounds", "stopped", "terminated"].includes(stateName) ? "terminal" : "idle";
+  const className = stateName === "error" ? "error" : ["deadline", "max_rounds", "stopped", "terminated", "reclaimed"].includes(stateName) ? "terminal" : "idle";
   return { label: labels[stateName] || labels[labelName] || "待命", className };
 }
 
@@ -286,6 +340,13 @@ function workerRound(worker) {
 function workerCurrentAction(worker) {
   const round = workerRound(worker);
   const stateName = String(worker?.state || "").toLowerCase();
+  const persistedState = String(worker?.persisted_state || "").toLowerCase();
+  const recordedActiveState = stateName === "stale" ? persistedState : stateName;
+  if (worker?.process_identity === "mismatch") return `PID ${workerPid(worker)} 属于其他进程；状态记录已过期`;
+  if (!worker?.alive && recordedActiveState === "retrying") return "没有 identity-matched retry loop；持久化重试状态已过期";
+  if (!worker?.alive && recordedActiveState === "running") return "没有 identity-matched Worker loop；持久化运行状态已过期";
+  if (worker?.alive && worker?.stop_requested) return `正在完成第 ${round} 轮，随后优雅停止`;
+  if (worker?.alive && worker?.pause_requested) return `正在完成第 ${round} 轮，随后暂停`;
   if (stateName === "queued") return "排队等待可用 API 槽位";
   if (stateName === "retrying") {
     const wait = Math.max(0, Math.ceil(Number(worker?.next_retry_at || 0) - Date.now() / 1000));
@@ -293,12 +354,14 @@ function workerCurrentAction(worker) {
   }
   if (worker?.alive && stateName === "running") return `正在执行第 ${round} 轮`;
   if (worker?.alive) return `在线同步 · ${compactValue(worker?.state, "working")}`;
+  if (worker?.pause_requested || worker?.desired_state === "paused") return round ? `第 ${round} 轮完成，保持暂停` : "已暂停，保留现有任务与研究状态";
   if (stateName === "idle") return round ? `第 ${round} 轮完成，等待下一轮` : "等待第一轮任务";
-  if (stateName === "created") return "已配置，等待启动 Run";
+  if (stateName === "created") return "已配置，等待 Main Agent 启动 Run";
   if (stateName === "deadline") return "运行期限已到达";
   if (stateName === "max_rounds") return "已达到最大轮次";
-  if (stateName === "stopped") return "已请求优雅停止";
-  if (stateName === "terminated") return "进程已终止";
+  if (stateName === "stopped") return "已完成优雅停止";
+  if (stateName === "terminated") return "进程已强制终止";
+  if (stateName === "reclaimed") return "已清理陈旧进程记录";
   if (stateName === "error") return compactValue(worker?.error, "Worker loop 报错");
   return worker?.last_fact_id ? `最近产出 fact ${worker.last_fact_id}` : "等待新任务";
 }
@@ -348,6 +411,117 @@ function workerRoundLogGroups(workerName) {
 function latestWorkerRoundSelection(workerName) {
   const groups = workerRoundLogGroups(workerName);
   return groups.length ? String(groups[groups.length - 1].round) : "all";
+}
+
+function workerLogEntries(workerName) {
+  return state.logs.filter((entry) => entry.worker === workerName).slice().sort((left, right) => {
+    const rank = (entry) => entry.name === "loop.log" ? 0 : entry.kind === "round" ? 1 : 2;
+    const ranked = rank(left) - rank(right);
+    if (ranked) return ranked;
+    if (left.kind === "round" && right.kind === "round") return Number(left.round || 0) - Number(right.round || 0);
+    return String(left.name || "").localeCompare(String(right.name || ""));
+  });
+}
+
+function latestRawLogSelection(workerName) {
+  const entries = workerLogEntries(workerName);
+  const loop = entries.find((entry) => entry.name === "loop.log");
+  return loop?.name || entries[entries.length - 1]?.name || "";
+}
+
+function logMetaForWorker(workerName) {
+  return state.logMetaByWorker[workerName] || state.logMetaByWorker["*"] || {};
+}
+
+function logErrorForWorker(workerName) {
+  return state.logErrorsByWorker[workerName] || state.logErrorsByWorker["*"] || null;
+}
+
+function applyLogProjection(projection, scopedWorker = null) {
+  if (!projection || !Array.isArray(projection.entries)) return;
+  if (scopedWorker) {
+    state.logs = state.logs.filter((entry) => entry.worker !== scopedWorker).concat(projection.entries);
+  } else {
+    state.logs = projection.entries;
+  }
+  const meta = {
+    fetched_at: projection.fetched_at || Date.now() / 1000,
+    tail: projection.tail || 200,
+    max_bytes: projection.max_bytes || 65536,
+  };
+  const workers = scopedWorker
+    ? [scopedWorker]
+    : [...new Set(projection.entries.map((entry) => entry.worker).filter(Boolean))];
+  if (!workers.length) state.logMetaByWorker[scopedWorker || "*"] = meta;
+  workers.forEach((workerName) => {
+    state.logMetaByWorker[workerName] = meta;
+    delete state.logErrorsByWorker[workerName];
+  });
+  if (!scopedWorker) {
+    state.logMetaByWorker["*"] = meta;
+    delete state.logErrorsByWorker["*"];
+  }
+}
+
+function recordLogError(error, workerName = null) {
+  state.logErrorsByWorker[workerName || "*"] = {
+    message: error?.message || "日志获取失败",
+    at: Date.now() / 1000,
+  };
+}
+
+function workerLogUrl(projectId, workerName = null) {
+  const worker = workerName ? `&worker=${encodeURIComponent(workerName)}` : "";
+  return `/api/projects/${projectId}/logs?tail=200&max_bytes=65536${worker}`;
+}
+
+function pendingLogRequest(projectAtStart) {
+  return state.activeWorker ? api(workerLogUrl(projectAtStart, state.activeWorker)) : Promise.resolve(null);
+}
+
+function renderRawWorkerLog(workerName, selectedName) {
+  const entries = workerLogEntries(workerName);
+  const entry = entries.find((item) => item.name === selectedName) || null;
+  const meta = logMetaForWorker(workerName);
+  const error = logErrorForWorker(workerName);
+  const errorMarkup = error
+    ? `<div class="log-fetch-error" role="status"><strong>日志获取失败</strong><span>${esc(error.message)}</span><small>${entries.length ? "显示上一次成功获取的 bounded snapshot" : "当前没有可回退的日志快照"}</small></div>`
+    : "";
+  if (!entries.length) {
+    const empty = meta.fetched_at ? "尚未生成日志文件。" : "尚未获取日志；打开 Worker 后会加载 bounded tail。";
+    return `${errorMarkup}<div class="raw-log-empty"><strong>${esc(empty)}</strong><span>loop.log 与 round_N.log 出现后会列在这里。</span></div>`;
+  }
+  const tabs = entries.map((item) => `<button class="raw-log-tab ${item.name === selectedName ? "is-active" : ""}" type="button" data-worker-log="${esc(item.name)}" aria-pressed="${item.name === selectedName ? "true" : "false"}">${esc(item.name)}${item.truncated ? " · truncated" : ""}</button>`).join("");
+  if (!entry) return `${errorMarkup}<div class="raw-log-empty"><strong>所选日志不再存在。</strong><span>请选择另一个日志快照。</span></div>`;
+  const refreshed = meta.fetched_at ? formatTime(meta.fetched_at) : "尚未刷新";
+  const modified = entry.modified_at ? formatTime(entry.modified_at) : "未知";
+  const rawBody = entry.empty
+    ? '<div class="raw-log-empty"><strong>日志文件存在，但当前为空。</strong><span>Worker 可能尚未写入第一行。</span></div>'
+    : entry.lines?.length
+      ? `<pre class="raw-log-tail"><code>${esc(entry.lines.join("\n"))}</code></pre>`
+      : '<div class="raw-log-empty"><strong>日志存在，但 bounded tail 没有返回完整行。</strong><span>可刷新后重试。</span></div>';
+  return `${errorMarkup}<div class="raw-log-tabs" role="tablist" aria-label="选择 raw Worker log">${tabs}</div><div class="raw-log-metadata"><span><strong>Source</strong>${esc(entry.name)}</span><span><strong>Kind</strong>${esc(entry.kind || "other")}</span><span><strong>Size</strong>${esc(formatBytes(entry.size))}</span><span><strong>Modified</strong>${esc(modified)}</span><span><strong>Returned</strong>${esc(entry.returned_lines || 0)} lines</span><span><strong>Bounds</strong>tail ${esc(meta.tail || 200)} · ${esc(formatBytes(meta.max_bytes || 65536))}</span><span><strong>Refresh</strong>${esc(refreshed)}</span><span><strong>Truncation</strong>${entry.truncated ? "truncated" : "complete within bounds"}</span></div>${rawBody}`;
+}
+
+async function refreshWorkerLogs(workerName, options = {}) {
+  if (!state.current || !workerName || state.logsRefreshing === workerName) return;
+  const projectAtStart = state.current;
+  state.logsRefreshing = workerName;
+  renderWorkerDrawer();
+  try {
+    const projection = await api(workerLogUrl(projectAtStart, workerName));
+    if (state.current !== projectAtStart) return;
+    applyLogProjection(projection, workerName);
+    if (options.notify) notify(`${workerName} 日志已刷新`, "success");
+  } catch (error) {
+    if (state.current === projectAtStart) {
+      recordLogError(error, workerName);
+      if (options.notify) notify(error.message || "日志获取失败", "error");
+    }
+  } finally {
+    if (state.logsRefreshing === workerName) state.logsRefreshing = null;
+    if (state.current === projectAtStart) renderWorkerDrawer();
+  }
 }
 
 function workerLogLines(workerName) {
@@ -468,7 +642,7 @@ function renderWorkerRoundTranscript(groups, selectedRound, worker) {
       idPrefix: `round-${group.round}-`,
     });
     const sources = group.entries.map((entry) => entry.name).join(" · ");
-    return `<section class="round-transcript-group" data-round="${esc(group.round)}"><div class="round-transcript-heading"><strong>第 ${esc(group.round)} 轮</strong><small>${esc(group.lines.length)} 行 · ${esc(sources)}</small></div>${transcript || '<div class="round-log-empty">本轮暂无可显示消息</div>'}</section>`;
+    return `<section class="round-transcript-group" data-round="${esc(group.round)}"><div class="round-transcript-heading"><strong>第 ${esc(group.round)} 轮</strong><small>${esc(group.lines.length)} 行 · ${esc(sources)}</small></div>${transcript || '<div class="round-log-empty">本轮日志存在，但 transcript parser 没有可显示消息；请查看下方 raw tail。</div>'}</section>`;
   }).join("");
   if (assignment || rounds) return `${assignment}${rounds}`;
   return renderTranscript([], worker);
@@ -711,8 +885,13 @@ function renderProjectShell(project) {
     <section class="conversation-view">
       <header class="project-header">
         <div class="project-header-copy"><p class="eyebrow">PROJECT / ${esc(project.name)}</p><div class="project-title-row"><h1>${esc(project.name)}</h1><span id="main-status" class="status-pill idle"><i></i>Main Agent 待命</span></div><p class="project-problem">${esc(project.problem || "还没有描述问题")}</p><div class="project-config-chips"><span>Worker · ${esc(model)}</span><span>并发 · ${esc(capacity)}</span></div></div>
-        <div class="project-header-actions"><button id="run-start" class="secondary-button"><span class="button-dot"></span>启动 workers</button><button id="run-stop" class="quiet-button">停止</button><button id="delete-project" class="quiet-button danger-text">删除</button></div>
+        <div class="project-header-actions"><button id="workers-logs-open" class="secondary-button workers-logs-button" type="button" aria-expanded="false" aria-controls="worker-rail"><span aria-hidden="true">☷</span>Workers / Logs</button><button id="run-start" class="secondary-button"><span class="button-dot"></span>启动 workers</button><button id="delete-project" class="quiet-button danger-text">删除</button></div>
       </header>
+      <section class="lifecycle-controls" aria-label="Worker lifecycle and recovery controls">
+        <div class="lifecycle-target"><label for="lifecycle-worker-target">Operational target</label><select id="lifecycle-worker-target"><option value="">All Workers</option></select><small>这些是 host safety / desired-state controls；不会分配任务或修改研究策略。</small></div>
+        <div class="lifecycle-actions"><button id="run-pause" class="control-button" type="button">Pause after round</button><button id="run-resume" class="control-button" type="button">Resume</button><button id="run-stop" class="control-button" type="button">Graceful stop</button><button id="run-force-stop" class="control-button danger" type="button">Force stop now</button><button id="run-reclaim" class="control-button warning" type="button">Reclaim dry-run</button></div>
+        <div id="lifecycle-safety" class="lifecycle-safety" role="status"></div>
+      </section>
       <div id="conversation-scroll" class="conversation-scroll">
         <section id="main-agent-control" class="main-agent-control" aria-label="Main Agent orchestration state"></section>
         <div id="main-activity" class="main-activity" hidden><span class="thinking-dots"><i></i><i></i><i></i></span><span>Main Agent 会话执行中 · 正在读取真实项目状态并编排</span><span class="activity-line"></span></div>
@@ -722,11 +901,21 @@ function renderProjectShell(project) {
       <div class="composer-wrap"><form id="chat-form" class="composer"><div class="composer-top"><div class="composer-tools"><label class="composer-tool" for="attachment" title="添加资料">＋</label><select id="attachment" aria-label="选择附件"><option value="">添加资料</option></select><span class="composer-divider"></span><span class="agent-selector"><span class="mini-agent-avatar">M</span>Main Agent <span class="chevron">⌄</span></span></div><span class="composer-context">项目上下文已载入</span></div><textarea id="message" rows="1" placeholder="继续和 Main Agent 对话……" required></textarea><div class="composer-bottom"><span class="composer-hint">Enter 发送 · Shift + Enter 换行</span><button class="send-button" type="submit" aria-label="发送">↑</button></div></form></div>
     </section>
     <div id="worker-rail-resizer" class="rail-resizer rail-resizer-right" role="separator" aria-label="调整 Worker 侧栏宽度" aria-orientation="vertical" tabindex="0"></div>
-    <aside class="worker-rail" aria-label="Worker fleet"><div class="rail-header"><div><p class="eyebrow">OBSERVABILITY</p><h2>Worker fleet</h2></div><span id="worker-count" class="count-badge">0</span></div><p class="rail-intro">点选一个 worker，打开它的实时对话与执行轨迹。</p><div id="workers" class="worker-list"></div><div class="rail-runtime"><div class="rail-runtime-top"><span class="status-dot online"></span><span id="run-state">Run 尚未启动</span></div><div class="rail-runtime-bar"><span></span></div><p>主 agent 负责方向，workers 并行推进证明。</p></div></aside>
+    <aside id="worker-rail" class="worker-rail" aria-label="Worker fleet"><div class="rail-header"><div><p class="eyebrow">OBSERVABILITY</p><h2>Workers / Logs</h2></div><div class="rail-header-actions"><span id="worker-count" class="count-badge">0</span><button id="worker-rail-close" class="close-button worker-rail-close" type="button" aria-label="关闭 Workers / Logs">×</button></div></div><p class="rail-intro">点选一个 Worker，查看结构化 round transcript、loop.log 与 raw bounded tails。</p><div id="workers" class="worker-list"></div><div class="rail-runtime"><div class="rail-runtime-top"><span class="status-dot online"></span><span id="run-state">Run 尚未启动</span></div><div class="rail-runtime-bar"><span id="run-progress-bar"></span></div><p id="run-progress-detail">主 agent 负责方向，workers 并行推进证明。</p></div></aside>
     <aside id="worker-drawer" class="worker-drawer" hidden aria-label="Worker details"></aside>
+    <div id="reclaim-modal" class="reclaim-backdrop" hidden><section class="reclaim-plan" role="dialog" aria-modal="true" aria-labelledby="reclaim-plan-title"><div class="drawer-header"><div><p class="eyebrow">IDENTITY-VERIFIED RECOVERY</p><h2 id="reclaim-plan-title">Reclaim dry-run</h2></div><button id="reclaim-close" class="close-button" type="button" aria-label="关闭 reclaim dry-run">×</button></div><div id="reclaim-plan-body"></div><div class="reclaim-actions"><button id="reclaim-cancel" class="secondary-button" type="button">Cancel</button><button id="reclaim-confirm" class="primary-button" type="button">Confirm reclaim</button></div></section></div>
   </div>`;
   bindProjectControls();
   bindRailResizer("worker-rail-resizer", "worker");
+}
+
+function setWorkerRailOpen(open) {
+  const rail = $("worker-rail");
+  const button = $("workers-logs-open");
+  if (!rail || !button) return;
+  rail.classList.toggle("is-open", open);
+  button.setAttribute("aria-expanded", open ? "true" : "false");
+  if (open) window.requestAnimationFrame(() => rail.querySelector("[data-worker]")?.focus());
 }
 
 function bindProjectControls() {
@@ -744,8 +933,22 @@ function bindProjectControls() {
     const card = event.target.closest("[data-worker]");
     if (card) openWorkerDrawer(card.dataset.worker);
   });
+  $("workers-logs-open").addEventListener("click", () => setWorkerRailOpen(true));
+  $("worker-rail-close").addEventListener("click", () => setWorkerRailOpen(false));
   $("run-start").addEventListener("click", startRun);
+  $("run-pause").addEventListener("click", pauseRun);
+  $("run-resume").addEventListener("click", resumeRun);
   $("run-stop").addEventListener("click", stopRun);
+  $("run-force-stop").addEventListener("click", forceStopRun);
+  $("run-reclaim").addEventListener("click", reclaimDryRun);
+  $("lifecycle-worker-target").addEventListener("change", () => {
+    state.reclaimPlan = null;
+    renderLifecycleControls();
+  });
+  $("reclaim-close").addEventListener("click", closeReclaimPlan);
+  $("reclaim-cancel").addEventListener("click", closeReclaimPlan);
+  $("reclaim-confirm").addEventListener("click", confirmReclaim);
+  $("reclaim-modal").addEventListener("click", (event) => { if (event.target === $("reclaim-modal")) closeReclaimPlan(); });
   $("delete-project").addEventListener("click", deleteProject);
   $("upload-form").addEventListener("submit", handleUpload);
   $("upload").addEventListener("change", () => {
@@ -771,6 +974,11 @@ async function openProject(id) {
   state.selectedFactId = null;
   state.current = id;
   state.activeWorker = null;
+  state.logs = [];
+  state.logMetaByWorker = {};
+  state.logErrorsByWorker = {};
+  state.reclaimPlan = null;
+  state.reclaimTarget = "";
   state.messages = [];
   state.mainAgentEvents = [];
   state.mainAgentEventLastId = 0;
@@ -794,31 +1002,47 @@ function mainAgentFailureMarkup(message) {
 function mainAgentEventLabel(type) {
   return ({
     "turn.started": "会话启动",
-    "agent.message": "Main Agent",
-    "tool.started": "调用工具",
-    "tool.completed": "工具完成",
-    "turn.retry": "自动重试",
+    "agent.progress": "Reasoning / progress summary",
+    "agent.message": "Emitted progress",
+    "tool.started": "Tool started",
+    "tool.completed": "Tool completed",
+    "turn.retry": "自动续接",
     "turn.completed": "执行完成",
     "turn.failed": "执行失败",
   })[type] || "执行事件";
 }
 
+function mainAgentEventMeta(event) {
+  const values = [`event #${event.id ?? "—"}`, String(event.type || "event")];
+  if (event.status) values.push(String(event.status));
+  if (event.attempt != null) values.push(`attempt ${event.attempt}/${event.max_attempts || event.attempt}`);
+  if (event.delay_seconds != null) values.push(`retry in ${event.delay_seconds}s`);
+  if (event.duration_seconds != null) values.push(`duration ${event.duration_seconds}s`);
+  if (event.message_id) values.push(`message ${String(event.message_id).slice(0, 10)}`);
+  if (event.main_agent_session_id) values.push(`session ${String(event.main_agent_session_id).slice(0, 10)}`);
+  if (event.run_id) values.push(`run ${String(event.run_id).slice(0, 10)}`);
+  if (event.call_id) values.push(`call ${String(event.call_id).slice(0, 10)}`);
+  return values.join(" · ");
+}
+
 function renderMainAgentEvents(messageId) {
-  const events = state.mainAgentEvents.filter((event) => event.message_id === messageId);
+  const events = state.mainAgentEvents
+    .filter((event) => event.message_id === messageId);
   if (!events.length) return "";
+  const orderedEvents = events.slice().sort((left, right) => Number(left.id || 0) - Number(right.id || 0));
   const message = state.messages.find((row) => row.id === messageId);
   const live = message && ["submitted", "retrying", "pending"].includes(message.status);
-  const rows = events.map((event) => {
+  const rows = orderedEvents.map((event) => {
     const type = String(event.type || "event");
     const label = mainAgentEventLabel(type);
     const tool = event.tool ? `<strong>${esc(event.tool)}</strong>` : "";
     const detail = String(event.detail || "");
     const detailMarkup = detail
       ? (type === "agent.message" ? `<div class="main-agent-event-message">${renderMarkdown(detail)}</div>` : `<pre>${esc(detail)}</pre>`)
-      : "";
-    return `<li class="main-agent-event ${esc(type.replace(/\./g, "-"))}"><i></i><div><div class="main-agent-event-head"><span>${esc(label)}</span>${tool}<time>${formatTime(event.created_at)}</time></div>${detailMarkup}</div></li>`;
+      : '<div class="main-agent-event-empty">No additional safe detail was emitted.</div>';
+    return `<li class="main-agent-event ${esc(type.replace(/\./g, "-"))}" data-event-id="${esc(event.id)}"><i></i><div><div class="main-agent-event-head"><span>${esc(label)}</span>${tool}<time>${formatTime(event.created_at)}</time></div><small class="main-agent-event-meta">${esc(mainAgentEventMeta(event))}</small>${detailMarkup}</div></li>`;
   }).join("");
-  return `<details class="main-agent-events ${live ? "is-live" : ""}" ${live ? "open" : ""}><summary><span>执行过程</span><small>${events.length} 个事件${live ? " · 实时更新" : ""}</small></summary><ol>${rows}</ol></details>`;
+  return `<details class="main-agent-events ${live ? "is-live" : ""}" open><summary><span>Emitted progress + tool trace · 执行过程</span><small>${orderedEvents.length} 个持久事件${live ? " · 实时更新" : ""}</small></summary><div class="main-agent-event-boundary"><strong>运行时提供的安全事件流</strong><span>Shows the safe progress/tool events made available by the Main Agent runtime; private chain-of-thought is not exposed.</span></div><ol>${rows}</ol></details>`;
 }
 
 function renderMessages() {
@@ -910,10 +1134,12 @@ function renderWorkers() {
   $("worker-count").textContent = String(state.workers.length);
   if (!state.workers.length) {
     container.innerHTML = '<div class="worker-empty"><span class="empty-worker-icon">∿</span><strong>还没有 worker</strong><p>创建项目时的 worker roster 会出现在这里。</p></div>';
+    renderLifecycleControls();
     return;
   }
   container.innerHTML = state.workers.map((worker) => {
     const status = workerStatus(worker);
+    const desired = workerDesiredState(worker);
     const selected = state.activeWorker === worker.worker;
     const action = workerCurrentAction(worker);
     const task = worker.assigned === false ? "尚未由 Main Agent 分工" : compactValue(worker.task, "等待任务投影");
@@ -924,6 +1150,8 @@ function renderWorkers() {
         <small>${esc(roleDescription(worker))}</small>
         <span class="worker-card-action"><span>Action</span><strong>${esc(action)}</strong></span>
         <span class="worker-card-task ${worker.assigned === false ? "is-unassigned" : ""}"><em>Task</em><strong>${esc(shortText(task, 112))}</strong></span>
+        <span class="worker-process-row"><span><em>PID</em><strong>${esc(workerPid(worker))}</strong></span><span><em>Process identity</em><strong class="process-identity ${processIdentityClass(worker)}">${esc(processIdentityLabel(worker))}</strong></span></span>
+        <span class="worker-desired-state ${esc(desired.key)}"><em>Desired state</em><strong>${esc(desired.label)}</strong></span>
         <span class="worker-card-fields">
           <span><em>Round</em><strong>${esc(workerRound(worker))}</strong></span>
           <span><em>Model</em><strong>${esc(shortText(compactValue(worker.model, "default"), 18))}</strong></span>
@@ -933,6 +1161,7 @@ function renderWorkers() {
       <span class="worker-chevron">›</span>
     </button>`;
   }).join("");
+  renderLifecycleControls();
 }
 
 function openWorkerDrawer(workerName) {
@@ -940,12 +1169,15 @@ function openWorkerDrawer(workerName) {
   const selectedRound = latestWorkerRoundSelection(workerName);
   state.drawerViews[workerName] = {
     selectedRound,
+    selectedRawLog: latestRawLogSelection(workerName),
     positions: {
       [selectedRound]: { scrollTop: 0, followTail: true, forceBottom: true, openTools: [] },
     },
   };
+  setWorkerRailOpen(false);
   renderWorkers();
   renderWorkerDrawer({ remember: false });
+  void refreshWorkerLogs(workerName);
 }
 
 function closeWorkerDrawer() {
@@ -985,6 +1217,13 @@ function selectWorkerRound(workerName, selectedRound) {
   renderWorkerDrawer({ remember: false });
 }
 
+function selectWorkerRawLog(workerName, selectedName) {
+  const view = state.drawerViews[workerName];
+  if (!view || !workerLogEntries(workerName).some((entry) => entry.name === selectedName)) return;
+  view.selectedRawLog = selectedName;
+  renderWorkerDrawer();
+}
+
 function renderWorkerDrawer(options = {}) {
   const drawer = $("worker-drawer");
   if (!drawer) return;
@@ -997,15 +1236,19 @@ function renderWorkerDrawer(options = {}) {
     return;
   }
   const status = workerStatus(worker);
+  const desired = workerDesiredState(worker);
   const groups = workerRoundLogGroups(worker.worker);
+  const rawEntries = workerLogEntries(worker.worker);
   const latestRound = groups.length ? String(groups[groups.length - 1].round) : "all";
-  const view = state.drawerViews[worker.worker] || { selectedRound: latestRound, positions: {} };
+  const view = state.drawerViews[worker.worker] || { selectedRound: latestRound, selectedRawLog: latestRawLogSelection(worker.worker), positions: {} };
   if (view.selectedRound !== "all" && !groups.some((group) => String(group.round) === view.selectedRound)) {
     view.selectedRound = latestRound;
     view.positions[latestRound] = { scrollTop: 0, followTail: true, forceBottom: true, openTools: [] };
   }
+  if (!rawEntries.some((entry) => entry.name === view.selectedRawLog)) view.selectedRawLog = latestRawLogSelection(worker.worker);
   view.positions ||= {};
   const selectedRound = view.selectedRound || latestRound;
+  const selectedRawLog = view.selectedRawLog || "";
   const saved = view.positions[selectedRound] || { scrollTop: 0, followTail: true, forceBottom: true, openTools: [] };
   view.positions[selectedRound] = saved;
   state.drawerViews[worker.worker] = view;
@@ -1020,10 +1263,17 @@ function renderWorkerDrawer(options = {}) {
     <div class="worker-state-panel">
       <div><span>State</span><strong>${esc(compactValue(worker.state, "idle"))}</strong></div>
       <div><span>Action</span><strong>${esc(action)}</strong></div>
+      <div><span>PID</span><strong>${esc(workerPid(worker))}</strong></div>
+      <div><span>Desired state</span><strong>${esc(desired.label)}</strong></div>
     </div>
-    <details class="worker-metadata" ${metadataWasOpen ? "open" : ""}><summary><span>运行详情</span><small>${esc(compactValue(worker.model, "default"))} · ${esc(compactValue(worker.reasoning_effort, "inherit"))} · memory ${esc(worker.local_memory_count || 0)}</small></summary><div class="worker-config-grid">
+    <details class="worker-metadata" ${metadataWasOpen ? "open" : ""}><summary><span>运行详情</span><small>PID ${esc(workerPid(worker))} · ${esc(processIdentityLabel(worker))} · memory ${esc(worker.local_memory_count || 0)}</small></summary><div class="worker-config-grid">
         <div><span>Role</span><strong>${esc(compactValue(worker.role || worker.worker))}</strong></div>
         <div><span>Round</span><strong>${esc(workerRound(worker))}</strong></div>
+        <div><span>PID</span><strong>${esc(workerPid(worker))}</strong></div>
+        <div><span>Process identity</span><strong class="process-identity ${processIdentityClass(worker)}">${esc(processIdentityLabel(worker))}</strong></div>
+        <div><span>Desired state</span><strong>${esc(desired.label)}</strong></div>
+        <div><span>Stop marker</span><strong>${worker.stop_requested ? "present" : "absent"}</strong></div>
+        <div><span>Pause marker</span><strong>${worker.pause_requested ? "present" : "absent"}</strong></div>
         <div><span>Effort</span><strong>${esc(compactValue(worker.reasoning_effort, "inherit"))}</strong></div>
         <div><span>Model</span><strong>${esc(compactValue(worker.model, "project default"))}</strong></div>
         <div><span>Last fact</span><strong>${esc(compactValue(worker.last_fact_id))}</strong></div>
@@ -1033,11 +1283,20 @@ function renderWorkerDrawer(options = {}) {
         <div><span>Retry</span><strong>${worker.next_retry_at ? esc(formatTime(worker.next_retry_at)) : "—"}</strong></div>
         <div><span>Local memory</span><strong>${esc(worker.local_memory_count || 0)}</strong></div>
       </div>${checkpoint ? `<section class="worker-checkpoint"><div><span>CHECKPOINT</span><small>${esc(checkpoint.source || "local memory")}${checkpoint.round != null ? ` · round ${esc(checkpoint.round)}` : ""}${checkpoint.fact_id ? ` · fact ${esc(checkpoint.fact_id)}` : ""}</small></div><div class="state-panel-markdown">${renderMarkdown(checkpoint.message)}</div></section>` : ""}</details>
-    <section class="drawer-section"><div class="drawer-section-heading"><div><p class="eyebrow">LIVE TRANSCRIPT</p><h3>执行轨迹</h3></div><span>${groups.length ? `${esc(groups.length)} 个保留轮次` : "暂无轮次日志"}</span></div><div class="worker-round-tabs" role="tablist" aria-label="选择 Worker 轮次">${roundTabs.map((tab) => `<button class="worker-round-tab ${tab.value === selectedRound ? "is-active" : ""}" type="button" role="tab" aria-selected="${tab.value === selectedRound ? "true" : "false"}" data-worker-round="${esc(tab.value)}">${esc(tab.label)}</button>`).join("")}</div><div class="trace-list">${renderWorkerRoundTranscript(groups, selectedRound, worker)}</div></section>
-    <div class="drawer-footer"><span class="status-dot ${worker.alive ? "online" : "offline"}"></span><span>${worker.alive ? "正在持续同步" : "等待下一次运行"}</span><span class="drawer-footer-spacer"></span><span>author: ${esc(worker.author || worker.worker)}</span></div>`;
+    <div class="drawer-trace-body">
+      <section class="drawer-section"><div class="drawer-section-heading"><div><p class="eyebrow">STRUCTURED ROUND TRANSCRIPT</p><h3>执行轨迹</h3></div><span>${groups.length ? `${esc(groups.length)} 个保留轮次` : "暂无轮次日志"}</span></div><div class="worker-round-tabs" role="tablist" aria-label="选择 Worker 轮次">${roundTabs.map((tab) => `<button class="worker-round-tab ${tab.value === selectedRound ? "is-active" : ""}" type="button" role="tab" aria-selected="${tab.value === selectedRound ? "true" : "false"}" data-worker-round="${esc(tab.value)}">${esc(tab.label)}</button>`).join("")}</div><div class="trace-list">${renderWorkerRoundTranscript(groups, selectedRound, worker)}</div></section>
+      <section class="raw-log-panel"><div class="drawer-section-heading"><div><p class="eyebrow">RAW BOUNDED LOGS</p><h3>loop.log + retained round logs</h3></div><button class="log-refresh-button" type="button" data-refresh-worker-log="${esc(worker.worker)}" ${state.logsRefreshing === worker.worker ? "disabled" : ""}>${state.logsRefreshing === worker.worker ? "Refreshing…" : "Refresh"}</button></div>${renderRawWorkerLog(worker.worker, selectedRawLog)}</section>
+    </div>
+    <div class="drawer-footer"><span class="status-dot ${worker.alive ? "online" : "offline"}"></span><span>${worker.alive ? "identity-matched Worker loop" : `not live · ${esc(processIdentityLabel(worker))}`}</span><span class="drawer-footer-spacer"></span><span>author: ${esc(worker.author || worker.worker)}</span></div>`;
   $("worker-drawer-close").addEventListener("click", closeWorkerDrawer);
   drawer.querySelectorAll("[data-worker-round]").forEach((button) => {
     button.addEventListener("click", () => selectWorkerRound(worker.worker, button.dataset.workerRound));
+  });
+  drawer.querySelectorAll("[data-worker-log]").forEach((button) => {
+    button.addEventListener("click", () => selectWorkerRawLog(worker.worker, button.dataset.workerLog));
+  });
+  drawer.querySelector("[data-refresh-worker-log]")?.addEventListener("click", () => {
+    void refreshWorkerLogs(worker.worker, { notify: true });
   });
   const trace = drawer.querySelector(".trace-list");
   if (trace) {
@@ -1448,8 +1707,206 @@ function renderArtifacts() {
   $("artifacts").innerHTML = files.map((file) => `<div class="artifact-row"><span>↗</span><span><strong>${esc(file.name)}</strong><small>${formatBytes(file.size)}</small></span></div>`).join("") || '<p class="muted">还没有报告或输出。</p>';
 }
 
+function runtimeProgress() {
+  const activeRun = state.runtime.run || {};
+  const progress = state.runtime.progress || {};
+  const expected = Number(activeRun.expected_workers ?? progress.expected_workers ?? state.workers.length ?? 0);
+  const live = Number(activeRun.live_workers ?? progress.live_workers ?? state.workers.filter((worker) => worker.alive).length);
+  const pending = Number(activeRun.stop_pending_workers ?? progress.stop_pending_workers ?? state.workers.filter((worker) => worker.alive && worker.stop_requested).length);
+  const stale = Number(activeRun.stale_workers ?? progress.stale_workers ?? state.workers.filter((worker) => worker.process_identity === "mismatch").length);
+  const stopped = Number(activeRun.stopped_workers ?? progress.stopped_workers ?? Math.max(0, expected - live - stale));
+  return {
+    expected_workers: Math.max(0, expected),
+    live_workers: Math.max(0, live),
+    stop_pending_workers: Math.max(0, pending),
+    stopped_workers: Math.max(0, stopped),
+    stale_workers: Math.max(0, stale),
+  };
+}
+
+function gracefulStopProgressText(progress) {
+  const stale = progress.stale_workers ? ` · ${progress.stale_workers} stale process record${progress.stale_workers === 1 ? "" : "s"}` : "";
+  if (progress.live_workers > 0 && progress.stop_pending_workers === 0) {
+    return `Graceful stop intent recorded · awaiting Main Agent / host broker · ${progress.live_workers} still running${stale}`;
+  }
+  return `Graceful stop in progress · ${progress.stop_pending_workers} finishing current round · ${progress.stopped_workers} stopped${stale}`;
+}
+
+function lifecycleTargetValue() {
+  return $("lifecycle-worker-target")?.value || "";
+}
+
+function lifecycleTargetWorkers(target = lifecycleTargetValue()) {
+  return target ? state.workers.filter((worker) => worker.worker === target) : state.workers.slice();
+}
+
+function forceStopSafety(target = lifecycleTargetValue()) {
+  const workers = lifecycleTargetWorkers(target);
+  const blocking = workers.filter((worker) => worker.pid != null && worker.process_identity !== "matched");
+  const matched = workers.filter((worker) => worker.process_identity === "matched" && worker.alive);
+  if (blocking.length) {
+    return { allowed: false, reason: `Blocked: ${blocking.map((worker) => `${worker.worker} PID ${workerPid(worker)} is ${worker.process_identity || "unknown"}`).join("; ")}` };
+  }
+  if (!matched.length) return { allowed: false, reason: "Blocked: no identity-matched live Worker process is selected." };
+  return { allowed: true, reason: `Identity safety passed for ${matched.length} live Worker process${matched.length === 1 ? "" : "es"}.` };
+}
+
+function reclaimCandidate(worker) {
+  const identity = String(worker?.process_identity || "unknown");
+  return worker?.reclaim_candidate === true || identity === "mismatch" || (worker?.pid != null && identity === "dead");
+}
+
+function renderLifecycleControls() {
+  const select = $("lifecycle-worker-target");
+  if (!select) return;
+  const previous = select.value;
+  select.innerHTML = '<option value="">All Workers</option>' + state.workers.map((worker) => `<option value="${esc(worker.worker)}">${esc(worker.worker)}</option>`).join("");
+  select.value = state.workers.some((worker) => worker.worker === previous) ? previous : "";
+  const workers = lifecycleTargetWorkers(select.value);
+  const activeRun = state.runtime.run;
+  const live = workers.filter((worker) => worker.alive);
+  const paused = workers.filter((worker) => worker.pause_requested || worker.desired_state === "paused");
+  const stopPending = workers.filter((worker) => worker.stop_requested);
+  const forceSafety = forceStopSafety(select.value);
+  const reclaimable = workers.filter(reclaimCandidate);
+  const pause = $("run-pause");
+  const resume = $("run-resume");
+  const stop = $("run-stop");
+  const force = $("run-force-stop");
+  const reclaim = $("run-reclaim");
+  const mainAgentBusy = Boolean(currentPendingMessage());
+  if (pause) pause.disabled = mainAgentBusy || !live.some((worker) => !worker.pause_requested && !worker.stop_requested);
+  if (resume) resume.disabled = mainAgentBusy || !paused.length;
+  if (stop) stop.disabled = mainAgentBusy || (!activeRun && !live.length) || (live.length > 0 && stopPending.length === live.length);
+  if (force) {
+    force.disabled = !forceSafety.allowed;
+    force.title = forceSafety.reason;
+  }
+  if (reclaim) {
+    reclaim.disabled = !reclaimable.length;
+    reclaim.title = reclaimable.length ? "Preview identity-verified stale artifact cleanup" : "No concrete mismatch/dead process record is currently detected";
+  }
+  const safety = $("lifecycle-safety");
+  if (safety) {
+    const target = select.value || "all Workers";
+    const desired = workers.length ? workers.map((worker) => `${worker.worker}: ${workerDesiredState(worker).label}`).join(" · ") : "No Workers";
+    safety.className = `lifecycle-safety ${forceSafety.allowed ? "safe" : "blocked"}`;
+    safety.innerHTML = `<strong>${esc(target)}</strong><span>${esc(desired)}</span><small>${esc(forceSafety.reason)}${reclaimable.length ? ` · ${reclaimable.length} reclaim candidate${reclaimable.length === 1 ? "" : "s"}` : ""}</small>`;
+  }
+}
+
+async function lifecycleRequest(endpoint, payload, successMessage) {
+  if (!state.current) return null;
+  const result = await api(`/api/projects/${state.current}/${endpoint}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  notify(successMessage, "success");
+  await refreshProject();
+  return result;
+}
+
+async function pauseRun() {
+  const worker = lifecycleTargetValue();
+  const label = worker || "all Workers";
+  if (!window.confirm(`Pause after round for ${label}? Current rounds may finish and persist before pause.`)) return;
+  try {
+    await lifecycleRequest("pause", worker ? { worker } : {}, `Pause intent recorded for ${label}`);
+    const activated = await sendMessageText(lifecycleIntentMessage("pause", worker));
+    notify(activated ? `Main Agent is applying pause-after-round for ${label}` : "Pause intent recorded, but Main Agent did not activate", activated ? "success" : "error");
+  } catch (error) {
+    notify(error.message || "Pause request failed", "error");
+  }
+}
+
+async function resumeRun() {
+  const worker = lifecycleTargetValue();
+  const label = worker || "all paused Workers";
+  if (!window.confirm(`Resume ${label} with their existing assigned tasks? This does not change strategy or tasks.`)) return;
+  try {
+    await lifecycleRequest("resume", worker ? { worker } : {}, `Resume intent recorded for ${label}`);
+    const activated = await sendMessageText(lifecycleIntentMessage("resume", worker));
+    notify(activated ? `Main Agent is resuming ${label} through the host broker` : "Resume intent recorded, but Main Agent did not activate", activated ? "success" : "error");
+  } catch (error) {
+    notify(error.message || "Resume failed", "error");
+  }
+}
+
+function closeReclaimPlan() {
+  const modal = $("reclaim-modal");
+  if (modal) modal.hidden = true;
+}
+
+function renderReclaimPlan() {
+  const modal = $("reclaim-modal");
+  const body = $("reclaim-plan-body");
+  const confirm = $("reclaim-confirm");
+  if (!modal || !body || !confirm || !state.reclaimPlan) return;
+  const plan = state.reclaimPlan;
+  const rows = (plan.workers || []).map((worker) => `<article class="reclaim-target ${worker.safe_to_execute ? "safe" : "blocked"}"><div><strong>${esc(worker.worker)}</strong><span>PID ${esc(worker.pid ?? "—")} · identity ${esc(worker.process_identity || "unknown")}</span></div><dl><div><dt>Stale artifacts</dt><dd>${esc((worker.stale_artifacts || []).join(", ") || "none")}</dd></div><div><dt>Orphan processes</dt><dd>${esc((worker.orphan_processes || []).length)}</dd></div><div><dt>Safe to execute</dt><dd>${worker.safe_to_execute ? "yes" : "no"}</dd></div></dl></article>`).join("");
+  body.innerHTML = `<div class="reclaim-summary ${plan.safe_to_execute ? "safe" : "blocked"}"><strong>${plan.safe_to_execute ? "Dry-run passed identity safety checks" : "Dry-run blocked destructive reclaim"}</strong><span>Target: ${esc(state.reclaimTarget || "all Workers")} · token expires after the backend safety window.</span></div>${rows || '<div class="raw-log-empty"><strong>No reclaim targets returned.</strong></div>'}`;
+  confirm.disabled = plan.safe_to_execute !== true || !plan.confirmation_token;
+  modal.hidden = false;
+}
+
+async function reclaimDryRun() {
+  const worker = lifecycleTargetValue();
+  try {
+    const plan = await api(`/api/projects/${state.current}/reclaim`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(worker ? { worker, execute: false } : { execute: false }),
+    });
+    state.reclaimPlan = plan;
+    state.reclaimTarget = worker;
+    renderReclaimPlan();
+  } catch (error) {
+    notify(error.message || "Reclaim dry-run failed", "error");
+  }
+}
+
+async function confirmReclaim() {
+  const plan = state.reclaimPlan;
+  if (!plan?.safe_to_execute || !plan.confirmation_token || !state.project) return;
+  const confirmation = window.prompt(`输入项目名「${state.project.name}」确认清理 dry-run 中列出的 stale artifacts。不会修改任务或研究策略。`);
+  if (confirmation !== state.project.name) return;
+  try {
+    const worker = state.reclaimTarget;
+    const result = await api(`/api/projects/${state.current}/reclaim`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...(worker ? { worker } : {}), execute: true, confirm: confirmation, confirmation_token: plan.confirmation_token }),
+    });
+    const remaining = (result.remaining_project_processes || []).length;
+    closeReclaimPlan();
+    state.reclaimPlan = null;
+    notify(remaining ? `Reclaim completed, but ${remaining} project process(es) remain` : "Reclaim completed; no selected-Project processes remain", remaining ? "error" : "success");
+    await refreshProject();
+  } catch (error) {
+    notify(error.message || "Reclaim refused", "error");
+  }
+}
+
+async function forceStopRun() {
+  const worker = lifecycleTargetValue();
+  const safety = forceStopSafety(worker);
+  if (!safety.allowed || !state.project) {
+    notify(safety.reason, "error");
+    return;
+  }
+  const confirmation = window.prompt(`输入项目名「${state.project.name}」确认 Force stop now ${worker || "all identity-matched Workers"}。Host 将先 TERM，必要时 KILL；PID identity 会在发信号前再次验证。`);
+  if (confirmation !== state.project.name) return;
+  try {
+    await lifecycleRequest("force-stop", { ...(worker ? { worker } : {}), confirm: confirmation }, "Emergency force stop completed");
+  } catch (error) {
+    notify(error.message || "Force stop refused by identity safety", "error");
+  }
+}
+
 function updateRuntime() {
-  const live = state.workers.filter((worker) => worker.alive).length;
+  const progress = runtimeProgress();
+  const live = progress.live_workers;
   const activeRun = state.runtime.run;
   const main = state.orchestration.main_agent || state.orchestration.session || {};
   const assigned = Number(state.orchestration.assigned_workers ?? state.workers.filter((worker) => worker.assigned === true).length);
@@ -1462,16 +1919,31 @@ function updateRuntime() {
     status.className = `status-pill ${currentPendingMessage() || sessionStatus === "active" ? "working" : "idle"}`;
     status.innerHTML = `<i></i>${text}`;
   }
+  const stopping = activeRun?.status === "stopping";
+  const progressText = stopping
+    ? gracefulStopProgressText(progress)
+    : activeRun
+      ? `Run ${activeRun.status} · ${progress.live_workers}/${progress.expected_workers} identity-matched live · 截止 ${formatTime(activeRun.deadline)}`
+      : live
+        ? `${live} 个 identity-matched Worker 在线`
+        : ready ? `已完成 ${assigned}/${total} 分工` : `等待 Main Agent 分工 · ${assigned}/${total}`;
   const runState = $("run-state");
-  if (runState) runState.textContent = activeRun ? `Run ${activeRun.status} · ${live} active · 截止 ${formatTime(activeRun.deadline)}` : live ? `${live} 个 worker 在线` : ready ? `已完成 ${assigned}/${total} 分工` : `等待 Main Agent 分工 · ${assigned}/${total}`;
+  if (runState) runState.textContent = progressText;
+  const detail = $("run-progress-detail");
+  if (detail) detail.textContent = activeRun
+    ? `${progress.stop_pending_workers} stop pending · ${progress.stopped_workers} stopped · ${progress.stale_workers} stale`
+    : "主 agent 负责正常方向与分工；此处仅显示 host-observed lifecycle state。";
+  const bar = $("run-progress-bar");
+  if (bar) bar.style.width = `${progress.expected_workers ? Math.min(100, Math.round((progress.stopped_workers / progress.expected_workers) * 100)) : 0}%`;
   const start = $("run-start");
   const stop = $("run-stop");
   const mainAgentBusy = Boolean(currentPendingMessage());
   if (start) {
     start.disabled = Boolean(activeRun || live || !ready || mainAgentBusy);
-    start.title = mainAgentBusy ? "等待当前 Main Agent 回复完成" : ready ? "启动已完成分工的 Worker swarm" : "先让 Main Agent 完成所有 Worker 的 TASK.md 分工";
+    start.title = mainAgentBusy ? "等待当前 Main Agent 回复完成" : ready ? "启动已完成 Main Agent 分工的 Worker swarm" : "先让 Main Agent 完成所有 Worker 的 TASK.md 分工";
   }
   if (stop) stop.disabled = !activeRun || mainAgentBusy;
+  renderLifecycleControls();
 }
 
 async function refreshPendingMessages() {
@@ -1480,11 +1952,16 @@ async function refreshPendingMessages() {
   const projectAtStart = pending.project_id;
   if (state.pendingRefreshingProject === projectAtStart) return;
   const after = state.mainAgentEventLastId;
+  const logWorkerAtStart = state.activeWorker;
   state.pendingRefreshingProject = projectAtStart;
   try {
-    const [messagesResult, eventsResult] = await Promise.allSettled([
+    const [messagesResult, eventsResult, workersResult, runtimeResult, logsResult, orchestrationResult] = await Promise.allSettled([
       api(`/api/projects/${projectAtStart}/messages`),
       api(`/api/projects/${projectAtStart}/main-agent-events?after=${after}`),
+      api(`/api/projects/${projectAtStart}/workers`),
+      api(`/api/projects/${projectAtStart}/runtime`),
+      pendingLogRequest(projectAtStart),
+      api(`/api/projects/${projectAtStart}/orchestration`),
     ]);
     if (state.current !== projectAtStart || state.pendingMessage !== pending) return;
     let persistedTurnTerminal = false;
@@ -1505,6 +1982,17 @@ async function refreshPendingMessages() {
       }
       state.mainAgentEventLastId = Math.max(state.mainAgentEventLastId, Number(eventsResult.value.last_id || 0));
     }
+    if (workersResult.status === "fulfilled") {
+      const projection = workersResult.value;
+      state.workers = Array.isArray(projection) ? projection : (projection.workers || []);
+    }
+    if (runtimeResult.status === "fulfilled") state.runtime = runtimeResult.value;
+    if (orchestrationResult.status === "fulfilled") state.orchestration = orchestrationResult.value;
+    if (logsResult.status === "fulfilled" && logsResult.value && logWorkerAtStart) {
+      applyLogProjection(logsResult.value, logWorkerAtStart);
+    } else if (logsResult.status === "rejected" && logWorkerAtStart) {
+      recordLogError(logsResult.reason, logWorkerAtStart);
+    }
     const hasTerminalEvent = state.mainAgentEvents.some((event) => (
       event.message_id === pending.id && ["turn.completed", "turn.failed"].includes(event.type)
     ));
@@ -1518,6 +2006,8 @@ async function refreshPendingMessages() {
     renderMessages();
     renderActivity();
     renderMainAgentControl();
+    renderWorkers();
+    renderWorkerDrawer();
     updateRuntime();
   } finally {
     if (state.pendingRefreshingProject === projectAtStart) state.pendingRefreshingProject = null;
@@ -1527,6 +2017,7 @@ async function refreshPendingMessages() {
 async function refreshProject() {
   if (!state.current || currentPendingMessage()) return;
   const projectAtStart = state.current;
+  const logWorkerAtStart = state.activeWorker;
   if (state.refreshingProject === projectAtStart) return;
   state.refreshingProject = projectAtStart;
   try {
@@ -1537,7 +2028,9 @@ async function refreshProject() {
       api(`/api/projects/${projectAtStart}/fact-graph`),
       api(`/api/projects/${projectAtStart}/memory`),
       api(`/api/projects/${projectAtStart}/runtime`),
-      api(`/api/projects/${projectAtStart}/logs`),
+      logWorkerAtStart
+        ? api(workerLogUrl(projectAtStart, logWorkerAtStart))
+        : Promise.resolve(null),
       api(`/api/projects/${projectAtStart}/reports`),
       api(`/api/projects/${projectAtStart}/outputs`),
       api(`/api/projects/${projectAtStart}/orchestration`),
@@ -1552,7 +2045,11 @@ async function refreshProject() {
     state.facts = value(results[3], { nodes: [], edges: [] });
     state.memory = value(results[4], { total: 0, channels: [] });
     state.runtime = value(results[5], {});
-    state.logs = value(results[6], { entries: [] }).entries || [];
+    if (logWorkerAtStart && results[6].status === "fulfilled") {
+      applyLogProjection(results[6].value, logWorkerAtStart);
+    } else if (logWorkerAtStart) {
+      recordLogError(results[6].reason, logWorkerAtStart);
+    }
     state.reports = value(results[7], { files: [] });
     state.outputs = value(results[8], { files: [] });
     state.orchestration = value(results[9], {});
@@ -1632,24 +2129,27 @@ async function startRun() {
   if (!state.current || currentPendingMessage()) return;
   const projectAtStart = state.current;
   try {
-    await api(`/api/projects/${projectAtStart}/runs`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ duration_seconds: 3600 }) });
-    const activated = state.current === projectAtStart && await sendMessageText(START_RUN_MESSAGE);
+    const intent = await api(`/api/projects/${projectAtStart}/runs`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ duration_seconds: 3600 }) });
+    const activated = state.current === projectAtStart && await sendMessageText(
+      `${START_RUN_MESSAGE} Run id: ${intent.run_id || "unknown"}. Do not claim success for a partial fleet.`,
+    );
     notify(activated ? "Run intent 已记录；Main Agent 正在启动 Worker fleet" : "Run intent 已记录，但 Main Agent 未能激活", activated ? "success" : "error");
     await refreshProjects();
   } catch (error) {
-    notify(error.message || "Run 启动失败", "error");
+    notify(error.message || "Run intent 提交失败", "error");
   }
 }
 
 async function stopRun() {
   if (!state.current || currentPendingMessage()) return;
+  if (!window.confirm("Graceful stop the Project Run? Every live Worker may finish its current round before exiting.")) return;
   const projectAtStart = state.current;
   try {
     await api(`/api/projects/${projectAtStart}/stop`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
     const activated = state.current === projectAtStart && await sendMessageText(STOP_RUN_MESSAGE);
     notify(activated ? "停止 intent 已记录；Main Agent 正在执行优雅停止" : "停止 intent 已记录，但 Main Agent 未能激活", activated ? "success" : "error");
   } catch (error) {
-    notify(error.message || "停止失败", "error");
+    notify(error.message || "Graceful stop failed", "error");
   }
 }
 

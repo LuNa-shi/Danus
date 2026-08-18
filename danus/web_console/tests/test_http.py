@@ -26,6 +26,7 @@ class FakeRuntime:
         self.deadlines = {}
         self.cleared_deadlines = []
         self.configs = {}
+        self.controls = []
 
     def project_context_dir(self, runtime_name):
         project = self.root / runtime_name
@@ -91,8 +92,31 @@ class FakeRuntime:
     def status_project(self, runtime_name):
         return {"config": self.configs.get(runtime_name, {}), "workers": self.statuses.get(runtime_name, [])}
 
-    def logs_projection(self, runtime_name, worker=None, tail=200):
-        return {"entries": [{"worker": worker or "high", "name": "loop.log", "lines": ["status"]}]}
+    def pause_project(self, runtime_name, *, worker=None):
+        self.controls.append(("pause", runtime_name, worker))
+        return {"status": "pause_requested", "worker": worker}
+
+    def resume_project(self, runtime_name, *, worker=None):
+        self.controls.append(("resume", runtime_name, worker))
+        return {"status": "resume_requested", "workers": []}
+
+    def force_stop_project(self, runtime_name, *, worker=None, term_timeout=5.0):
+        self.controls.append(("force_stop", runtime_name, worker))
+        return {"status": "force_stopped", "workers": []}
+
+    def reclaim_project(self, runtime_name, *, worker=None, execute=False, confirmation_token=None):
+        self.controls.append(("reclaim", runtime_name, worker, execute, confirmation_token))
+        if execute:
+            return {"status": "reclaimed", "remaining_project_processes": [], "workers": []}
+        return {"dry_run": True, "safe_to_execute": True, "confirmation_token": "confirm-token", "workers": []}
+
+    def logs_projection(self, runtime_name, worker=None, tail=200, *, max_bytes=65536):
+        return {
+            "worker": worker,
+            "tail": tail,
+            "max_bytes": max_bytes,
+            "entries": [{"worker": worker or "high", "name": "loop.log", "lines": ["status"]}],
+        }
 
     def fact_graph_projection(self, runtime_name):
         return {"nodes": [], "edges": [], "max_depth": 0}
@@ -974,6 +998,7 @@ def test_main_agent_events_are_persisted_and_project_scoped(tmp_path: Path):
         def send(self, **kwargs):
             for event in [
                 {"type": "turn.started", "detail": "Main Agent 会话已建立"},
+                {"type": "agent.progress", "detail": "公开的推理进度摘要。"},
                 {"type": "agent.message", "detail": "我先检查项目状态。"},
                 {"type": "tool.started", "tool": "exec_command", "detail": "danus-web-agent status", "call_id": "call-1"},
                 {"type": "tool.completed", "tool": "exec_command", "detail": "exit 0", "status": "completed", "call_id": "call-1"},
@@ -1009,12 +1034,15 @@ def test_main_agent_events_are_persisted_and_project_scoped(tmp_path: Path):
 
         events = client.get(f"/api/projects/{a['id']}/main-agent-events").json()["events"]
         assert [event["type"] for event in events] == [
-            "turn.started", "agent.message", "tool.started", "tool.completed", "turn.completed",
+            "turn.started", "agent.progress", "agent.message", "tool.started", "tool.completed", "turn.completed",
         ]
-        assert events[2]["tool"] == "exec_command"
-        assert events[2]["detail"] == "danus-web-agent status"
-        assert all("call_id" not in event for event in events)
+        assert events[3]["tool"] == "exec_command"
+        assert events[3]["detail"] == "danus-web-agent status"
+        assert events[3]["call_id"] == "call-1"
+        assert events[4]["call_id"] == "call-1"
         assert all(event["message_id"] == response.json()["message_id"] for event in events)
+        assert all("main_agent_session_id" in event for event in events)
+        assert all("run_id" in event for event in events)
         assert client.get(f"/api/projects/{b['id']}/main-agent-events").json() == {"events": [], "last_id": 0}
         assert client.get("/api/projects/foreign/main-agent-events").status_code == 404
 
@@ -1231,6 +1259,198 @@ def test_main_agent_event_retention_is_project_scoped(tmp_path: Path):
     assert [event["detail"] for event in store.main_agent_events("p2")] == ["other project"]
 
 
+def test_runtime_and_run_projection_report_partial_graceful_stop_progress(tmp_path: Path):
+    class DrainingRuntime(FakeRuntime):
+        def stop_project(self, runtime_name):
+            self.stopped.append(runtime_name)
+            for worker in self.statuses.get(runtime_name, []):
+                if worker.get("alive"):
+                    worker["stop_requested"] = True
+            return {"workers": self.statuses[runtime_name]}
+
+    runtime = DrainingRuntime(tmp_path / "projects")
+    settings = AppSettings(
+        database_path=tmp_path / "console.sqlite3",
+        password_hash=hash_password("correct horse battery staple"),
+        cookie_secure=True,
+        allowed_origins={"https://testserver"},
+        lifecycle_hmac_secret=_LIFECYCLE_SECRET,
+    )
+    app = create_app(settings=settings, runtime=runtime)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client)
+        headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post(
+            "/api/projects",
+            json={"name": "A", "problem": "alpha", "roles": "high:8"},
+            headers=headers,
+        ).json()
+        runtime.assign_all(project["runtime_name"])
+        run = client.post(
+            f"/api/projects/{project['id']}/runs",
+            json={"duration_seconds": 3600},
+            headers=headers,
+        ).json()
+        assert _broker_start(client, project).status_code == 200
+        for worker in runtime.statuses[project["runtime_name"]]:
+            worker.update({"process_identity": "matched", "alive": True, "state": "running"})
+        runtime.statuses[project["runtime_name"]][-1].update({
+            "process_identity": "dead", "alive": False, "state": "stopped",
+        })
+
+        assert client.post(
+            f"/api/projects/{project['id']}/runs/{run['run_id']}/stop",
+            json={}, headers=headers,
+        ).status_code == 202
+        assert _broker_stop(client, project).status_code == 202
+
+        projection = client.get(f"/api/projects/{project['id']}/runtime").json()
+        expected_run = {
+            "id": run["run_id"],
+            "status": "stopping",
+            "deadline": run["deadline"],
+            "expected_workers": 8,
+            "live_workers": 7,
+            "stop_pending_workers": 7,
+            "stopped_workers": 1,
+            "stale_workers": 0,
+        }
+        assert {key: projection["run"][key] for key in expected_run} == expected_run
+        assert projection["progress"] == {
+            "expected_workers": 8,
+            "live_workers": 7,
+            "stop_pending_workers": 7,
+            "stopped_workers": 1,
+            "stale_workers": 0,
+        }
+        run_projection = client.get(
+            f"/api/projects/{project['id']}/runs/{run['run_id']}"
+        ).json()
+        assert run_projection["stop_pending_workers"] == 7
+        assert run_projection["stopped_workers"] == 1
+
+
+def test_worker_safety_controls_are_authenticated_confirmed_and_project_scoped(tmp_path: Path):
+    app, runtime = _app(tmp_path)
+    with TestClient(app, base_url="https://testserver") as client:
+        project = None
+        assert client.post("/api/projects/missing/pause", json={}).status_code == 401
+        csrf = _login(client)
+        headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post(
+            "/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers,
+        ).json()
+        pid = project["id"]
+        runtime.assign_all(project["runtime_name"])
+        started = client.post(
+            f"/api/projects/{pid}/runs", json={"duration_seconds": 60}, headers=headers,
+        )
+        assert started.status_code == 202
+        assert _broker_start(client, project).status_code == 200
+
+        paused = client.post(f"/api/projects/{pid}/pause", json={"worker": "high"}, headers=headers)
+        assert paused.status_code == 202 and paused.json()["status"] == "pause_intent"
+        assert runtime.controls == []
+        assert _broker_lifecycle(client, project, "pause", worker="high").status_code == 202
+
+        resumed = client.post(f"/api/projects/{pid}/resume", json={"worker": "high"}, headers=headers)
+        assert resumed.status_code == 202 and resumed.json()["status"] == "resume_intent"
+        assert _broker_lifecycle(client, project, "resume", worker="high").status_code == 202
+        denied = client.post(f"/api/projects/{pid}/force-stop", json={"confirm": "wrong"}, headers=headers)
+        assert denied.status_code == 409
+        forced = client.post(
+            f"/api/projects/{pid}/force-stop",
+            json={"worker": "high", "confirm": project["name"]}, headers=headers,
+        )
+        assert forced.status_code == 200 and forced.json()["status"] == "force_stopped"
+        plan = client.post(f"/api/projects/{pid}/reclaim", json={"worker": "high"}, headers=headers)
+        assert plan.status_code == 200 and plan.json()["dry_run"] is True
+        reclaimed = client.post(
+            f"/api/projects/{pid}/reclaim",
+            json={"worker": "high", "execute": True, "confirmation_token": "confirm-token", "confirm": project["name"]},
+            headers=headers,
+        )
+        assert reclaimed.status_code == 200 and reclaimed.json()["status"] == "reclaimed"
+        assert runtime.controls == [
+            ("pause", "A", "high"),
+            ("resume", "A", "high"),
+            ("force_stop", "A", "high"),
+            ("reclaim", "A", "high", False, None),
+            ("reclaim", "A", "high", True, "confirm-token"),
+        ]
+        assert client.post("/api/projects/foreign/reclaim", json={}, headers=headers).status_code == 404
+
+
+def test_selected_force_stop_keeps_run_active_when_other_workers_remain_live(tmp_path: Path):
+    app, runtime = _app(tmp_path)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client)
+        headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post(
+            "/api/projects",
+            json={"name": "A", "problem": "alpha", "roles": "high:1,xhigh:1"},
+            headers=headers,
+        ).json()
+        for worker in runtime.statuses[project["runtime_name"]]:
+            worker["assigned"] = True
+        started = client.post(
+            f"/api/projects/{project['id']}/runs",
+            json={"duration_seconds": 60}, headers=headers,
+        )
+        assert started.status_code == 202
+        assert _broker_start(client, project).status_code == 200
+        assert client.get(
+            f"/api/projects/{project['id']}/runs/{started.json()['run_id']}"
+        ).json()["status"] == "running"
+
+        forced = client.post(
+            f"/api/projects/{project['id']}/force-stop",
+            json={"worker": "high", "confirm": project["name"]}, headers=headers,
+        )
+        assert forced.status_code == 200
+        run = client.get(
+            f"/api/projects/{project['id']}/runs/{started.json()['run_id']}"
+        ).json()
+        assert run["status"] == "running"
+        assert run["outcome"] == "main_agent_start"
+
+
+def test_log_http_projection_is_authenticated_scoped_and_forwards_bounds(tmp_path: Path):
+    class LogRuntime(FakeRuntime):
+        def __init__(self, root):
+            super().__init__(root)
+            self.log_calls = []
+
+        def logs_projection(self, runtime_name, worker=None, tail=200, *, max_bytes=65536):
+            self.log_calls.append((runtime_name, worker, tail, max_bytes))
+            return {
+                "worker": worker, "tail": tail, "max_bytes": max_bytes,
+                "fetched_at": 123.0, "entries": [],
+            }
+
+    runtime = LogRuntime(tmp_path / "projects")
+    settings = AppSettings(
+        database_path=tmp_path / "console.sqlite3",
+        password_hash=hash_password("correct horse battery staple"),
+        cookie_secure=True,
+        allowed_origins={"https://testserver"},
+    )
+    app = create_app(settings=settings, runtime=runtime)
+    with TestClient(app, base_url="https://testserver") as client:
+        assert client.get("/api/projects/unknown/logs").status_code == 401
+        csrf = _login(client)
+        headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        a = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
+        client.post("/api/projects", json={"name": "B", "problem": "beta"}, headers=headers)
+
+        response = client.get(
+            f"/api/projects/{a['id']}/logs?worker=high&tail=7&max_bytes=4096"
+        )
+        assert response.status_code == 200
+        assert runtime.log_calls == [("A", "high", 7, 4096)]
+        assert response.json()["fetched_at"] == 123.0
+        assert client.get(f"/api/projects/{a['id']}/logs?tail=bad").status_code == 400
+        assert client.get(f"/api/projects/{a['id']}/logs?worker=../B").status_code == 400
 def test_deadline_supervisor_enforces_expiry_without_browser_polling(tmp_path: Path):
     class DeadlineRuntime(FakeRuntime):
         def __init__(self, root):
@@ -1352,6 +1572,36 @@ def test_broker_stop_refusal_keeps_unresolved_raw_process_nonterminal(tmp_path: 
         assert projection["run"]["status"] == "stopping"
         assert projection["run"]["outcome"].startswith("main_agent_stop_refused:")
         assert runtime.statuses[project["runtime_name"]][0]["raw_alive"] is True
+
+
+def test_pause_and_resume_are_rejected_after_stop_intent(tmp_path: Path):
+    app, runtime = _app(tmp_path)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client)
+        headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post(
+            "/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers,
+        ).json()
+        runtime.assign_all(project["runtime_name"])
+        started = client.post(
+            f"/api/projects/{project['id']}/runs",
+            json={"duration_seconds": 60}, headers=headers,
+        )
+        assert started.status_code == 202
+        assert _broker_start(client, project).status_code == 200
+        assert client.post(
+            f"/api/projects/{project['id']}/stop", json={}, headers=headers,
+        ).status_code == 202
+
+        assert client.post(
+            f"/api/projects/{project['id']}/pause", json={}, headers=headers,
+        ).status_code == 409
+        assert client.post(
+            f"/api/projects/{project['id']}/resume", json={}, headers=headers,
+        ).status_code == 409
+        assert _broker_lifecycle(client, project, "pause").status_code == 409
+        assert _broker_lifecycle(client, project, "resume").status_code == 409
+        assert not any(control[0] in {"pause", "resume"} for control in runtime.controls)
 
 
 def test_deadline_does_not_claim_terminal_for_unresolved_raw_process(tmp_path: Path):

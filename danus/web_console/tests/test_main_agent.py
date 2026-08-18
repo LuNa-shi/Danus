@@ -622,7 +622,9 @@ def test_codex_streams_safe_agent_and_tool_events_before_final_reply(tmp_path: P
     lines = [
         json.dumps({"type": "thread.started", "thread_id": "sid-stream"}),
         json.dumps({"type": "response_item", "payload": {
-            "type": "reasoning", "summary": ["private reasoning must not be exposed"],
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "Safe emitted reasoning summary"}],
+            "encrypted_content": "private reasoning must not be exposed",
         }}),
         json.dumps({"type": "event_msg", "payload": {
             "type": "agent_message", "message": "我先检查项目状态。",
@@ -651,13 +653,14 @@ def test_codex_streams_safe_agent_and_tool_events_before_final_reply(tmp_path: P
 
     assert result["reply"] == "完成。"
     assert [event["type"] for event in events] == [
-        "turn.started", "agent.message", "tool.started", "tool.completed", "turn.completed",
+        "turn.started", "agent.progress", "agent.message", "tool.started", "tool.completed", "turn.completed",
     ]
-    assert events[2]["tool"] == "exec_command"
-    assert "danus-web-agent status" in events[2]["detail"]
+    assert events[1]["detail"] == "Safe emitted reasoning summary"
+    assert events[3]["tool"] == "exec_command"
+    assert "danus-web-agent status" in events[3]["detail"]
     assert "must-not-leak" not in json.dumps(events, ensure_ascii=False)
     assert "敏感参数已隐藏" in json.dumps(events, ensure_ascii=False)
-    assert "原始输出未展示" in json.dumps(events, ensure_ascii=False)
+    assert "content hidden by safety policy" in json.dumps(events, ensure_ascii=False)
     assert "private reasoning" not in json.dumps(events, ensure_ascii=False)
 
 
@@ -705,3 +708,121 @@ def test_web_main_agent_uses_broker_only_contract_and_hides_generic_repo_bin(tmp
     assert "Never invoke the generic `danus start`" in prompt
     assert "$DANUS_WEB_AGENT_BIN start" in prompt
     assert "danus stop <project>" not in prompt
+
+
+def test_claude_streams_safe_tool_results_and_turn_events(tmp_path: Path):
+    events = []
+    session_id = "123e4567-e89b-12d3-a456-426614174000"
+    lines = [
+        json.dumps({"type": "system", "subtype": "init", "session_id": session_id}),
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "Checking Worker state."},
+            {"type": "tool_use", "id": "tool-1", "name": "Bash", "input": {"command": "danus-web-agent status"}},
+        ]}}),
+        json.dumps({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "tool-1", "content": json.dumps({"status": "running", "workers": [{"worker": "high", "result": "started"}]})},
+        ]}}),
+        json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "session_id": session_id, "result": "done", "duration_ms": 125,
+        }),
+    ]
+
+    def runner(cmd, **kwargs):
+        assert cmd[cmd.index("--output-format") + 1] == "stream-json"
+        for line in lines:
+            kwargs["on_stdout_line"](line)
+        return SimpleNamespace(returncode=0, stdout="\n".join(lines), stderr="")
+
+    adapter = MainAgentAdapter(backend="claude", runner=runner, claude_bin="claude")
+    result = adapter.send(**_args(tmp_path), on_progress=events.append)
+
+    assert result["reply"] == "done"
+    assert [event["type"] for event in events] == [
+        "turn.started", "agent.message", "tool.started", "tool.completed", "turn.completed",
+    ]
+    assert events[2]["call_id"] == "tool-1"
+    assert events[3]["call_id"] == "tool-1"
+    assert events[3]["tool"] == "Bash"
+    assert events[3]["duration_seconds"] >= 0
+    assert '"status": "running"' in events[3]["detail"]
+    assert events[4]["duration_seconds"] == 0.125
+
+
+def test_codex_tool_result_keeps_safe_broker_outcome_and_hides_unclassified_text():
+    broker = MainAgentAdapter._codex_progress_events(json.dumps({
+        "type": "response_item",
+        "payload": {
+            "type": "function_call_output", "call_id": "call-1",
+            "output": json.dumps({
+                "status": "partial_start", "not_running_workers": ["xhigh"],
+                "workers": [{"worker": "high", "result": "started"}],
+            }),
+        },
+    }))[0]
+    opaque = MainAgentAdapter._codex_progress_events(json.dumps({
+        "type": "response_item",
+        "payload": {
+            "type": "function_call_output", "call_id": "call-2",
+            "output": "arbitrary-unclassified-secret",
+        },
+    }))[0]
+
+    assert broker["status"] == "completed"
+    assert "partial_start" in broker["detail"]
+    assert "xhigh" in broker["detail"]
+    assert "arbitrary-unclassified-secret" not in opaque["detail"]
+    assert "content hidden by safety policy" in opaque["detail"]
+    rejected = MainAgentAdapter._codex_progress_events(json.dumps({
+        "type": "response_item",
+        "payload": {
+            "type": "function_call_output", "call_id": "call-3",
+            "output": json.dumps({"status": "rejected", "error": "identity mismatch"}),
+        },
+    }))[0]
+    assert rejected["status"] == "failed"
+    assert "identity mismatch" in rejected["detail"]
+
+
+def test_claude_tool_boundary_and_final_reply_redact_raw_values(tmp_path: Path):
+    started = MainAgentAdapter._claude_progress_events(json.dumps({
+        "type": "assistant", "message": {"content": [{
+            "type": "tool_use", "id": "tool-secret", "name": "Bash",
+            "input": {"command": "echo arbitrary-unclassified-secret"},
+        }]},
+    }))[0]
+    completed = MainAgentAdapter._claude_progress_events(json.dumps({
+        "type": "user", "message": {"content": [{
+            "type": "tool_result", "tool_use_id": "tool-secret",
+            "content": "arbitrary-unclassified-secret",
+        }]},
+    }))[0]
+    assert "arbitrary-unclassified-secret" not in started["detail"]
+    assert "arbitrary-unclassified-secret" not in completed["detail"]
+
+    stdout = _claude_result(result="api_key=must-not-leak")
+    adapter = MainAgentAdapter(
+        backend="claude",
+        runner=lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=stdout, stderr=""),
+    )
+    result = adapter.send(**_args(tmp_path))
+    assert "must-not-leak" not in result["reply"]
+    assert result["reply"] == "api_key=<REDACTED>"
+
+
+def test_progress_sink_failure_aborts_stream_instead_of_silently_losing_audit(tmp_path: Path):
+    line = json.dumps({"type": "response_item", "payload": {
+        "type": "function_call", "name": "exec_command",
+        "arguments": json.dumps({"cmd": "danus-web-agent status"}), "call_id": "call-1",
+    }})
+
+    def runner(cmd, **kwargs):
+        kwargs["on_stdout_line"](line)
+        raise AssertionError("unreachable after sink failure")
+
+    adapter = MainAgentAdapter(backend="codex", runner=runner, codex_bin="codex")
+    with pytest.raises(RuntimeError, match="audit sink unavailable"):
+        adapter.send(
+            **_args(tmp_path),
+            on_progress=lambda event: (_ for _ in ()).throw(RuntimeError("audit sink unavailable")),
+        )

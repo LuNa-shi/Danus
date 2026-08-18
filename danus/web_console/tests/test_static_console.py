@@ -396,8 +396,8 @@ def test_run_controls_record_intent_then_activate_main_agent_through_chat_flow()
     stop_body = app.split("async function stopRun()", 1)[1].split("async function handleUpload", 1)[0]
 
     assert "/runs`" in start_body
-    assert "await sendMessageText(START_RUN_MESSAGE)" in start_body
-    assert start_body.index("/runs`") < start_body.index("await sendMessageText(START_RUN_MESSAGE)")
+    assert "await sendMessageText(" in start_body
+    assert start_body.index("/runs`") < start_body.index("await sendMessageText(")
     assert 'const START_RUN_MESSAGE = "' in app
     assert "danus-web-agent start" in app
 
@@ -406,3 +406,143 @@ def test_run_controls_record_intent_then_activate_main_agent_through_chat_flow()
     assert stop_body.index("/stop`") < stop_body.index("await sendMessageText(STOP_RUN_MESSAGE)")
     assert 'const STOP_RUN_MESSAGE = "' in app
     assert "danus-web-agent stop" in app
+
+def test_truthful_graceful_stop_progress_and_worker_process_identity_are_rendered():
+    app = _asset("app.js")
+    css = _asset("style.css")
+
+    for token in (
+        "function runtimeProgress",
+        "state.runtime.progress",
+        "activeRun.stop_pending_workers",
+        "Graceful stop in progress",
+        "finishing current round",
+        "stopped",
+        'worker.process_identity === "mismatch"',
+        "worker.stop_requested",
+        "worker.pause_requested",
+        "重试状态已过期",
+        "worker-process-row",
+        "PID",
+        "Process identity",
+        "Desired state",
+    ):
+        assert token in app
+
+    assert 'stateName === "stale" ? persistedState : stateName' in app
+    assert ".process-identity.mismatch" in css
+    assert ".worker-desired-state" in css
+
+
+def test_workers_and_logs_entry_point_remains_accessible_on_narrow_and_desktop_layouts():
+    app = _asset("app.js")
+    css = _asset("style.css")
+
+    for token in (
+        'id="workers-logs-open"',
+        "Workers / Logs",
+        "function setWorkerRailOpen",
+        'classList.toggle("is-open", open)',
+        'aria-label="关闭 Workers / Logs"',
+    ):
+        assert token in app
+
+    assert ".workers-logs-button" in css
+    assert ".worker-rail.is-open" in css
+    assert "@media (max-width: 860px)" in css
+    assert ".rail-resizer-right, .worker-rail { display: none; }" not in css
+
+
+def test_worker_drawer_keeps_structured_transcript_and_exposes_bounded_raw_logs():
+    app = _asset("app.js")
+    css = _asset("style.css")
+
+    for token in (
+        "function workerLogEntries",
+        'entry.name === "loop.log"',
+        "function renderRawWorkerLog",
+        "renderWorkerRoundTranscript(groups, selectedRound, worker)",
+        "data-worker-log",
+        "data-refresh-worker-log",
+        "returned_lines",
+        "modified_at",
+        "truncated",
+        "fetched_at",
+        "max_bytes",
+        "日志文件存在，但当前为空",
+        "日志获取失败",
+        "本轮日志存在，但 transcript parser 没有可显示消息",
+        "async function refreshWorkerLogs",
+        "tail=200&max_bytes=65536",
+    ):
+        assert token in app
+
+    assert "logWorkerAtStart\n        ? api(workerLogUrl" in app
+    assert "else if (logWorkerAtStart)" in app
+    assert ".raw-log-panel" in css
+    assert ".raw-log-tabs" in css
+    assert ".log-fetch-error" in css
+
+
+def test_main_agent_timeline_shows_every_safe_emitted_event_and_polling_keeps_operations_live():
+    app = _asset("app.js")
+
+    for token in (
+        'events.slice().sort((left, right) => Number(left.id || 0) - Number(right.id || 0))',
+        'data-event-id="${esc(event.id)}"',
+        "function mainAgentEventMeta",
+        "main_agent_session_id",
+        "event.run_id",
+        "event.call_id",
+        "Emitted progress + tool trace",
+        "private chain-of-thought is not exposed",
+        'api(`/api/projects/${projectAtStart}/workers`)',
+        'api(`/api/projects/${projectAtStart}/runtime`)',
+        "pendingLogRequest(projectAtStart)",
+        "renderWorkers();",
+        "renderWorkerDrawer();",
+    ):
+        assert token in app
+
+
+def test_lifecycle_recovery_controls_call_only_host_safety_endpoints_with_confirmation():
+    app = _asset("app.js")
+    css = _asset("style.css")
+
+    for token in (
+        "Pause after round",
+        "Resume",
+        "Graceful stop",
+        "Force stop now",
+        "Reclaim dry-run",
+        'lifecycleRequest("pause"',
+        'lifecycleRequest("resume"',
+        'lifecycleRequest("force-stop"',
+        '/reclaim`',
+        "function forceStopSafety",
+        'worker.process_identity !== "matched"',
+        "输入项目名",
+        "confirmation_token",
+        "safe_to_execute",
+        "remaining_project_processes",
+        "function renderReclaimPlan",
+        "worker?.reclaim_candidate === true",
+    ):
+        assert token in app
+
+    assert ".lifecycle-controls" in css
+    assert ".reclaim-plan" in css
+    assert "function lifecycleIntentMessage" in app
+    assert 'sendMessageText(lifecycleIntentMessage("pause", worker))' in app
+    assert 'sendMessageText(lifecycleIntentMessage("resume", worker))' in app
+    assert "authenticated host lifecycle broker" in app
+    assert "data-direct-worker-assignment" not in app
+    assert "data-direct-strategy" not in app
+
+
+def test_run_start_records_intent_then_activates_main_agent_instead_of_browser_orchestration():
+    app = _asset("app.js")
+    assert "Run intent 已记录；Main Agent 正在启动" in app
+    assert "danus-web-agent start" in app
+    assert "Do not claim success for a partial fleet" in app
+    assert 'notify("Worker fleet 已启动"' not in app

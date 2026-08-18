@@ -2,14 +2,20 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import secrets
+import stat as stat_module
 import time
 from pathlib import Path
 from typing import Any
 
 from danus.execution import layout as L
+from danus.execution import processes as P
 from danus.execution.scaffold import atomic_write
 from danus.orchestration import cli
+
+from .observability import redact_text
 
 _PROJECT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
@@ -26,6 +32,10 @@ class RuntimeOperationError(RuntimeErrorBase):
     pass
 
 
+class RuntimeSafetyError(RuntimeOperationError):
+    """A requested destructive action failed a process-identity safety gate."""
+
+
 def validate_runtime_name(name: str) -> str:
     if not isinstance(name, str) or not _PROJECT_RE.fullmatch(name):
         raise ValueError("invalid project name")
@@ -38,6 +48,7 @@ class DanusRuntimeAdapter:
     def __init__(self, agents_root: Path | None = None):
         # The adapter is constructed once with a server-owned root.
         self.agents_root = Path(agents_root).resolve() if agents_root else L.agents_root()
+        self._reclaim_tokens: dict[str, tuple[str, float]] = {}
 
     def _project_dir(self, runtime_name: str) -> Path:
         validate_runtime_name(runtime_name)
@@ -102,22 +113,340 @@ class DanusRuntimeAdapter:
         return {"workers": self._call(cli.do_start, runtime_name)}
 
     def stop_project(self, runtime_name: str) -> dict[str, Any]:
-        self._project_dir(runtime_name)
+        # Terminal graceful stop supersedes any cooperative pause marker.
+        for worker_dir in self._target_worker_dirs(runtime_name):
+            (worker_dir / L.PAUSE_FILE).unlink(missing_ok=True)
         return {"workers": self._call(cli.do_stop, runtime_name, force=False)}
 
     def enforce_deadline(self, runtime_name: str) -> dict[str, Any]:
         """Hard-stop an expired Run through identity-verified host handles."""
-        self._project_dir(runtime_name)
+        for worker_dir in self._target_worker_dirs(runtime_name):
+            (worker_dir / L.PAUSE_FILE).unlink(missing_ok=True)
         return {"workers": self._call(cli.do_stop, runtime_name, force=True)}
+    def _target_worker_dirs(self, runtime_name: str, worker: str | None = None) -> list[Path]:
+        root = self._project_dir(runtime_name)
+        names = [worker] if worker is not None else L.list_workers(runtime_name, self.agents_root)
+        result: list[Path] = []
+        for name in names:
+            if not isinstance(name, str):
+                raise RuntimeOperationError("invalid worker")
+            worker_dir = self._worker_dir(root, name)
+            if worker_dir is None:
+                raise RuntimeOperationError(f"worker not found: {name}")
+            result.append(worker_dir)
+        if not result:
+            raise RuntimeOperationError("project has no workers")
+        return result
+
+    def pause_project(self, runtime_name: str, *, worker: str | None = None) -> dict[str, Any]:
+        for worker_dir in self._target_worker_dirs(runtime_name, worker):
+            pause = worker_dir / L.PAUSE_FILE
+            if pause.is_symlink():
+                raise RuntimeSafetyError("pause marker must not be a symlink")
+            pause.touch()
+        return {"status": "pause_requested", "worker": worker}
+
+    def resume_project(self, runtime_name: str, *, worker: str | None = None) -> dict[str, Any]:
+        """Resume only pause-marked Workers after Main Agent authorization."""
+        resumed: list[dict[str, Any]] = []
+        for worker_dir in self._target_worker_dirs(runtime_name, worker):
+            pause = worker_dir / L.PAUSE_FILE
+            if pause.is_symlink():
+                raise RuntimeSafetyError("pause marker must not be a symlink")
+            if not pause.exists():
+                continue
+            pause.unlink()
+            target = f"{runtime_name}/{worker_dir.name}"
+            resumed.extend(self._call(cli.do_start, target))
+        return {"status": "resume_requested", "workers": resumed}
+
+    @staticmethod
+    def _merge_worker_status(worker_dir: Path, **fields: Any) -> None:
+        path = worker_dir / L.STATUS_FILE
+        try:
+            current = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        except (OSError, json.JSONDecodeError):
+            current = {}
+        current.update(fields)
+        current["worker"] = worker_dir.name
+        current["updated_at"] = time.time()
+        atomic_write(path, json.dumps(current, ensure_ascii=False, indent=2))
+
+    @staticmethod
+    def _public_identity(identity: P.WorkerProcessIdentity | None) -> dict[str, Any] | None:
+        if identity is None:
+            return None
+        return {
+            "pid": identity.pid, "boot_id": identity.boot_id,
+            "start_time": identity.start_time,
+        }
+
+    @staticmethod
+    def _inspect_worker_process(worker_dir: Path, pid: Any) -> dict[str, Any]:
+        """Distinguish unavailable inspection from a proven identity mismatch."""
+        try:
+            parsed_pid = int(pid)
+        except (TypeError, ValueError):
+            return {"status": "dead", "pid": None}
+        if parsed_pid <= 0 or not P.process_alive(parsed_pid):
+            return {"status": "dead", "pid": parsed_pid}
+        wl = L.WorkerLayout(worker_dir)
+        persisted = P.read_worker_identity(wl)
+        try:
+            record = P.DEFAULT_PROCFS.process_record(parsed_pid)
+            boot_id = P.DEFAULT_PROCFS.boot_id()
+        except (OSError, ValueError, IndexError, UnicodeError):
+            return {"status": "unknown", "pid": parsed_pid}
+        observed = P.WorkerProcessIdentity(
+            pid=parsed_pid, boot_id=boot_id,
+            start_time=str(record["start_time"]),
+            cmdline=tuple(record["cmdline"]),
+        )
+        if observed.cmdline != P.expected_worker_cmdline(wl):
+            return {
+                "status": "mismatch", "pid": parsed_pid,
+                "observed_identity": DanusRuntimeAdapter._public_identity(observed),
+                "persisted_identity": DanusRuntimeAdapter._public_identity(persisted),
+            }
+        if persisted is None:
+            return {
+                "status": "unknown", "pid": parsed_pid,
+                "observed_identity": DanusRuntimeAdapter._public_identity(observed),
+            }
+        return {
+            "status": "matched" if observed == persisted else "mismatch",
+            "pid": parsed_pid,
+            "observed_identity": DanusRuntimeAdapter._public_identity(observed),
+            "persisted_identity": DanusRuntimeAdapter._public_identity(persisted),
+        }
+
+    def force_stop_project(
+        self, runtime_name: str, *, worker: str | None = None, term_timeout: float = 5.0,
+    ) -> dict[str, Any]:
+        targets = self._target_worker_dirs(runtime_name, worker)
+        verified: list[tuple[Path, dict[str, Any]]] = []
+        # Validate every target before the first destructive signal so a
+        # multi-Worker request cannot partially execute and then fail safety.
+        for worker_dir in targets:
+            pid_path = worker_dir / L.PID_FILE
+            try:
+                pid = int(pid_path.read_text(encoding="utf-8").strip())
+            except (OSError, ValueError):
+                persisted = P.read_worker_identity(L.WorkerLayout(worker_dir))
+                if persisted is not None:
+                    pid = persisted.pid
+                elif P.processes_with_argv_path(worker_dir):
+                    raise RuntimeSafetyError(
+                        f"worker {worker_dir.name} has unverified project processes; reclaim required"
+                    )
+                else:
+                    verified.append((worker_dir, {"status": "dead", "pid": None}))
+                    continue
+            identity = self._inspect_worker_process(worker_dir, pid)
+            if identity.get("status") != "matched":
+                raise RuntimeSafetyError(
+                    f"worker {worker_dir.name} process identity is {identity.get('status')}"
+                )
+            verified.append((worker_dir, identity))
+
+        rows: list[dict[str, Any]] = []
+        for worker_dir, identity in verified:
+            if identity.get("status") == "dead":
+                rows.append({"worker": worker_dir.name, "outcome": "not-running", "signals_sent": []})
+                continue
+            signals_sent: list[str] = []
+            outcome = P.force_stop_worker(
+                L.WorkerLayout(worker_dir), term_timeout=term_timeout,
+                kill_timeout=1.0, on_signal=signals_sent.append,
+            )
+            if outcome != "killed":
+                raise RuntimeSafetyError(
+                    f"worker {worker_dir.name} force stop failed closed: {outcome}"
+                )
+            self._merge_worker_status(
+                worker_dir, state="terminated", control_outcome="emergency_force_stop",
+            )
+            rows.append({
+                "worker": worker_dir.name,
+                "verified_identity": identity,
+                "signals_sent": signals_sent,
+                "descendants_verified": True,
+                "outcome": "terminated",
+            })
+        return {"status": "force_stopped", "workers": rows}
+
+    @staticmethod
+    def _project_processes(root: Path) -> list[dict[str, Any]]:
+        return P.processes_with_argv_path(root)
+
+    @staticmethod
+    def _clear_provider_lock_artifacts(root: Path) -> list[str]:
+        cleared: list[str] = []
+        single = root / ".worker-provider.lock"
+        if single.exists() and not single.is_symlink():
+            single.unlink(missing_ok=True)
+            cleared.append(single.name)
+        directory = root / ".worker-provider.lock.d"
+        if directory.is_dir() and not directory.is_symlink():
+            for path in directory.iterdir():
+                if path.is_file() and not path.is_symlink():
+                    path.unlink(missing_ok=True)
+                    cleared.append(str(path.relative_to(root)))
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+        return cleared
+
+    def reclaim_project(
+        self, runtime_name: str, *, worker: str | None = None, execute: bool = False,
+        confirmation_token: str | None = None,
+    ) -> dict[str, Any]:
+        root = self._project_dir(runtime_name)
+        worker_dirs = self._target_worker_dirs(runtime_name, worker)
+        key = f"{runtime_name}:{worker or '*'}"
+        plans: list[dict[str, Any]] = []
+        safe = True
+        for worker_dir in worker_dirs:
+            wl = L.WorkerLayout(worker_dir)
+            pid = P.read_pid(wl)
+            identity = self._inspect_worker_process(worker_dir, pid)
+            persisted = P.read_worker_identity(wl)
+            # A dead leader may leave exact descendants in its launch-time
+            # process group. A mismatched reused PID is never used as a PGID.
+            orphan_records = (
+                P.process_group_members(persisted.pid)
+                if persisted is not None and identity.get("status") == "dead"
+                else []
+            )
+            orphans = [
+                {key: record[key] for key in ("pid", "ppid", "pgid", "state", "start_time")}
+                for record in orphan_records
+            ]
+            worker_safe = identity.get("status") in {"dead", "mismatch"}
+            safe = safe and worker_safe
+            stale_artifacts = [
+                name for name in (L.PID_FILE, L.STOP_FILE, L.PAUSE_FILE, L.PROCESS_IDENTITY_FILE)
+                if (worker_dir / name).exists()
+            ]
+            plans.append({
+                "worker": worker_dir.name,
+                "process_identity": identity.get("status"),
+                "pid": pid,
+                "persisted_identity": self._public_identity(persisted),
+                "orphan_processes": orphans,
+                "stale_artifacts": stale_artifacts,
+                "safe_to_execute": worker_safe,
+            })
+        if not execute:
+            token = secrets.token_urlsafe(24)
+            self._reclaim_tokens[key] = (token, time.monotonic() + 60.0)
+            return {
+                "dry_run": True, "safe_to_execute": safe, "workers": plans,
+                "confirmation_token": token,
+            }
+        expected = self._reclaim_tokens.pop(key, None)
+        if expected is None or expected[1] < time.monotonic() or not secrets.compare_digest(
+            expected[0], confirmation_token or ""
+        ):
+            raise RuntimeSafetyError("invalid or expired reclaim confirmation")
+        if not safe:
+            raise RuntimeSafetyError("reclaim plan contains live or unknown Worker processes")
+
+        # Destructive process work happens first, while all stale artifacts and
+        # identities remain available for diagnosis if verification fails.
+        for worker_dir, plan in zip(worker_dirs, plans):
+            persisted = plan.get("persisted_identity")
+            if plan.get("orphan_processes"):
+                if not isinstance(persisted, dict) or not isinstance(persisted.get("pid"), int):
+                    raise RuntimeSafetyError("orphan reclaim lacks persisted process-group identity")
+                try:
+                    plan["orphan_termination"] = P.terminate_orphan_process_group(
+                        int(persisted["pid"]), term_timeout=5.0, kill_timeout=1.0,
+                    )
+                except (RuntimeError, OSError) as exc:
+                    raise RuntimeSafetyError(f"orphan reclaim failed closed: {exc}") from exc
+
+        unresolved_targets = {
+            worker_dir.name: self._project_processes(worker_dir)
+            for worker_dir in worker_dirs
+            if self._project_processes(worker_dir)
+        }
+        if unresolved_targets:
+            raise RuntimeSafetyError(
+                "reclaim left selected Worker processes: "
+                + ",".join(sorted(unresolved_targets))
+            )
+        remaining = self._project_processes(root)
+        if worker is None and remaining:
+            raise RuntimeSafetyError("project-wide reclaim could not prove zero Project processes")
+
+        for worker_dir in worker_dirs:
+            for name in (L.PID_FILE, L.STOP_FILE, L.PAUSE_FILE, L.PROCESS_IDENTITY_FILE):
+                (worker_dir / name).unlink(missing_ok=True)
+            self._merge_worker_status(
+                worker_dir, state="reclaimed", control_outcome="stale_reclaim",
+            )
+        cleared_locks = self._clear_provider_lock_artifacts(root) if not remaining else []
+        return {
+            "status": "reclaimed", "workers": plans,
+            "cleared_lock_artifacts": cleared_locks,
+            "remaining_project_processes": remaining,
+        }
 
     def status_project(self, runtime_name: str) -> dict[str, Any]:
         root = self._project_dir(runtime_name)
         workers = self._call(cli.do_status, runtime_name)
         for worker in workers:
-            memory_count, checkpoint = self._worker_checkpoint(root, str(worker.get("worker", "")))
+            name = str(worker.get("worker", ""))
+            memory_count, checkpoint = self._worker_checkpoint(root, name)
             worker["local_memory_count"] = memory_count
             worker["checkpoint"] = checkpoint
+            worker_dir = self._worker_dir(root, name)
+            identity = self._process_identity(worker_dir, worker.get("pid"))
+            worker["process_identity"] = identity
+            process_record = worker_dir / L.PROCESS_IDENTITY_FILE if worker_dir is not None else None
+            worker["reclaim_candidate"] = bool(
+                identity in {"dead", "mismatch"}
+                and (
+                    worker.get("pid") is not None
+                    or (process_record is not None and process_record.is_file() and not process_record.is_symlink())
+                )
+            )
+            # A numeric PID is not liveness. Only an identity-matched Worker is
+            # safe to report as alive or to target with an emergency signal.
+            worker["alive"] = identity == "matched"
+            stop = worker_dir / L.STOP_FILE if worker_dir is not None else None
+            worker["stop_requested"] = bool(
+                stop is not None and stop.exists() and not stop.is_symlink()
+            )
+            pause = worker_dir / L.PAUSE_FILE if worker_dir is not None else None
+            worker["pause_requested"] = bool(
+                pause is not None and pause.exists() and not pause.is_symlink()
+            )
+            worker["desired_state"] = (
+                "stopped" if worker["stop_requested"]
+                else "paused" if worker["pause_requested"]
+                else "running"
+            )
         return {"config": self.project_config(runtime_name), "workers": workers}
+
+    @staticmethod
+    def _worker_dir(root: Path, worker: str) -> Path | None:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", worker):
+            return None
+        raw = root / "workers" / worker
+        if raw.is_symlink():
+            return None
+        resolved = raw.resolve()
+        return resolved if resolved.parent == root / "workers" and resolved.is_dir() else None
+
+    @staticmethod
+    def _process_identity(worker_dir: Path | None, pid: Any) -> str:
+        """Return the conservative state from the single process inspector."""
+        if worker_dir is None:
+            return "unknown"
+        return str(DanusRuntimeAdapter._inspect_worker_process(worker_dir, pid).get("status", "unknown"))
 
     def project_config(self, runtime_name: str) -> dict[str, Any]:
         root = self._project_dir(runtime_name)
@@ -207,23 +536,101 @@ class DanusRuntimeAdapter:
                 continue
         return rows
 
-    def logs_projection(self, runtime_name: str, worker: str | None = None, tail: int = 200) -> dict[str, Any]:
+    def logs_projection(
+        self,
+        runtime_name: str,
+        worker: str | None = None,
+        tail: int = 200,
+        *,
+        max_bytes: int = 64 * 1024,
+    ) -> dict[str, Any]:
+        """Return bounded log tails opened relative to a no-follow directory fd."""
         root = self._project_dir(runtime_name)
+        if tail < 1 or max_bytes < 1:
+            raise ValueError("tail and max_bytes must be positive")
+        if worker is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", worker):
+            raise ValueError("invalid worker name")
         workers = [worker] if worker else L.list_workers(runtime_name, self.agents_root)
-        entries = []
+        entries: list[dict[str, Any]] = []
+        fetched_at = time.time()
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
         for name in workers:
-            if not name or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name):
+            if not name:
                 continue
-            log_dir = (root / "workers" / name / "logs").resolve()
-            if log_dir.parent.parent.parent != root or not log_dir.is_dir():
+            worker_dir = self._worker_dir(root, name)
+            if worker_dir is None:
                 continue
-            for path in sorted(log_dir.glob("*.log")):
-                try:
-                    text = path.read_text(encoding="utf-8", errors="replace").splitlines()[-tail:]
-                    entries.append({"worker": name, "name": path.name, "lines": text})
-                except OSError:
-                    continue
-        return {"entries": entries}
+            raw_log_dir = worker_dir / L.LOGS_DIR
+            if raw_log_dir.is_symlink() or not raw_log_dir.is_dir():
+                continue
+            log_dir = raw_log_dir.resolve()
+            if log_dir.parent != worker_dir:
+                continue
+            try:
+                directory_fd = os.open(log_dir, directory_flags)
+            except OSError as exc:
+                raise RuntimeOperationError(f"log directory unavailable for Worker {name}") from exc
+            try:
+                names = [entry for entry in os.listdir(directory_fd) if entry.endswith(".log")]
+                names.sort(key=lambda entry: self._log_sort_key(Path(entry)))
+                for log_name in names:
+                    if "/" in log_name or log_name in {".", ".."}:
+                        continue
+                    try:
+                        listed_stat = os.stat(log_name, dir_fd=directory_fd, follow_symlinks=False)
+                        if not stat_module.S_ISREG(listed_stat.st_mode):
+                            continue
+                        file_fd = os.open(log_name, file_flags, dir_fd=directory_fd)
+                        stat = os.fstat(file_fd)
+                        if not stat_module.S_ISREG(stat.st_mode):
+                            os.close(file_fd)
+                            continue
+                        with os.fdopen(file_fd, "rb", closefd=True) as handle:
+                            offset = max(0, stat.st_size - max_bytes)
+                            handle.seek(offset)
+                            data = handle.read(max_bytes)
+                        if offset:
+                            boundary = data.find(b"\n")
+                            data = data[boundary + 1:] if boundary >= 0 else b""
+                        # Redact the whole bounded value so multi-line PEM and
+                        # header shapes cannot escape line-at-a-time filtering.
+                        decoded = redact_text(data.decode("utf-8", errors="replace"), limit=max_bytes)
+                        available = decoded.splitlines()
+                        selected = available[-tail:]
+                        round_match = re.fullmatch(r"round_(\d+)\.log", log_name)
+                        entries.append({
+                            "worker": name,
+                            "name": log_name,
+                            "kind": "loop" if log_name == "loop.log" else "round" if round_match else "other",
+                            "round": int(round_match.group(1)) if round_match else None,
+                            "size": stat.st_size,
+                            "modified_at": stat.st_mtime,
+                            "truncated": bool(offset or len(available) > tail),
+                            "empty": stat.st_size == 0,
+                            "returned_lines": len(selected),
+                            "lines": selected,
+                        })
+                    except OSError as exc:
+                        raise RuntimeOperationError(f"log file unavailable for Worker {name}") from exc
+            finally:
+                os.close(directory_fd)
+        return {
+            "worker": worker,
+            "tail": tail,
+            "max_bytes": max_bytes,
+            "fetched_at": fetched_at,
+            "entries": entries,
+        }
+
+    @staticmethod
+    def _log_sort_key(path: Path) -> tuple[int, int, str]:
+        if path.name == "loop.log":
+            return (0, 0, path.name)
+        match = re.fullmatch(r"round_(\d+)\.log", path.name)
+        if match:
+            return (1, int(match.group(1)), path.name)
+        return (2, 0, path.name)
 
     def fact_graph_projection(self, runtime_name: str) -> dict[str, Any]:
         from danus.observability.app import build_factgraph

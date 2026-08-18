@@ -19,6 +19,7 @@ from typing import Any, Callable
 
 from danus.strategy.config import resolve_transport
 
+from .observability import redact_text
 from .runtime import RuntimeErrorBase
 
 
@@ -217,7 +218,7 @@ class MainAgentAdapter:
         return "\n".join([
             "You are the Danus Main Agent for exactly one Project.",
             "Follow the Main Agent contract below. Retain strategic orchestration authority; do not submit facts directly.",
-            "Use the exact project-scoped command path in `$DANUS_WEB_AGENT_BIN` for status, assignment, and graceful Worker lifecycle coordination. It is the only allowed lifecycle command and is pinned to this Project. Do not edit Danus source code or access another Project. Use the Danus MCP tools for scoped memory and Fact Graph oversight; never submit facts as Main Agent.",
+            "Use the exact project-scoped command path in `$DANUS_WEB_AGENT_BIN` for status, assignment, and Worker lifecycle coordination (`start`, `pause`, `resume`, and graceful `stop`). It is the only allowed lifecycle command and is pinned to this Project. Do not edit Danus source code or access another Project. Use the Danus MCP tools for scoped memory and Fact Graph oversight; never submit facts as Main Agent.",
             strategy_policy,
             "MAIN AGENT CONTRACT:\n" + contract_text,
             "The Web Console supplies this project state and material manifest explicitly.",
@@ -334,43 +335,7 @@ class MainAgentAdapter:
 
     @staticmethod
     def _redact_display_text(value: str, limit: int = 1200) -> str:
-        text = str(value or "")
-        text = re.sub(
-            r"(?is)-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?-----END [^-\r\n]*PRIVATE KEY-----",
-            "<REDACTED_PRIVATE_KEY>", text,
-        )
-        text = re.sub(
-            r"(?im)^(\s*(?:export\s+)?[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|AUTHORIZATION|COOKIE|SESSION|CREDENTIAL)[A-Z0-9_]*\s*=).*$",
-            r"\1<REDACTED>", text,
-        )
-        text = re.sub(
-            r"(?i)((?:-u|--user)\s+)(?:\"[^\"]*\"|'[^']*'|\S+)",
-            r"\1<REDACTED>", text,
-        )
-        text = re.sub(
-            r"(?i)([a-z][a-z0-9+.-]*://)[^/\s:@]+:[^@\s/]+@",
-            r"\1<REDACTED>@", text,
-        )
-        text = re.sub(
-            r"(?i)((?:authorization|cookie|set-cookie|x-session)\s*[:=]\s*)(?:bearer\s+)?[^\r\n]+",
-            r"\1<REDACTED>", text,
-        )
-        text = re.sub(
-            r"(?i)([\"']?(?:api[_-]?key|token|secret|password|auth[_-]?token|session|cookie|credential|private[_-]?key|access[_-]?key)[\"']?\s*[:=]\s*)([\"']?)[^\s,\"';}]+\2",
-            r"\1<REDACTED>", text,
-        )
-        text = re.sub(r"(?i)\b(?:sk|rk)-[A-Za-z0-9_-]{8,}\b", "<REDACTED>", text)
-        text = re.sub(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b", "<REDACTED>", text)
-        text = re.sub(r"\bglpat-[A-Za-z0-9_-]{20,}\b", "<REDACTED>", text)
-        text = re.sub(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b", "<REDACTED>", text)
-        text = re.sub(r"\bAIza[0-9A-Za-z_-]{20,}\b", "<REDACTED>", text)
-        text = re.sub(r"\b(?:hf|npm)_[A-Za-z0-9_-]{20,}\b", "<REDACTED>", text)
-        text = re.sub(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b", "<REDACTED>", text)
-        text = re.sub(
-            r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}\b",
-            "<REDACTED>", text,
-        )
-        return text[:limit]
+        return redact_text(str(value or ""), limit=limit, replacement="<REDACTED>")
 
     @classmethod
     def _safe_display_value(cls, value: Any, limit: int = 1200) -> str:
@@ -401,6 +366,45 @@ class MainAgentAdapter:
         else:
             rendered = str(clean(parsed))
         return cls._redact_display_text(rendered, limit=limit)
+
+    @classmethod
+    def _tool_result_detail(cls, raw_result: Any) -> str:
+        parsed = raw_result
+        if isinstance(raw_result, str):
+            try:
+                parsed = json.loads(raw_result)
+            except (json.JSONDecodeError, TypeError):
+                parsed = raw_result
+        allowed = {
+            "status", "outcome", "detail", "error", "exit_code", "run_id",
+            "worker", "workers", "alive_workers", "not_running_workers",
+            "signals_sent", "remaining_project_processes", "safe_to_execute",
+        }
+        if isinstance(parsed, dict):
+            selected = {key: parsed[key] for key in allowed if key in parsed}
+            if selected:
+                return cls._safe_display_value(selected, 1200)
+        size = len(str(raw_result or ""))
+        return f"Result returned ({size} characters; content hidden by safety policy)"
+
+    @staticmethod
+    def _tool_result_status(raw_result: Any, envelope: dict[str, Any] | None = None) -> str:
+        envelope = envelope or {}
+        if envelope.get("is_error") or envelope.get("error"):
+            return "failed"
+        parsed = raw_result
+        if isinstance(raw_result, str):
+            try:
+                parsed = json.loads(raw_result)
+            except (json.JSONDecodeError, TypeError):
+                parsed = None
+        if isinstance(parsed, dict) and (
+            parsed.get("is_error") or parsed.get("error")
+            or str(parsed.get("status") or "").lower() in {"failed", "error", "rejected"}
+            or parsed.get("accepted") is False
+        ):
+            return "failed"
+        return "completed"
 
     @classmethod
     def _tool_call_detail(cls, tool: str, raw_detail: Any) -> str:
@@ -458,6 +462,15 @@ class MainAgentAdapter:
                 return
             item_type = obj.get("type")
             if item_type == "reasoning":
+                # Codex may emit an explicit operator-safe reasoning summary.
+                # Never expose encrypted/private reasoning content; only the
+                # plaintext summary field supplied by the runtime is observable.
+                summary = cls._text_value(obj.get("summary"))
+                if summary:
+                    events.append({
+                        "type": "agent.progress",
+                        "detail": cls._redact_display_text(summary, 4000),
+                    })
                 return
             if item_type in {"agent_message", "message"}:
                 role = obj.get("role", "assistant")
@@ -474,6 +487,8 @@ class MainAgentAdapter:
                 events.append({
                     "type": "tool.started", "tool": cls._redact_display_text(str(tool), 120),
                     "detail": cls._tool_call_detail(str(tool), raw_detail),
+                    "call_id": cls._redact_display_text(str(obj.get("call_id") or obj.get("id") or ""), 200),
+                    "status": "started",
                 })
                 return
             if item_type in {
@@ -481,16 +496,24 @@ class MainAgentAdapter:
             }:
                 events.append({
                     "type": "tool.completed", "tool": "tool result",
-                    "detail": "工具已返回结果（原始输出未展示）",
+                    "detail": cls._tool_result_detail(obj.get("output") or obj.get("result") or ""),
+                    "call_id": cls._redact_display_text(str(obj.get("call_id") or obj.get("id") or ""), 200),
+                    "status": cls._tool_result_status(obj.get("output") or obj.get("result") or "", obj),
                 })
                 return
             if item_type == "command_execution":
                 command = obj.get("command") or obj.get("cmd") or ""
+                completed = phase == "completed"
+                exit_code = obj.get("exit_code")
                 events.append({
-                    "type": "tool.completed" if phase == "completed" else "tool.started",
+                    "type": "tool.completed" if completed else "tool.started",
                     "tool": "exec_command",
-                    "detail": cls._tool_call_detail("exec_command", command),
-                    "status": "completed" if phase == "completed" else "started",
+                    "detail": (
+                        f"exit_code={exit_code if exit_code is not None else 'unknown'}; "
+                        + cls._tool_result_detail(obj.get("aggregated_output") or obj.get("output") or "")
+                    ) if completed else cls._tool_call_detail("exec_command", command),
+                    "status": "failed" if completed and exit_code else "completed" if completed else "started",
+                    "call_id": cls._redact_display_text(str(obj.get("id") or obj.get("call_id") or ""), 200),
                 })
                 return
             if item_type == "file_change":
@@ -501,7 +524,10 @@ class MainAgentAdapter:
                 })
 
         if kind in {"thread.started", "turn.started"}:
-            events.append({"type": "turn.started", "detail": "Main Agent 会话已建立"})
+            events.append({
+                "type": "turn.started", "detail": "Main Agent 会话已建立",
+                "session_id": item.get("thread_id") or payload.get("session_id") or payload.get("id"),
+            })
         elif kind == "turn.completed":
             events.append({"type": "turn.completed", "detail": "Main Agent 已完成本次回复"})
         elif kind == "turn.failed":
@@ -530,11 +556,73 @@ class MainAgentAdapter:
                 else:
                     events.append({"type": "turn.completed", "detail": "Main Agent 已完成本次回复"})
             elif event_type and "tool_call" in str(event_type):
+                completed = str(event_type).endswith(("end", "completed"))
                 events.append({
-                    "type": "tool.completed" if str(event_type).endswith(("end", "completed")) else "tool.started",
+                    "type": "tool.completed" if completed else "tool.started",
                     "tool": cls._redact_display_text(str(payload.get("tool") or payload.get("name") or "MCP tool"), 120),
-                    "detail": "工具调用状态已更新（原始输出未展示）",
+                    "detail": cls._tool_result_detail(payload.get("result") or payload.get("output") or payload.get("error") or "") if completed else cls._tool_call_detail(str(payload.get("tool") or payload.get("name") or "MCP tool"), payload.get("arguments") or payload.get("input") or {}),
+                    "status": "failed" if payload.get("error") else "completed" if completed else "started",
+                    "call_id": cls._redact_display_text(str(payload.get("call_id") or payload.get("id") or ""), 200),
                 })
+        return events
+
+    @classmethod
+    def _claude_progress_events(cls, line: str) -> list[dict[str, Any]]:
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            return []
+        kind = item.get("type")
+        events: list[dict[str, Any]] = []
+        if kind == "system" and item.get("subtype") == "init":
+            events.append({
+                "type": "turn.started", "detail": "Main Agent 会话已建立",
+                "session_id": item.get("session_id"),
+            })
+        elif kind == "assistant":
+            message = item.get("message") or {}
+            for block in message.get("content", []) if isinstance(message, dict) else []:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "text" and block.get("text"):
+                    events.append({
+                        "type": "agent.message",
+                        "detail": cls._redact_display_text(str(block["text"]), 4000),
+                    })
+                elif block.get("type") == "tool_use":
+                    events.append({
+                        "type": "tool.started",
+                        "tool": cls._redact_display_text(str(block.get("name") or "tool"), 120),
+                        "call_id": cls._redact_display_text(str(block.get("id") or ""), 200),
+                        "status": "started",
+                        "detail": cls._tool_call_detail(
+                            str(block.get("name") or "tool"), block.get("input") or {},
+                        ),
+                    })
+        elif kind == "user":
+            message = item.get("message") or {}
+            for block in message.get("content", []) if isinstance(message, dict) else []:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                events.append({
+                    "type": "tool.completed", "tool": "tool result",
+                    "call_id": cls._redact_display_text(str(block.get("tool_use_id") or ""), 200),
+                    "status": "failed" if block.get("is_error") else "completed",
+                    "detail": cls._tool_result_detail(block.get("content") or ""),
+                })
+        elif kind == "result":
+            failed = bool(item.get("is_error") or item.get("subtype") != "success")
+            duration_ms = item.get("duration_ms")
+            events.append({
+                "type": "turn.failed" if failed else "turn.completed",
+                "status": "failed" if failed else "completed",
+                "detail": cls._redact_display_text(
+                    str(item.get("error") or ("Main Agent 执行失败" if failed else "Main Agent 已完成本次回复")),
+                    1200,
+                ),
+                "duration_seconds": float(duration_ms) / 1000 if isinstance(duration_ms, (int, float)) else None,
+                "session_id": item.get("session_id") or item.get("sessionId"),
+            })
         return events
 
     @classmethod
@@ -771,12 +859,20 @@ class MainAgentAdapter:
         active_session_id = session_id
         active_prompt = prompt
         last_progress_signature: tuple[Any, ...] | None = None
+        tool_started_at: dict[str, float] = {}
 
         def emit_stdout_line(line: str) -> None:
             nonlocal last_progress_signature
             if on_progress is None:
                 return
             for event in self._codex_progress_events(line):
+                call_id = str(event.get("call_id") or "")
+                if event.get("type") == "tool.started" and call_id:
+                    tool_started_at[call_id] = time.monotonic()
+                elif event.get("type") == "tool.completed" and call_id in tool_started_at:
+                    event["duration_seconds"] = round(time.monotonic() - tool_started_at.pop(call_id), 3)
+                if event.get("type") in {"turn.completed", "turn.failed"}:
+                    event["duration_seconds"] = round(time.monotonic() - started, 3)
                 signature = (
                     event.get("type"), event.get("tool"), event.get("detail"),
                     event.get("status"), event.get("call_id"),
@@ -784,11 +880,9 @@ class MainAgentAdapter:
                 if signature == last_progress_signature:
                     continue
                 last_progress_signature = signature
-                try:
-                    on_progress(event)
-                except Exception:
-                    # Progress display is best-effort and must never abort a turn.
-                    continue
+                # Persistence is part of the control-plane audit boundary. A
+                # failed sink aborts the turn instead of silently losing events.
+                on_progress(event)
 
         for attempt in range(1, self.max_attempts + 1):
             try:
@@ -841,20 +935,17 @@ class MainAgentAdapter:
                 delay = min(self.retry_cap_seconds, self.retry_base_seconds * (2 ** (attempt - 1)))
                 if on_progress is not None:
                     safe_retry_detail = self._redact_display_text(structured_detail, 1200)
-                    try:
-                        on_progress({
-                            "type": "turn.retry",
-                            "status": "retrying",
-                            "attempt": attempt + 1,
-                            "max_attempts": self.max_attempts,
-                            "delay_seconds": delay,
-                            "error_code": code,
-                            "message": safe_retry_detail,
-                            "detail": safe_retry_detail,
-                            "session_id": chosen_id,
-                        })
-                    except Exception:
-                        pass
+                    on_progress({
+                        "type": "turn.retry",
+                        "status": "retrying",
+                        "attempt": attempt + 1,
+                        "max_attempts": self.max_attempts,
+                        "delay_seconds": delay,
+                        "error_code": code,
+                        "message": safe_retry_detail,
+                        "detail": safe_retry_detail,
+                        "session_id": chosen_id,
+                    })
                 self._sleeper(delay)
                 active_session_id = chosen_id
                 active_prompt = continuation
@@ -875,7 +966,10 @@ class MainAgentAdapter:
         )
 
 
-    def _send_claude(self, *, root: Path, session_id: str | None, prompt: str, env: dict[str, str]) -> dict[str, Any]:
+    def _send_claude(
+        self, *, root: Path, session_id: str | None, prompt: str, env: dict[str, str],
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         repo = Path(__file__).resolve().parents[2]
         contract = repo / "agents" / "contracts" / "web_main_agent.md"
         if not contract.is_file() or not os.access(contract, os.R_OK):
@@ -896,17 +990,37 @@ class MainAgentAdapter:
         }}}
         new_session = session_id is None
         sid = session_id or str(uuid.uuid4())
-        allowed = ["Read", "Glob", "Grep", "Bash(danus-web-agent status)", "Bash(danus-web-agent assign *)", "Bash(danus-web-agent start)", "Bash(danus-web-agent stop)",
+        allowed = ["Read", "Glob", "Grep", "Bash(danus-web-agent status)", "Bash(danus-web-agent assign *)", "Bash(danus-web-agent start)", "Bash(danus-web-agent pause *)", "Bash(danus-web-agent resume *)", "Bash(danus-web-agent stop)",
                    "mcp__danus__gm_add", "mcp__danus__gm_search",
                    "mcp__danus__fact_search", "mcp__danus__fact_revoke",
                    "mcp__danus__search_arxiv_theorems"]
-        cmd = [self.claude_bin, "-p", "--output-format", "json", "--permission-mode", "dontAsk",
+        cmd = [self.claude_bin, "-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "dontAsk",
                "--setting-sources", "", "--strict-mcp-config", "--mcp-config", json.dumps(mcp),
                "--system-prompt-file", str(contract), "--add-dir", str(root),
                "--allowed-tools", *allowed, "--session-id" if new_session else "--resume", sid]
         started = time.monotonic()
         try:
-            result = self._runner(cmd, input=prompt, cwd=str(root), env=env, timeout=self.timeout)
+            tool_started_at: dict[str, tuple[float, str]] = {}
+
+            def emit_stdout_line(line: str) -> None:
+                if on_progress is None:
+                    return
+                for event in self._claude_progress_events(line):
+                    call_id = str(event.get("call_id") or "")
+                    if event.get("type") == "tool.started" and call_id:
+                        tool_started_at[call_id] = (
+                            time.monotonic(), str(event.get("tool") or "tool"),
+                        )
+                    elif event.get("type") == "tool.completed" and call_id in tool_started_at:
+                        started_at, tool_name = tool_started_at.pop(call_id)
+                        event["tool"] = tool_name
+                        event["duration_seconds"] = round(time.monotonic() - started_at, 3)
+                    on_progress(event)
+
+            result = self._runner(
+                cmd, input=prompt, cwd=str(root), env=env, timeout=self.timeout,
+                on_stdout_line=emit_stdout_line,
+            )
         except subprocess.TimeoutExpired as exc:
             raise MainAgentError("main agent turn timed out") from exc
         except (FileNotFoundError, PermissionError, OSError) as exc:
@@ -926,7 +1040,8 @@ class MainAgentAdapter:
             uuid.UUID(str(returned_id))
         except (ValueError, AttributeError) as exc:
             raise MainAgentError("main agent returned an invalid session identity") from exc
-        return {"session_id": returned_id, "reply": parsed["result"].strip(),
+        reply = str(parsed["result"]).strip()
+        return {"session_id": returned_id, "reply": self._redact_display_text(reply, max(1, len(reply) + 1)),
                 "status": "completed", "seconds": round(time.monotonic() - started, 1),
                 "read_status": parsed.get("read_status", "unknown")}
 
@@ -955,5 +1070,6 @@ class MainAgentAdapter:
             on_progress=on_progress,
         ) if self.backend == "codex" else self._send_claude(
             root=root, session_id=session_id, prompt=prompt, env=env,
+            on_progress=on_progress,
         )
         return result

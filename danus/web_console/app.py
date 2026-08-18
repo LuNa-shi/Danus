@@ -22,7 +22,7 @@ from danus import codex
 from danus.execution import layout as L
 
 from .config import ProviderModelCatalog, main_agent_metadata, strategy_metadata
-from .runtime import DanusRuntimeAdapter, RuntimeErrorBase, validate_runtime_name
+from .runtime import DanusRuntimeAdapter, RuntimeErrorBase, RuntimeSafetyError, validate_runtime_name
 from .files import FileValidationError, file_type, material_root, metadata, normalize_filename, promote_pending, remove_blob, stream_to_pending, validate_bytes
 from .main_agent import MainAgentError, MainAgentAdapter
 from .security import (
@@ -221,10 +221,12 @@ def create_app(
         for key, value in (projection.get("config") or {}).items():
             if value is not None:
                 config[key] = value
+        workers = projection.get("workers", [])
         return {
             **projection,
             "config": config,
             "project": project_payload(project),
+            "progress": worker_progress(workers),
         }
 
     def unassigned_workers(projection: dict[str, Any]) -> list[str]:
@@ -241,6 +243,31 @@ def create_app(
                 entries = channel.get("entries") or []
                 return entries[0] if entries else None
         return None
+
+    def worker_is_live(worker: dict[str, Any]) -> bool:
+        identity = worker.get("process_identity")
+        if identity in {"matched", "mismatch", "dead", "unknown"}:
+            return identity == "matched"
+        # Injectable adapters used by deployments/tests predating #8 retain a
+        # compatibility fallback. Production never trusts a raw numeric PID.
+        return bool(worker.get("alive"))
+
+    def worker_progress(workers: list[dict[str, Any]]) -> dict[str, int]:
+        live = [worker for worker in workers if worker_is_live(worker)]
+        stale = [
+            worker for worker in workers
+            if not worker_is_live(worker) and (
+                worker.get("process_identity") == "mismatch"
+                or str(worker.get("state") or "").lower() in {"running", "retrying"}
+            )
+        ]
+        return {
+            "expected_workers": len(workers),
+            "live_workers": len(live),
+            "stop_pending_workers": sum(bool(worker.get("stop_requested")) for worker in live),
+            "stopped_workers": len(workers) - len(live) - len(stale),
+            "stale_workers": len(stale),
+        }
 
     def expected_worker_roster(
         project: dict[str, Any], projection: dict[str, Any],
@@ -285,7 +312,7 @@ def create_app(
             for worker in projection.get("workers", [])
             if worker.get("worker")
         }
-        alive = [name for name in expected if workers.get(name, {}).get("alive") is True]
+        alive = [name for name in expected if worker_is_live(workers.get(name, {}))]
         pending = [name for name in expected if name not in alive]
         return expected, alive, pending
 
@@ -349,7 +376,7 @@ def create_app(
                 return enforce_expired_deadline(
                     project_id, project, active, projection,
                 )
-            if active["status"] == "stopping" and not any(worker.get("alive") for worker in workers):
+            if active["status"] == "stopping" and not any(worker_is_live(worker) for worker in workers):
                 unresolved = unresolved_raw_processes(projection)
                 if unresolved:
                     store.update_run(
@@ -412,7 +439,7 @@ def create_app(
         except Exception:
             return _error(400, "invalid lifecycle request")
         action = payload.get("action") if isinstance(payload, dict) else None
-        if action not in {"assign", "status", "start", "stop"}:
+        if action not in {"assign", "status", "start", "pause", "resume", "stop"}:
             return _error(400, "invalid lifecycle action")
         if payload.get("force") is True:
             return _error(403, "force stop is reserved for host safety controls")
@@ -444,6 +471,10 @@ def create_app(
         active = store.active_run(project_id)
         if active is None:
             return _error(409, "project has no active run intent")
+        if action in {"pause", "resume"} and (
+            active["status"] != "running" or time.time() >= active["deadline"]
+        ):
+            return _error(409, "project run is not resumable")
         if action == "start":
             if active["status"] != "starting":
                 if active["status"] == "running":
@@ -502,6 +533,24 @@ def create_app(
             )
             store.audit("run_start", "success", project_id)
             return {"status": "running", "run_id": active["id"], "workers": alive}
+
+        if action == "pause":
+            try:
+                result = runtime.pause_project(project["runtime_name"], worker=worker)
+            except (RuntimeErrorBase, OSError) as exc:
+                store.audit("run_pause", "failure", project_id)
+                return _error(409, str(exc)[:200] or "pause request failed")
+            store.audit("run_pause", "success", project_id)
+            return JSONResponse({**result, "run_id": active["id"]}, status_code=202)
+
+        if action == "resume":
+            try:
+                result = runtime.resume_project(project["runtime_name"], worker=worker)
+            except (RuntimeErrorBase, OSError) as exc:
+                store.audit("run_resume", "failure", project_id)
+                return _error(409, str(exc)[:200] or "resume request failed")
+            store.audit("run_resume", "success", project_id)
+            return JSONResponse({**result, "run_id": active["id"]}, status_code=202)
 
         try:
             result = runtime.stop_project(project["runtime_name"])
@@ -830,7 +879,8 @@ def create_app(
             run = store.run(run_id) or run
         except RuntimeErrorBase:
             projection = {"workers": [], "error": "runtime unavailable"}
-        return {**run, "workers": projection.get("workers", [])}
+        workers = projection.get("workers", [])
+        return {**run, **worker_progress(workers), "workers": workers}
 
     @app.post("/api/projects/{project_id}/runs/{run_id}/stop")
     async def stop_run(project_id: str, run_id: str, request: Request):
@@ -867,12 +917,14 @@ def create_app(
             active = store.active_run(project_id)
             if active is not None:
                 expected, alive, pending = roster_state(project, projection)
+                progress = worker_progress(projection.get("workers", []))
                 projection = {**projection, "run": {
                     "id": active["id"], "status": active["status"],
                     "deadline": active["deadline"], "outcome": active.get("outcome"),
-                    "expected_workers": expected, "alive_workers": alive,
-                    "not_running_workers": pending,
+                    "expected_worker_names": expected, "alive_worker_names": alive,
+                    "alive_workers": alive, "not_running_workers": pending, **progress,
                 }}
+
             return projection_with_project(project, projection)
         except RuntimeErrorBase:
             return _error(502, "runtime projection unavailable")
@@ -894,6 +946,149 @@ def create_app(
             store.update_run(active["id"], status="stopping", outcome="operator_stop_intent")
             store.audit("run_stop", "intent_recorded", project_id)
             return JSONResponse({"status": "stop_requested"}, status_code=202)
+
+    async def safety_control_context(project_id: str, request: Request) -> tuple[dict[str, Any], dict[str, Any]] | JSONResponse:
+        current = auth_required(request)
+        if isinstance(current, JSONResponse):
+            return current
+        if not csrf_ok(request, current):
+            return _error(403, "csrf validation failed")
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse):
+            return project
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            return _error(400, "invalid request body")
+        payload["_actor_session_id"] = current.get("id")
+        worker = payload.get("worker")
+        if worker is not None:
+            try:
+                validate_runtime_name(str(worker))
+            except ValueError:
+                return _error(400, "invalid worker")
+            payload["worker"] = str(worker)
+        return project, payload
+
+    @app.post("/api/projects/{project_id}/pause")
+    async def pause_project_workers(project_id: str, request: Request):
+        context = await safety_control_context(project_id, request)
+        if isinstance(context, JSONResponse):
+            return context
+        project, payload = context
+        async with lock_for(project_id):
+            active = store.active_run(project_id)
+            if active is None or active["status"] != "running" or time.time() >= active["deadline"]:
+                return _error(409, "project run is not resumable")
+            store.audit(
+                "run_pause", "intent_recorded", project_id,
+                details=json.dumps({
+                    "actor": "operator_session", "session_id": payload.get("_actor_session_id"),
+                    "worker": payload.get("worker"),
+                }),
+            )
+            return JSONResponse({
+                "status": "pause_intent", "worker": payload.get("worker"),
+            }, status_code=202)
+
+    @app.post("/api/projects/{project_id}/resume")
+    async def resume_project_workers(project_id: str, request: Request):
+        context = await safety_control_context(project_id, request)
+        if isinstance(context, JSONResponse):
+            return context
+        project, payload = context
+        async with lock_for(project_id):
+            active = store.active_run(project_id)
+            if active is None or active["status"] != "running" or time.time() >= active["deadline"]:
+                return _error(409, "project run is not resumable")
+            store.audit(
+                "run_resume", "intent_recorded", project_id,
+                details=json.dumps({
+                    "actor": "operator_session", "session_id": payload.get("_actor_session_id"),
+                    "worker": payload.get("worker"),
+                }),
+            )
+            return JSONResponse({
+                "status": "resume_intent", "worker": payload.get("worker"),
+            }, status_code=202)
+
+    @app.post("/api/projects/{project_id}/force-stop")
+    async def force_stop_project_workers(project_id: str, request: Request):
+        context = await safety_control_context(project_id, request)
+        if isinstance(context, JSONResponse):
+            return context
+        project, payload = context
+        if payload.get("confirm") != project["name"]:
+            return _error(409, "project-name confirmation required")
+        async with lock_for(project_id):
+            try:
+                result = runtime.force_stop_project(project["runtime_name"], worker=payload.get("worker"))
+                projection = runtime.status_project(project["runtime_name"])
+                active = store.active_run(project_id)
+                if active is not None and not any(
+                    worker_is_live(row) for row in projection.get("workers", [])
+                ):
+                    store.update_run(
+                        active["id"], status="stopped", stopped_at=time.time(),
+                        outcome="emergency_force_stop",
+                    )
+                store.audit(
+                    "run_force_stop", "success", project_id,
+                    details=json.dumps({
+                        "actor": "operator_session",
+                        "session_id": payload.get("_actor_session_id"),
+                        "target_worker": payload.get("worker"),
+                        "result": result.get("workers", []),
+                    }),
+                )
+                return {**result, "progress": worker_progress(projection.get("workers", []))}
+            except (RuntimeSafetyError, RuntimeErrorBase, OSError) as exc:
+                store.audit(
+                    "run_force_stop", "failure", project_id,
+                    details=json.dumps({
+                        "actor": "operator_session",
+                        "session_id": payload.get("_actor_session_id"),
+                        "target_worker": payload.get("worker"),
+                        "error": str(exc)[:200],
+                    }),
+                )
+                return _error(409, str(exc)[:200] or "force stop refused")
+
+    @app.post("/api/projects/{project_id}/reclaim")
+    async def reclaim_project_workers(project_id: str, request: Request):
+        context = await safety_control_context(project_id, request)
+        if isinstance(context, JSONResponse):
+            return context
+        project, payload = context
+        execute = payload.get("execute") is True
+        if execute and payload.get("confirm") != project["name"]:
+            return _error(409, "project-name confirmation required")
+        async with lock_for(project_id):
+            try:
+                result = runtime.reclaim_project(
+                    project["runtime_name"], worker=payload.get("worker"), execute=execute,
+                    confirmation_token=payload.get("confirmation_token"),
+                )
+                if execute and not result.get("remaining_project_processes"):
+                    active = store.active_run(project_id)
+                    if active is not None:
+                        store.update_run(active["id"], status="stopped", stopped_at=time.time(), outcome="process_reclaimed")
+                store.audit("process_reclaim", "success", project_id, details=json.dumps({
+                    "actor": "operator_session", "session_id": payload.get("_actor_session_id"),
+                    "execute": execute, "target_worker": payload.get("worker"),
+                    "workers": result.get("workers", []),
+                    "remaining_project_processes": result.get("remaining_project_processes", []),
+                }))
+                return result
+            except (RuntimeSafetyError, RuntimeErrorBase, OSError) as exc:
+                store.audit("process_reclaim", "failure", project_id, details=json.dumps({
+                    "actor": "operator_session", "session_id": payload.get("_actor_session_id"),
+                    "execute": execute, "target_worker": payload.get("worker"),
+                    "error": str(exc)[:200],
+                }))
+                return _error(409, str(exc)[:200] or "reclaim refused")
 
     @app.get("/api/projects/{project_id}/files")
     async def list_files(project_id: str, request: Request):
@@ -1049,8 +1244,16 @@ def create_app(
             return project
         try:
             tail = max(1, min(int(request.query_params.get("tail", "200")), 1000))
-            return runtime.logs_projection(project["runtime_name"], worker=request.query_params.get("worker"), tail=tail)
-        except (RuntimeErrorBase, ValueError):
+            max_bytes = max(1024, min(int(request.query_params.get("max_bytes", str(64 * 1024))), 256 * 1024))
+            worker = request.query_params.get("worker")
+            if worker is not None:
+                validate_runtime_name(worker)
+            return runtime.logs_projection(
+                project["runtime_name"], worker=worker, tail=tail, max_bytes=max_bytes,
+            )
+        except ValueError:
+            return _error(400, "invalid log projection parameters")
+        except RuntimeErrorBase:
             return _error(502, "logs projection unavailable")
 
     @app.get("/api/projects/{project_id}/fact-graph")
@@ -1126,7 +1329,12 @@ def create_app(
         active = store.active_run(project_id)
         run_projection = None
         if active is not None:
-            run_projection = {"id": active["id"], "status": active["status"], "deadline": active["deadline"]}
+            run_projection = {
+                "id": active["id"],
+                "status": active["status"],
+                "deadline": active["deadline"],
+                **worker_progress(workers),
+            }
         return {
             "project": project_payload(project),
             "config": project_config(project),
@@ -1211,19 +1419,24 @@ def create_app(
         def record_main_agent_progress(event: dict[str, Any]) -> None:
             event_type = str(event.get("type") or "")
             allowed_types = {
-                "turn.started", "agent.message", "tool.started", "tool.completed",
+                "turn.started", "agent.progress", "agent.message", "tool.started", "tool.completed",
                 "turn.retry", "turn.completed", "turn.failed",
             }
             if event_type in allowed_types:
                 safe_payload: dict[str, Any] = {}
-                for key in ("tool", "detail", "status"):
+                for key in ("tool", "detail", "status", "call_id", "error_code"):
                     value = event.get(key)
                     if value is not None:
                         safe_payload[key] = str(value)[:4000 if key == "detail" else 200]
-                for key in ("attempt", "max_attempts", "delay_seconds"):
+                for key in ("attempt", "max_attempts", "delay_seconds", "duration_seconds"):
                     value = event.get(key)
                     if isinstance(value, (int, float)):
                         safe_payload[key] = value
+                active_event_run = store.active_run(project_id)
+                safe_payload["main_agent_session_id"] = str(
+                    event.get("session_id") or session_id or ""
+                )[:200]
+                safe_payload["run_id"] = str(active_event_run.get("id") if active_event_run else "")[:200]
                 store.add_main_agent_event(
                     project_id=project_id, message_id=message_id,
                     event_type=event_type, payload=safe_payload,

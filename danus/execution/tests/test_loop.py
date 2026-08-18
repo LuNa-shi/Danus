@@ -185,6 +185,30 @@ def test_main_stops_on_stop_flag(tmp: Path):
     assert json.loads(wl.status.read_text())["state"] == "stopped"
 
 
+def test_main_pause_marker_blocks_next_round_until_stop(tmp: Path):
+    wl = _mk_worker(tmp)
+    wl.pause.touch()
+    calls = []
+    original_sleep = loop.time.sleep
+
+    def release_to_stop(_seconds):
+        calls.append("paused")
+        wl.pause.unlink(missing_ok=True)
+        wl.stop.touch()
+
+    loop.time.sleep = release_to_stop
+    with _restore_sigterm(), _env(DANUS_ROUND_BEAT="0"):
+        _patch_run_round(lambda *a, **k: (_ for _ in ()).throw(AssertionError("round started while paused")))
+        try:
+            rc = loop.main(str(wl.dir))
+        finally:
+            _unpatch_run_round()
+            loop.time.sleep = original_sleep
+    assert rc == 0
+    assert calls == ["paused"]
+    assert json.loads(wl.status.read_text())["state"] == "stopped"
+
+
 # --- main loop: deadline → stop -------------------------------------------- #
 
 def test_main_stops_on_deadline(tmp: Path):
@@ -498,6 +522,7 @@ def main() -> None:
         test_run_round_missing_binary_returns_127,
         test_run_round_timeout_then_kill,
         test_main_stops_on_stop_flag,
+        test_main_pause_marker_blocks_next_round_until_stop,
         test_main_stops_on_deadline,
         test_main_max_rounds_cap,
         test_main_consecutive_failure_cap,

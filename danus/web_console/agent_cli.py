@@ -69,6 +69,10 @@ def main(argv: list[str] | None = None) -> int:
     assign.add_argument("worker")
     assign.add_argument("--task", required=True)
     sub.add_parser("start")
+    pause = sub.add_parser("pause")
+    pause.add_argument("worker", nargs="?")
+    resume = sub.add_parser("resume")
+    resume.add_argument("worker", nargs="?")
     stop = sub.add_parser("stop")
     stop.add_argument("--force", action="store_true")
     args = parser.parse_args(argv)
@@ -79,6 +83,8 @@ def main(argv: list[str] | None = None) -> int:
         result = _broker_post("assign", worker=args.worker, task=args.task)
     elif args.command == "start":
         result = _broker_post("start")
+    elif args.command in {"pause", "resume"}:
+        result = _broker_post(args.command, worker=args.worker)
     else:
         result = _broker_post("stop", force=args.force)
     print(json.dumps(result, ensure_ascii=False))

@@ -9,13 +9,15 @@ V1 should expose the Run Budget and essential Danus startup options in the proje
 ## Amendment: Main Agent authority and host lifecycle supervisor
 
 The thin Control Plane persists operator intent and enforced deadlines, but normal
-Worker assignment/start/graceful-stop decisions originate from the Project Main
-Agent. The browser activates that Main Agent rather than spawning or signaling a
-Worker roster itself. The Main Agent uses a project-scoped capability to request
-execution from a loopback host supervisor, which owns process creation, persisted
-process identity, deadlines, signals, and state reconciliation.
+Worker assignment/start/pause/resume/graceful-stop decisions originate from the
+Project Main Agent. The browser must activate that Main Agent rather than spawn or
+signal a Worker roster itself. The Main Agent uses a project-scoped capability to
+request execution from a loopback host supervisor, which owns process creation,
+process-identity verification, deadlines, signals, and state reconciliation.
 
 Only non-strategic safety boundaries may bypass the Main Agent: deadline
-enforcement and separately confirmed, identity-verified emergency recovery
-operations. This amendment supersedes the earlier wording that the Control Plane
-directly "starts/stops" the swarm.
+enforcement, a separately confirmed identity-verified emergency force-stop, and
+identity-verified orphan reclamation. Pause is cooperative at a round boundary;
+resume preserves the existing assignment and is executed only after a Main Agent
+lifecycle request. This amendment supersedes the earlier wording that the Control
+Plane directly "starts/stops" the swarm.

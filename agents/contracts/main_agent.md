@@ -220,7 +220,12 @@ State only what you have **verified**. This is a hard rule, not a tone preferenc
     `stuck?` is a soft signal; decide stop/restart).
   - `danus stop <project>[/<worker>] [--force]` — graceful (finish the round) or
     `--force` (kill now). To **extend** a run, adjust the project's `.run_deadline`;
-    to **restart**, `stop` then `start`. (There is no pause/resume — re-`start`.)
+    to **restart**, `stop` then `start`.
+  - In a Web Console Main Agent session, use the project-pinned
+    `danus-web-agent pause [worker]` and `danus-web-agent resume [worker]` commands.
+    Pause finishes the current round and holds the next round; resume preserves
+    the existing assignment. These lifecycle decisions travel through the
+    authenticated host supervisor, never through browser-side roster logic.
 - **Human report:** the `human-summary` skill — render the verified fact graph into
   a clean self-contained PDF (problem statement, key results with real proof
   sketches, the obstacle, timeline, remaining lemma in full). For **humans**, the

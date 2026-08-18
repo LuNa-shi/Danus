@@ -17,7 +17,7 @@ which is also the codex working dir / LocalMemory root)::
         .codex/config.toml                        # MCP = danus gateway, role=worker
         TASK.md                                   # per-round assignment (danus assign)
         local_memory/                             # worker-private (codex writes)
-        .role .pid .process.json .pid.lock .stop .status.json  logs/
+        .role .pid .process.json .pid.lock .pause .stop .status.json  logs/
 
 Key defaults:
   - the MCP server is launched as the installed package ``python -m danus.gateway``
@@ -47,6 +47,7 @@ TASK_FILE = "TASK.md"
 ROLE_FILE = ".role"
 PID_FILE = ".pid"
 PROCESS_IDENTITY_FILE = ".process.json"
+PAUSE_FILE = ".pause"
 LOCK_FILE = ".pid.lock"
 STOP_FILE = ".stop"
 STATUS_FILE = ".status.json"
@@ -166,6 +167,10 @@ class WorkerLayout:
     @property
     def process_identity(self) -> Path:
         return self.dir / PROCESS_IDENTITY_FILE
+
+    @property
+    def pause(self) -> Path:
+        return self.dir / PAUSE_FILE
 
     @property
     def lock(self) -> Path:
