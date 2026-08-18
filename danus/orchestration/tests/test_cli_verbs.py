@@ -22,6 +22,8 @@ import tempfile
 from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 
+import pytest
+
 from danus.execution import layout as L
 from danus.execution import processes as P
 from danus.orchestration import cli
@@ -177,6 +179,7 @@ def test_stop_one_force_sigkill_fallback(tmp: Path):
     import subprocess
     import sys
     import time
+
     ready = tmp / "handler_ready"
     prog = (
         "import signal, time, sys\n"
@@ -906,3 +909,19 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def test_web_main_agent_environment_cannot_call_raw_lifecycle_apis(tmp: Path, monkeypatch):
+    with _project_env(tmp):
+        cli.do_new("P", roles="high:1")
+        wl = _wl("P", "high")
+        monkeypatch.setenv("DANUS_ROLE", "main")
+        monkeypatch.setenv("DANUS_WEB_LIFECYCLE_URL", "http://127.0.0.1/lifecycle")
+        with pytest.raises(SystemExit, match="DANUS_WEB_AGENT_BIN"):
+            cli.do_start("P")
+        with pytest.raises(SystemExit, match="DANUS_WEB_AGENT_BIN"):
+            cli._start_one(wl)
+        with pytest.raises(SystemExit, match="DANUS_WEB_AGENT_BIN"):
+            cli.do_stop("P")
+        with pytest.raises(SystemExit, match="DANUS_WEB_AGENT_BIN"):
+            cli._stop_one(wl, False)

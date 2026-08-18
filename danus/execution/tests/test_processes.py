@@ -72,6 +72,16 @@ class RecordingProcFS(LinuxProcFS):
         self.events.append(("procfs_cmdline", pid))
         return super().cmdline(pid)
 
+    def process_record(self, pid: int):
+        record = super().process_record(pid)
+        if any(
+            isinstance(event, tuple) and event[0] == "signal_pidfd"
+            and event[2] == signal.SIGSTOP
+            for event in self.events
+        ):
+            record["state"] = "T"
+        return record
+
     def process_ids(self) -> list[int]:
         if any(
             isinstance(event, tuple) and event[:2] == ("signal_pidfd", 77)

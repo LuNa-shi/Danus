@@ -358,6 +358,25 @@ def _freeze_process_group(
                     raise RuntimeError("Worker leader identity changed")
                 handles[pid] = (fd, str(current["start_time"]))
                 ops.signal_pidfd(fd, signal.SIGSTOP)
+            stop_deadline = ops.monotonic() + 1.0
+            while True:
+                stopped = True
+                for pid, (fd, start_time) in handles.items():
+                    if ops.pidfd_exited(fd):
+                        continue
+                    try:
+                        current = procfs.process_record(pid)
+                    except (OSError, ValueError, IndexError):
+                        stopped = False
+                        break
+                    if str(current["start_time"]) != start_time or current["state"] not in {"T", "t"}:
+                        stopped = False
+                        break
+                if stopped:
+                    break
+                if ops.monotonic() >= stop_deadline:
+                    raise RuntimeError("process group did not reach the SIGSTOP barrier")
+                ops.sleep(0.01)
             current_pids = {int(row["pid"]) for row in process_group_members(pgid, procfs=procfs)}
             if current_pids.issubset(handles):
                 return handles

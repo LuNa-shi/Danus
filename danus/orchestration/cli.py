@@ -34,6 +34,15 @@ from danus.execution import layout as L
 from danus.execution import processes as P
 from danus.execution.scaffold import atomic_write, do_new, spawn_loop
 
+def _reject_web_sandbox_control() -> None:
+    if (
+        os.environ.get("DANUS_ROLE") == "main"
+        and os.environ.get("DANUS_WEB_LIFECYCLE_URL")
+    ):
+        raise SystemExit(
+            "Web Main Agent control must use the project-scoped DANUS_WEB_AGENT_BIN broker"
+        )
+
 __all__ = [
     "do_new", "do_assign", "do_start", "do_status", "worker_status",
     "do_list", "do_stop", "do_finalize", "build_parser", "main",
@@ -188,8 +197,8 @@ def do_finalize(project: str, fact_ids: List[str],
 # --------------------------------------------------------------------------- #
 
 def _start_one(wl: L.WorkerLayout) -> str:
-    """Returns 'started' / 'already-running' / 'locked'. Idempotent via an flock
-    on .pid.lock; clears a stale .stop before spawning."""
+    """Return a lifecycle result while holding the Worker launch lock."""
+    _reject_web_sandbox_control()
     wl.dir.mkdir(parents=True, exist_ok=True)
     wl.logs.mkdir(exist_ok=True)
     lock = open(wl.lock, "w")
@@ -236,6 +245,7 @@ def _start_one(wl: L.WorkerLayout) -> str:
 
 
 def do_start(target: str, stagger: float = 0.2, root: Optional[Path] = None) -> List[Dict]:
+    _reject_web_sandbox_control()
     dirs = L.target_worker_dirs(target, root)
     if not dirs:
         raise SystemExit(f"no workers for target {target!r}")
@@ -357,6 +367,7 @@ def _fmt_status(rows: List[Dict]) -> str:
 # --------------------------------------------------------------------------- #
 
 def _stop_one(wl: L.WorkerLayout, force: bool) -> str:
+    _reject_web_sandbox_control()
     if force:
         return P.force_stop_worker(wl)
     pid = P.read_pid(wl)
@@ -373,6 +384,7 @@ def _stop_one(wl: L.WorkerLayout, force: bool) -> str:
 
 
 def do_stop(target: str, force: bool = False, root: Optional[Path] = None) -> List[Dict]:
+    _reject_web_sandbox_control()
     dirs = L.target_worker_dirs(target, root)
     if not dirs:
         raise SystemExit(f"no workers for target {target!r}")

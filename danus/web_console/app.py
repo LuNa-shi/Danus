@@ -1323,15 +1323,16 @@ def create_app(
                 active = store.active_run(project["id"])
                 if active is None or time.time() < active["deadline"]:
                     continue
-                async with lock_for(project["id"]):
-                    try:
-                        await asyncio.to_thread(
-                            lambda p=project: reconcile_run(
-                                p["id"], p, runtime.status_project(p["runtime_name"]),
-                            )
+                # Deadline enforcement is a host safety boundary and must not
+                # wait behind a long Main Agent turn's orchestration lock.
+                try:
+                    await asyncio.to_thread(
+                        lambda p=project: reconcile_run(
+                            p["id"], p, runtime.status_project(p["runtime_name"]),
                         )
-                    except (RuntimeErrorBase, OSError):
-                        store.audit("run_deadline", "projection_failure", project["id"])
+                    )
+                except (RuntimeErrorBase, OSError):
+                    store.audit("run_deadline", "projection_failure", project["id"])
             await asyncio.sleep(interval)
 
     return app

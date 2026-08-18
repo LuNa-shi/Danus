@@ -1384,3 +1384,71 @@ def test_deadline_does_not_claim_terminal_for_unresolved_raw_process(tmp_path: P
         assert run["status"] == "stopping"
         assert run["outcome"].startswith("deadline_force_failed:")
         assert runtime.statuses[project["runtime_name"]][0]["raw_alive"] is True
+
+
+def test_deadline_supervisor_is_not_blocked_by_main_agent_turn(tmp_path: Path):
+    class BlockingMain:
+        backend = "codex"
+        started = threading.Event()
+        release = threading.Event()
+
+        def send(self, **kwargs):
+            self.started.set()
+            assert self.release.wait(timeout=5)
+            return {
+                "session_id": "sid-blocking", "reply": "done", "status": "completed",
+                "seconds": 0.1, "read_status": "unknown", "attempts": 1,
+            }
+
+    class DeadlineRuntime(FakeRuntime):
+        def __init__(self, root):
+            super().__init__(root)
+            self.deadline_enforced = threading.Event()
+
+        def enforce_deadline(self, runtime_name):
+            self.deadline_enforced.set()
+            self.statuses[runtime_name] = [
+                {**worker, "alive": False, "raw_alive": False, "state": "terminated"}
+                for worker in self.statuses[runtime_name]
+            ]
+            return {"workers": [
+                {"worker": worker["worker"], "result": "killed"}
+                for worker in self.statuses[runtime_name]
+            ]}
+
+    runtime = DeadlineRuntime(tmp_path / "projects")
+    main = BlockingMain()
+    settings = AppSettings(
+        database_path=tmp_path / "console.sqlite3",
+        password_hash=hash_password("correct horse battery staple"),
+        cookie_secure=True, allowed_origins={"https://testserver"},
+        lifecycle_hmac_secret=_LIFECYCLE_SECRET, deadline_poll_seconds=0.05,
+    )
+    app = create_app(settings=settings, runtime=runtime, main_agent=main)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client)
+        headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post(
+            "/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers,
+        ).json()
+        runtime.assign_all(project["runtime_name"])
+        assert client.post(
+            f"/api/projects/{project['id']}/runs",
+            json={"duration_seconds": 1}, headers=headers,
+        ).status_code == 202
+        assert _broker_start(client, project).status_code == 200
+        response = {}
+        thread = threading.Thread(target=lambda: response.setdefault(
+            "message", client.post(
+                f"/api/projects/{project['id']}/messages",
+                json={"text": "monitor", "attachment_ids": []}, headers=headers,
+            )
+        ))
+        thread.start()
+        try:
+            assert main.started.wait(timeout=2)
+            assert runtime.deadline_enforced.wait(timeout=2.5)
+        finally:
+            main.release.set()
+            thread.join(timeout=5)
+        assert response["message"].status_code == 201
