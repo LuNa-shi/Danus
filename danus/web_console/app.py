@@ -294,7 +294,10 @@ def create_app(
         projection: dict[str, Any],
     ) -> dict[str, Any]:
         workers = projection.get("workers", [])
-        if not any(worker.get("alive") is True for worker in workers):
+        if not any(
+            worker.get("alive") is True or worker.get("raw_alive") is True
+            for worker in workers
+        ):
             store.update_run(
                 active["id"], status="stopped", stopped_at=time.time(),
                 outcome="deadline_enforced",

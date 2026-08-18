@@ -1338,3 +1338,49 @@ def test_broker_stop_refusal_keeps_unresolved_raw_process_nonterminal(tmp_path: 
         assert projection["run"]["status"] == "stopping"
         assert projection["run"]["outcome"].startswith("main_agent_stop_refused:")
         assert runtime.statuses[project["runtime_name"]][0]["raw_alive"] is True
+
+
+def test_deadline_does_not_claim_terminal_for_unresolved_raw_process(tmp_path: Path):
+    class RefusingDeadlineRuntime(FakeRuntime):
+        def __init__(self, root):
+            super().__init__(root)
+            self.deadline_attempted = threading.Event()
+
+        def enforce_deadline(self, runtime_name):
+            self.deadline_attempted.set()
+            self.statuses[runtime_name][0].update({
+                "alive": False, "raw_alive": True,
+                "process_identity": "mismatch", "state": "stale",
+            })
+            return {"workers": [{"worker": "high", "result": "identity-mismatch"}]}
+
+    runtime = RefusingDeadlineRuntime(tmp_path / "projects")
+    settings = AppSettings(
+        database_path=tmp_path / "console.sqlite3",
+        password_hash=hash_password("correct horse battery staple"),
+        cookie_secure=True,
+        allowed_origins={"https://testserver"},
+        lifecycle_hmac_secret=_LIFECYCLE_SECRET,
+        deadline_poll_seconds=0.05,
+    )
+    app = create_app(settings=settings, runtime=runtime)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client)
+        headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post(
+            "/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers,
+        ).json()
+        runtime.assign_all(project["runtime_name"])
+        started = client.post(
+            f"/api/projects/{project['id']}/runs",
+            json={"duration_seconds": 1}, headers=headers,
+        )
+        assert _broker_start(client, project).status_code == 200
+
+        assert runtime.deadline_attempted.wait(timeout=2.5)
+        run = client.get(
+            f"/api/projects/{project['id']}/runs/{started.json()['run_id']}"
+        ).json()
+        assert run["status"] == "stopping"
+        assert run["outcome"].startswith("deadline_force_failed:")
+        assert runtime.statuses[project["runtime_name"]][0]["raw_alive"] is True
