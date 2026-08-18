@@ -99,3 +99,17 @@ _Avoid_: consult result for offline guidance
 The operator's explicit approval of the Main Agent's first strategic direction
 before Worker assignment or start.
 _Avoid_: browser approval of individual Worker tasks
+
+
+**Orchestration Beat**:
+A host-triggered activation of one Project's resumable Main Agent Session after a
+stable Worker/memory/Fact-Graph watermark changes. A Beat may update strategy,
+re-task Workers, request supervisor lifecycle actions, stop verified-complete work,
+and produce a due human summary.
+_Avoid_: Browser poll, cron-owned strategy, Worker heartbeat
+
+**Human-Summary Cadence**:
+The auditable target interval for Main Agent progress summaries. If no project state
+has changed when the interval becomes due, the summary remains due but does not
+create a paid Main Agent activation.
+_Avoid_: Unconditional hourly model call
