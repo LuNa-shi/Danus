@@ -713,13 +713,38 @@ class DanusRuntimeAdapter:
         allowed = relative == "TARGET.md" or relative_path.parts[0] in {"report", "paper", "papers", "outputs", "reports"}
         if not allowed or not relative or relative_path.is_absolute() or "\\" in relative or any(part in {"", ".", ".."} for part in relative_path.parts):
             raise RuntimeOperationError("invalid artifact path")
-        path = root / relative_path
-        resolved = path.resolve()
-        if root not in resolved.parents or path.is_symlink() or not path.is_file():
-            raise RuntimeOperationError("artifact not found")
-        if path.stat().st_size > max_bytes:
-            raise RuntimeOperationError("artifact too large")
-        return path.read_bytes(), "application/pdf" if path.suffix.lower() == ".pdf" else "text/plain; charset=utf-8" if path.suffix.lower() in {".md", ".txt", ".log"} else "text/latex; charset=utf-8" if path.suffix.lower() in {".tex", ".ltx"} else "application/octet-stream"
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        dir_fd = os.open(root, directory_flags)
+        opened_dirs = [dir_fd]
+        try:
+            for part in relative_path.parts[:-1]:
+                dir_fd = os.open(part, directory_flags, dir_fd=dir_fd)
+                opened_dirs.append(dir_fd)
+            file_fd = os.open(relative_path.name, file_flags, dir_fd=dir_fd)
+            try:
+                info = os.fstat(file_fd)
+                if not stat_module.S_ISREG(info.st_mode):
+                    raise RuntimeOperationError("artifact not found")
+                if info.st_size > max_bytes:
+                    raise RuntimeOperationError("artifact too large")
+                chunks = []
+                remaining = max_bytes + 1
+                while remaining > 0:
+                    chunk = os.read(file_fd, min(65536, remaining))
+                    if not chunk: break
+                    chunks.append(chunk); remaining -= len(chunk)
+                body = b"".join(chunks)
+                if len(body) > max_bytes: raise RuntimeOperationError("artifact too large")
+            finally:
+                os.close(file_fd)
+        except OSError as exc:
+            raise RuntimeOperationError("artifact not found") from exc
+        finally:
+            for opened in reversed(opened_dirs):
+                os.close(opened)
+        suffix = relative_path.suffix.lower()
+        return body, "application/pdf" if suffix == ".pdf" else "text/plain; charset=utf-8" if suffix in {".md", ".txt", ".log"} else "text/latex; charset=utf-8" if suffix in {".tex", ".ltx"} else "application/octet-stream"
 
     def reports_projection(self, runtime_name: str) -> dict[str, Any]:
         return {"files": self._safe_relative_files(runtime_name, "reports")}

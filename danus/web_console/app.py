@@ -473,7 +473,7 @@ def create_app(
         except Exception:
             return _error(400, "invalid lifecycle request")
         action = payload.get("action") if isinstance(payload, dict) else None
-        if action not in {"assign", "status", "start", "pause", "resume", "stop"}:
+        if action not in {"assign", "status", "start", "pause", "resume", "stop", "finalize-suggest", "finalize", "human-summary", "write-paper"}:
             return _error(400, "invalid lifecycle action")
         if payload.get("force") is True:
             return _error(403, "force stop is reserved for host safety controls")
@@ -485,6 +485,24 @@ def create_app(
                 return _error(400, "invalid worker")
             worker = str(worker)
 
+        if action in {"finalize", "human-summary", "write-paper"} and payload.get("operator_confirmed") is not True:
+            return _error(409, "explicit operator confirmation required")
+        if action == "finalize-suggest":
+            try: return runtime.finalize_suggestions(project["runtime_name"])
+            except RuntimeErrorBase as exc: return _error(409, str(exc)[:200])
+        if action == "finalize":
+            try: return runtime.finalize_target(project["runtime_name"], [str(fid) for fid in payload.get("fact_ids") or []], payload.get("paper_id"))
+            except RuntimeErrorBase as exc: return _error(409, str(exc)[:200])
+        if action == "human-summary":
+            try: return runtime.write_human_summary(project["runtime_name"], payload.get("language"))
+            except RuntimeErrorBase: return _error(502, "human summary failed")
+        if action == "write-paper":
+            try:
+                stop_workers = bool(payload.get("stop_workers"))
+                result = runtime.write_paper_artifact(project["runtime_name"], paper_id=payload.get("paper_id"), stop_workers=stop_workers, fact_ids=payload.get("fact_ids"), instructions=payload.get("instructions"))
+                if stop_workers and result.get("status") == "ok": result["graceful_stop"] = runtime.stop_project(project["runtime_name"])
+                return result
+            except RuntimeErrorBase: return _error(502, "paper generation failed")
         if action == "status":
             try:
                 return runtime.status_project(project["runtime_name"])
@@ -1346,13 +1364,14 @@ def create_app(
         payload = await request.json()
         if not isinstance(payload, dict) or payload.get("confirm") != project["name"]:
             return _error(409, "project-name confirmation required")
-        if not isinstance(payload.get("fact_ids"), list) or not payload["fact_ids"]:
-            return _error(400, "fact_ids are required")
+        fact_ids = payload.get("fact_ids")
+        if not isinstance(fact_ids, list) or not fact_ids or len(fact_ids) > 128 or any(not isinstance(fid, str) or len(fid) > 200 for fid in fact_ids):
+            return _error(400, "fact_ids must be a bounded list of strings")
         paper_id = payload.get("paper_id")
         if paper_id is not None and (not isinstance(paper_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", paper_id)):
             return _error(400, "invalid paper_id")
         try:
-            result = runtime.finalize_target(project["runtime_name"], [str(fid) for fid in payload["fact_ids"]], paper_id)
+            result = runtime.finalize_target(project["runtime_name"], fact_ids, paper_id)
             store.audit("finalize", "success", project_id, details=json.dumps(result))
             return result
         except (RuntimeErrorBase, OSError, ValueError) as exc:
