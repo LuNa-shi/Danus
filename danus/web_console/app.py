@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import sqlite3
 import secrets
 import threading
 import time
 import uuid
+from urllib.parse import quote, urlsplit
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -16,12 +18,19 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from danus import codex
+from danus.execution import layout as L
 
 from .config import ProviderModelCatalog, main_agent_metadata, strategy_metadata
 from .runtime import DanusRuntimeAdapter, RuntimeErrorBase, validate_runtime_name
 from .files import FileValidationError, file_type, material_root, metadata, normalize_filename, promote_pending, remove_blob, stream_to_pending, validate_bytes
 from .main_agent import MainAgentError, MainAgentAdapter
-from .security import digest_token, new_token, verify_password
+from .security import (
+    digest_token,
+    new_token,
+    project_lifecycle_capability,
+    verify_password,
+    verify_project_lifecycle_capability,
+)
 from .store import ConsoleStore
 
 
@@ -38,6 +47,8 @@ class AppSettings:
     max_parallel_workers_limit: int = 32
     model_catalog_ttl_seconds: float = 300.0
     model_catalog_timeout_seconds: float = 5.0
+    lifecycle_base_url: str = "http://127.0.0.1:8080"
+    lifecycle_hmac_secret: bytes | None = None
 
 
 def _error(status: int, detail: str) -> JSONResponse:
@@ -69,6 +80,18 @@ def _runtime_name(name: str) -> str:
     validate_runtime_name(name)
     return name
 
+
+def _loopback_host(host: str | None) -> bool:
+    if not host:
+        return False
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def create_app(
     *,
     settings: AppSettings,
@@ -86,6 +109,12 @@ def create_app(
         response.headers.setdefault("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'; base-uri 'none'")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
         return response
+
+    lifecycle_base = settings.lifecycle_base_url.rstrip("/")
+    parsed_lifecycle_base = urlsplit(lifecycle_base)
+    if parsed_lifecycle_base.scheme not in {"http", "https"} or not _loopback_host(parsed_lifecycle_base.hostname):
+        raise ValueError("lifecycle broker base URL must be loopback-only")
+    lifecycle_hmac_secret = settings.lifecycle_hmac_secret or secrets.token_bytes(32)
 
     store = ConsoleStore(settings.database_path)
     runtime = runtime or DanusRuntimeAdapter()
@@ -200,18 +229,41 @@ def create_app(
                 return entries[0] if entries else None
         return None
 
+    def expected_worker_roster(
+        project: dict[str, Any], projection: dict[str, Any],
+    ) -> list[str]:
+        configured = (projection.get("config") or {}).get("workers") or []
+        roster: list[str] = []
+        for worker in configured:
+            name = worker.get("worker") if isinstance(worker, dict) else worker
+            if isinstance(name, str) and name and name not in roster:
+                roster.append(name)
+        if roster:
+            return roster
+        try:
+            return [name for name, _role in L.parse_roles(project_config(project)["roles"])]
+        except (TypeError, ValueError):
+            return []
+
+    def roster_state(
+        project: dict[str, Any], projection: dict[str, Any],
+    ) -> tuple[list[str], list[str], list[str]]:
+        expected = expected_worker_roster(project, projection)
+        workers = {
+            str(worker.get("worker")): worker
+            for worker in projection.get("workers", [])
+            if worker.get("worker")
+        }
+        alive = [name for name in expected if workers.get(name, {}).get("alive") is True]
+        pending = [name for name in expected if name not in alive]
+        return expected, alive, pending
+
     def reconcile_run(project_id: str, project: dict[str, Any], projection: dict[str, Any]) -> dict[str, Any]:
         active = store.active_run(project_id)
         if active is not None:
             workers = projection.get("workers", [])
-            if active["status"] == "stopping" and not any(worker.get("alive") for worker in workers):
-                store.update_run(active["id"], status="stopped", stopped_at=time.time(), outcome="graceful_stop")
-            elif active["status"] == "starting" and any(worker.get("alive") for worker in workers):
-                store.update_run(active["id"], status="running")
-            elif active["status"] == "running" and workers and not any(worker.get("alive") for worker in workers):
-                outcome = "worker_error" if any(worker.get("state") == "error" for worker in workers) else "workers_exited"
-                store.update_run(active["id"], status="stopped", stopped_at=time.time(), outcome=outcome)
-            elif active["status"] in ("starting", "running") and time.time() >= active["deadline"]:
+            expected, _alive, pending = roster_state(project, projection)
+            if active["status"] in ("starting", "running") and time.time() >= active["deadline"]:
                 try:
                     runtime.stop_project(project["runtime_name"])
                 except RuntimeErrorBase as exc:
@@ -220,7 +272,112 @@ def create_app(
                     store.update_run(active["id"], status="stopping", outcome=f"deadline_stop_failed: {exc}"[:200])
                 else:
                     store.update_run(active["id"], status="stopping", outcome="deadline_stop_requested")
+            elif active["status"] == "stopping" and not any(worker.get("alive") for worker in workers):
+                store.update_run(active["id"], status="stopped", stopped_at=time.time(), outcome="graceful_stop")
+            elif active["status"] == "starting" and expected and not pending:
+                store.update_run(active["id"], status="running")
+            elif active["status"] == "running" and workers and not any(worker.get("alive") for worker in workers):
+                outcome = "worker_error" if any(worker.get("state") == "error" for worker in workers) else "workers_exited"
+                store.update_run(active["id"], status="stopped", stopped_at=time.time(), outcome=outcome)
         return projection
+
+    def lifecycle_url(project_id: str) -> str:
+        return f"{lifecycle_base}/internal/api/projects/{quote(project_id, safe='')}/lifecycle"
+
+    def lifecycle_token(project: dict[str, Any]) -> str:
+        return project_lifecycle_capability(
+            lifecycle_hmac_secret, project["id"], project["runtime_name"],
+        )
+
+    @app.post("/internal/api/projects/{project_id}/lifecycle")
+    async def internal_project_lifecycle(project_id: str, request: Request):
+        client_host = request.client.host if request.client is not None else None
+        if not _loopback_host(client_host):
+            return _error(403, "loopback access required")
+        project = store.project(project_id)
+        if project is None:
+            return _error(404, "project not found")
+        authorization = request.headers.get("authorization", "")
+        prefix = "Bearer "
+        supplied = authorization[len(prefix):] if authorization.startswith(prefix) else ""
+        if not verify_project_lifecycle_capability(
+            supplied, lifecycle_hmac_secret, project["id"], project["runtime_name"],
+        ):
+            return _error(403, "invalid lifecycle capability")
+        try:
+            payload = await request.json()
+        except Exception:
+            return _error(400, "invalid lifecycle request")
+        action = payload.get("action") if isinstance(payload, dict) else None
+        if action not in {"start", "stop"}:
+            return _error(400, "invalid lifecycle action")
+        if payload.get("force") is True:
+            return _error(403, "force stop is reserved for host safety controls")
+
+        active = store.active_run(project_id)
+        if active is None:
+            return _error(409, "project has no active run intent")
+        if action == "start":
+            if active["status"] != "starting":
+                if active["status"] == "running":
+                    projection = runtime.status_project(project["runtime_name"])
+                    expected, alive, pending = roster_state(project, projection)
+                    if expected and not pending:
+                        return {"status": "running", "run_id": active["id"], "workers": alive}
+                return _error(409, "project run is not awaiting start")
+            if time.time() >= active["deadline"]:
+                try:
+                    runtime.stop_project(project["runtime_name"])
+                except (RuntimeErrorBase, OSError) as exc:
+                    store.update_run(active["id"], status="stopping", outcome=f"deadline_stop_failed: {exc}"[:200])
+                else:
+                    store.update_run(active["id"], status="stopping", outcome="deadline_stop_requested")
+                return _error(409, "project run deadline reached")
+            try:
+                before = runtime.status_project(project["runtime_name"])
+                expected = expected_worker_roster(project, before)
+                runtime.start_project(project["runtime_name"])
+                projection = runtime.status_project(project["runtime_name"])
+            except (RuntimeErrorBase, OSError) as exc:
+                store.update_run(active["id"], status="starting", outcome=f"start_failed: {exc}"[:200])
+                store.audit("run_start", "failure", project_id)
+                return _error(502, "project workers could not be started")
+            _after_expected, alive, pending = roster_state(project, projection)
+            if expected:
+                workers = {
+                    str(worker.get("worker")): worker
+                    for worker in projection.get("workers", [])
+                    if worker.get("worker")
+                }
+                alive = [name for name in expected if workers.get(name, {}).get("alive") is True]
+                pending = [name for name in expected if name not in alive]
+            if not expected or pending:
+                outcome = "partial_start:" + ",".join(pending or ["unknown_roster"])
+                store.update_run(active["id"], status="starting", outcome=outcome[:200])
+                store.audit("run_start", "partial_failure", project_id)
+                return JSONResponse({
+                    "detail": "project workers only partially started",
+                    "status": "partial_start",
+                    "run_id": active["id"],
+                    "expected_workers": expected,
+                    "alive_workers": alive,
+                    "not_running_workers": pending,
+                }, status_code=502)
+            store.update_run(active["id"], status="running", outcome="main_agent_start")
+            store.audit("run_start", "success", project_id)
+            return {"status": "running", "run_id": active["id"], "workers": alive}
+
+        try:
+            runtime.stop_project(project["runtime_name"])
+        except (RuntimeErrorBase, OSError):
+            store.update_run(active["id"], status="stopping", outcome="main_agent_stop_failed")
+            store.audit("run_stop", "failure", project_id)
+            return _error(502, "project stop could not be completed")
+        store.update_run(active["id"], status="stopping", outcome="main_agent_stop_requested")
+        store.audit("run_stop", "success", project_id)
+        return JSONResponse({
+            "status": "stop_requested", "run_id": active["id"],
+        }, status_code=202)
 
     @app.post("/api/auth/login")
     async def login(request: Request):
@@ -424,7 +581,10 @@ def create_app(
         async with lock_for(project_id):
             try:
                 projection = runtime.status_project(project["runtime_name"])
-                if any(worker.get("alive") for worker in projection.get("workers", [])):
+                reconcile_run(project_id, project, projection)
+                if store.active_run(project_id) is not None or any(
+                    worker.get("alive") for worker in projection.get("workers", [])
+                ):
                     return _error(409, "project must be stopped before deletion")
                 result = runtime.delete_project(project["runtime_name"])
                 store.delete_project(project_id)
@@ -485,23 +645,21 @@ def create_app(
                 )
             started, deadline = time.time(), time.time() + duration
             run = {"id": uuid.uuid4().hex, "project_id": project_id, "duration_seconds": duration, "started_at": started, "deadline": deadline, "status": "starting"}
-            # Record the control-plane run before spawning workers so a process
-            # crash cannot leave an untracked deadline/process pair.
+            # Persist the bounded operator intent before exposing it to the
+            # Main Agent. Normal Worker spawning is brokered only when that
+            # project-scoped Main Agent explicitly requests it.
             store.add_run(run)
             try:
                 runtime.write_deadline(project["runtime_name"], deadline)
-                runtime.start_project(project["runtime_name"])
-                store.audit("run_start", "success", project_id)
+                store.audit("run_start", "intent_recorded", project_id)
                 return JSONResponse({"run_id": run["id"], "status": "start_requested", "deadline": deadline}, status_code=202)
             except (RuntimeErrorBase, OSError) as exc:
-                # A failed launch must not leave a deadline that can constrain
-                # a later independent restart.
+                # A failed deadline write must not leave an active intent that
+                # appears safe to start later.
                 try:
                     runtime.clear_deadline(project["runtime_name"])
                 except (AttributeError, RuntimeErrorBase):
                     pass
-                # Persist a failed control-plane outcome rather than claiming
-                # that a deadline write/start request created a live run.
                 store.update_run(run["id"], status="failed", stopped_at=time.time(), outcome=str(exc)[:200])
                 store.audit("run_start", "failure", project_id)
                 return _error(502, "project run could not be started")
@@ -957,6 +1115,8 @@ def create_app(
                     project_state={"project_id": project_id, "name": project["name"], "problem": project["problem"]},
                     attachments=attachments,
                     on_progress=record_main_agent_progress,
+                    lifecycle_url=lifecycle_url(project_id),
+                    lifecycle_token=lifecycle_token(project),
                 )
 
             try:

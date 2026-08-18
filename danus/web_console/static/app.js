@@ -1626,7 +1626,7 @@ async function startRun() {
   if (!state.current) return;
   try {
     await api(`/api/projects/${state.current}/runs`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ duration_seconds: 3600 }) });
-    notify("Worker fleet 已启动", "success");
+    notify("Run intent 已记录；请由 Main Agent 启动 Worker fleet", "success");
     await refreshProject();
     await refreshProjects();
   } catch (error) {

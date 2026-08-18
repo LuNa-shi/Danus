@@ -5,8 +5,9 @@ import argparse
 import json
 import os
 from pathlib import Path
+import urllib.error
+import urllib.request
 
-from danus.execution import layout as L
 from danus.orchestration import cli
 
 
@@ -17,6 +18,41 @@ def _project() -> tuple[str, Path]:
     if not name or not root.is_dir() or pinned != root / name or not pinned.is_dir():
         raise SystemExit("Main Agent project scope is not configured")
     return name, root
+
+
+def _broker_post(action: str, *, force: bool = False) -> dict:
+    url = os.environ.get("DANUS_WEB_LIFECYCLE_URL", "")
+    token = os.environ.get("DANUS_WEB_LIFECYCLE_TOKEN", "")
+    if not url or not token:
+        raise SystemExit("Main Agent lifecycle broker is not configured")
+    payload = {"action": action}
+    if force:
+        payload["force"] = True
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            body = json.loads(exc.read().decode("utf-8"))
+            detail = str(body.get("detail") or "request rejected")
+        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            detail = "request rejected"
+        raise SystemExit(f"lifecycle broker rejected {action}: {detail}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise SystemExit(f"lifecycle broker unavailable for {action}") from exc
+    if not isinstance(result, dict):
+        raise SystemExit("lifecycle broker returned an invalid response")
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -37,9 +73,9 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "assign":
         result = cli.do_assign(f"{name}/{args.worker}", args.task, root=root)
     elif args.command == "start":
-        result = cli.do_start(target, root=root)
+        result = _broker_post("start")
     else:
-        result = cli.do_stop(target, force=args.force, root=root)
+        result = _broker_post("stop", force=args.force)
     print(json.dumps(result, ensure_ascii=False))
     return 0
 

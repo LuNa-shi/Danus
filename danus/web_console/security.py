@@ -51,3 +51,25 @@ def digest_token(token: str) -> str:
 
 def new_token() -> str:
     return secrets.token_urlsafe(32)
+
+
+def project_lifecycle_capability(
+    secret: bytes, project_id: str, runtime_name: str,
+) -> str:
+    """Mint one opaque lifecycle capability bound to exactly one Project."""
+    if not isinstance(secret, bytes) or len(secret) < 16:
+        raise ValueError("lifecycle capability secret must be at least 16 bytes")
+    if not isinstance(project_id, str) or not isinstance(runtime_name, str):
+        raise ValueError("project capability scope must be text")
+    message = b"danus-web-lifecycle-v1\0" + project_id.encode("utf-8") + b"\0" + runtime_name.encode("utf-8")
+    return _b64(hmac.digest(secret, message, "sha256"))
+
+
+def verify_project_lifecycle_capability(
+    token: str, secret: bytes, project_id: str, runtime_name: str,
+) -> bool:
+    try:
+        expected = project_lifecycle_capability(secret, project_id, runtime_name)
+        return hmac.compare_digest(token, expected)
+    except (TypeError, ValueError, UnicodeError):
+        return False

@@ -227,7 +227,13 @@ class MainAgentAdapter:
             "Operator message:", message,
         ])
 
-    def _env(self, root: Path) -> dict[str, str]:
+    def _env(
+        self,
+        root: Path,
+        *,
+        lifecycle_url: str | None = None,
+        lifecycle_token: str | None = None,
+    ) -> dict[str, str]:
         """Build a minimal server-side environment for the Main Agent.
 
         Codex needs its authentication/config homes and the Danus runtime wiring,
@@ -283,6 +289,11 @@ class MainAgentAdapter:
             # Do not inherit an arbitrary host PYTHONPATH; expose only Danus.
             "PYTHONPATH": str(repo),
         })
+        if (lifecycle_url is None) != (lifecycle_token is None):
+            raise MainAgentError("incomplete lifecycle broker capability")
+        if lifecycle_url is not None and lifecycle_token is not None:
+            env["DANUS_WEB_LIFECYCLE_URL"] = lifecycle_url
+            env["DANUS_WEB_LIFECYCLE_TOKEN"] = lifecycle_token
         # A project-scoped main session must be able to invoke the repository's
         # lifecycle CLI, whose wrapper sources scripts/env.sh. Keep the repo bin
         # directory ahead of the inherited PATH without exposing arbitrary cwd.
@@ -923,7 +934,9 @@ class MainAgentAdapter:
     def send(self, *, context_dir: Path, session_id: str | None, message: str,
              manifest: list[dict[str, Any]], project_state: dict[str, Any],
              attachments: list[dict[str, Any]],
-             on_progress: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
+             on_progress: Callable[[dict[str, Any]], None] | None = None,
+             lifecycle_url: str | None = None,
+             lifecycle_token: str | None = None) -> dict[str, Any]:
         raw_root = Path(context_dir)
         if raw_root.is_symlink():
             raise MainAgentError("project context directory must not be a symlink")
@@ -933,7 +946,11 @@ class MainAgentAdapter:
         if not isinstance(message, str) or not message.strip():
             raise MainAgentError("message must be non-empty")
         prompt = self._prompt(message=message, manifest=manifest, project_state=project_state, attachments=attachments)
-        env = self._env(root)
+        env = self._env(
+            root,
+            lifecycle_url=lifecycle_url,
+            lifecycle_token=lifecycle_token,
+        )
         result = self._send_codex(
             root=root, session_id=session_id, prompt=prompt, env=env,
             on_progress=on_progress,

@@ -12,7 +12,7 @@ from danus.execution import layout as L
 from danus.web_console.config import ProviderModelCatalog
 from danus.web_console.app import AppSettings, _public_main_agent_error, create_app
 from danus.web_console.main_agent import MainAgentError
-from danus.web_console.security import hash_password
+from danus.web_console.security import hash_password, project_lifecycle_capability
 from danus.web_console.store import ConsoleStore
 
 
@@ -118,6 +118,9 @@ class FakeMemoryRuntime(FakeRuntime):
         return self.memory_entries.get(runtime_name, {"total": 0, "channels": []})
 
 
+_LIFECYCLE_SECRET = b"test-lifecycle-hmac-secret"
+
+
 def _app(tmp_path: Path):
     runtime = FakeRuntime(tmp_path / "projects")
     settings = AppSettings(
@@ -125,6 +128,7 @@ def _app(tmp_path: Path):
         password_hash=hash_password("correct horse battery staple"),
         cookie_secure=True,
         allowed_origins={"https://testserver"},
+        lifecycle_hmac_secret=_LIFECYCLE_SECRET,
     )
     return create_app(settings=settings, runtime=runtime), runtime
 
@@ -140,6 +144,17 @@ def _login(client: TestClient):
     assert "httponly" in response.headers["set-cookie"].lower()
     assert "samesite=strict" in response.headers["set-cookie"].lower()
     return response.json()["csrf_token"]
+
+
+def _broker_start(client: TestClient, project: dict, *, secret: bytes = _LIFECYCLE_SECRET):
+    token = project_lifecycle_capability(secret, project["id"], project["runtime_name"])
+    with TestClient(
+        client.app, base_url="http://127.0.0.1:8080", client=("127.0.0.1", 50123),
+    ) as internal:
+        return internal.post(
+            f"/internal/api/projects/{project['id']}/lifecycle",
+            json={"action": "start"}, headers={"Authorization": f"Bearer {token}"},
+        )
 
 
 def test_authentication_cookie_csrf_and_project_boundary(tmp_path: Path):
@@ -206,8 +221,10 @@ def test_project_run_deadline_and_graceful_stop_are_scoped(tmp_path: Path):
         run = start.json()
         assert run["status"] == "start_requested"
         assert 43190 <= run["deadline"] - time.time() <= 43210
-        assert runtime.started == [a["runtime_name"]]
-        assert runtime.started != [b["runtime_name"]]
+        # The browser records the bounded run intent; only the project Main
+        # Agent may request the normal Worker start through the host broker.
+        assert runtime.started == []
+        assert runtime.deadlines[a["runtime_name"]] == run["deadline"]
 
         stopped = client.post(
             f"/api/projects/{a['id']}/stop", json={},
@@ -223,6 +240,143 @@ def test_project_run_deadline_and_graceful_stop_are_scoped(tmp_path: Path):
         assert b_workers[0]["alive"] is False
 
 
+def test_internal_lifecycle_broker_is_loopback_only_and_project_capability_scoped(
+    tmp_path: Path,
+):
+    secret = b"test-lifecycle-hmac-secret"
+    runtime = FakeRuntime(tmp_path / "projects")
+    settings = AppSettings(
+        database_path=tmp_path / "console.sqlite3",
+        password_hash=hash_password("correct horse battery staple"),
+        cookie_secure=True,
+        allowed_origins={"https://testserver"},
+        lifecycle_base_url="http://127.0.0.1:8080",
+        lifecycle_hmac_secret=secret,
+    )
+    app = create_app(settings=settings, runtime=runtime)
+    with TestClient(
+        app, base_url="https://testserver", client=("127.0.0.1", 50123),
+    ) as client:
+        csrf = _login(client)
+        headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        a = client.post(
+            "/api/projects",
+            json={"name": "A", "problem": "alpha", "roles": "high:1"},
+            headers=headers,
+        ).json()
+        b = client.post(
+            "/api/projects",
+            json={"name": "B", "problem": "beta", "roles": "high:1"},
+            headers=headers,
+        ).json()
+        runtime.assign_all(a["runtime_name"])
+        intent = client.post(
+            f"/api/projects/{a['id']}/runs",
+            json={"duration_seconds": 60},
+            headers=headers,
+        ).json()
+        url = f"/internal/api/projects/{a['id']}/lifecycle"
+        wrong = project_lifecycle_capability(secret, b["id"], b["runtime_name"])
+        assert client.post(
+            url, json={"action": "start"},
+            headers={"Authorization": f"Bearer {wrong}"},
+        ).status_code == 403
+        token = project_lifecycle_capability(secret, a["id"], a["runtime_name"])
+        started = client.post(
+            url, json={"action": "start"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert started.status_code == 200
+        assert started.json() == {
+            "status": "running", "run_id": intent["run_id"],
+            "workers": ["high"],
+        }
+        assert runtime.started == [a["runtime_name"]]
+        stopped = client.post(
+            url, json={"action": "stop"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert stopped.status_code == 202
+        assert stopped.json() == {
+            "status": "stop_requested", "run_id": intent["run_id"],
+        }
+        assert runtime.stopped == [a["runtime_name"]]
+
+    with TestClient(
+        app, base_url="http://127.0.0.1:8080", client=("203.0.113.9", 50124),
+    ) as remote:
+        denied = remote.post(
+            f"/internal/api/projects/{a['id']}/lifecycle",
+            json={"action": "stop"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert denied.status_code == 403
+        assert runtime.stopped == [a["runtime_name"]]
+
+
+def test_internal_lifecycle_broker_reports_partial_start_for_incomplete_roster(
+    tmp_path: Path,
+):
+    class PartialRuntime(FakeRuntime):
+        def start_project(self, runtime_name):
+            self.started.append(runtime_name)
+            workers = self.statuses[runtime_name]
+            self.statuses[runtime_name] = [
+                {**worker, "alive": index == 0, "state": "running" if index == 0 else "created"}
+                for index, worker in enumerate(workers)
+            ]
+            return {"workers": self.statuses[runtime_name]}
+
+    secret = b"test-lifecycle-hmac-secret"
+    runtime = PartialRuntime(tmp_path / "projects")
+    settings = AppSettings(
+        database_path=tmp_path / "console.sqlite3",
+        password_hash=hash_password("correct horse battery staple"),
+        cookie_secure=True,
+        allowed_origins={"https://testserver"},
+        lifecycle_hmac_secret=secret,
+    )
+    app = create_app(settings=settings, runtime=runtime)
+    with TestClient(
+        app, base_url="https://testserver", client=("127.0.0.1", 50123),
+    ) as client:
+        csrf = _login(client)
+        headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post(
+            "/api/projects",
+            json={"name": "A", "problem": "alpha", "roles": "high:1,xhigh:1"},
+            headers=headers,
+        ).json()
+        runtime.assign_all(project["runtime_name"])
+        intent = client.post(
+            f"/api/projects/{project['id']}/runs",
+            json={"duration_seconds": 60}, headers=headers,
+        ).json()
+        token = project_lifecycle_capability(
+            secret, project["id"], project["runtime_name"],
+        )
+        response = client.post(
+            f"/internal/api/projects/{project['id']}/lifecycle",
+            json={"action": "start"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 502
+        assert response.json() == {
+            "detail": "project workers only partially started",
+            "status": "partial_start",
+            "run_id": intent["run_id"],
+            "expected_workers": ["high", "xhigh"],
+            "alive_workers": ["high"],
+            "not_running_workers": ["xhigh"],
+        }
+        run = client.get(
+            f"/api/projects/{project['id']}/runs/{intent['run_id']}"
+        ).json()
+        assert run["status"] == "starting"
+        assert run["outcome"] == "partial_start:xhigh"
+
+
 def test_runtime_poll_reconciles_graceful_stop_to_terminal_run(tmp_path: Path):
     app, runtime = _app(tmp_path)
     with TestClient(app, base_url="https://testserver") as client:
@@ -231,6 +385,7 @@ def test_runtime_poll_reconciles_graceful_stop_to_terminal_run(tmp_path: Path):
         project = client.post("/api/projects", json={"name": "A", "problem": "alpha", "roles": "high:1"}, headers=headers).json()
         runtime.assign_all(project["runtime_name"])
         started = client.post(f"/api/projects/{project['id']}/runs", json={"duration_seconds": 3600}, headers=headers).json()
+        assert _broker_start(client, project).status_code == 200
         assert client.get(f"/api/projects/{project['id']}/runs/{started['run_id']}").json()["status"] == "running"
         assert client.post(f"/api/projects/{project['id']}/runs/{started['run_id']}/stop", json={}, headers=headers).status_code == 202
         terminal = client.get(f"/api/projects/{project['id']}/runs/{started['run_id']}").json()
@@ -246,6 +401,7 @@ def test_runtime_poll_reconciles_unexpected_worker_exit(tmp_path: Path):
         project = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
         runtime.assign_all(project["runtime_name"])
         started = client.post(f"/api/projects/{project['id']}/runs", json={"duration_seconds": 3600}, headers=headers).json()
+        assert _broker_start(client, project).status_code == 200
         client.get(f"/api/projects/{project['id']}/workers")
         runtime.statuses[project["runtime_name"]] = [{"worker": "high", "alive": False, "state": "error", "round": 2, "assigned": True, "task": "do the assigned work"}]
         client.get(f"/api/projects/{project['id']}/workers")
@@ -287,21 +443,48 @@ def test_runtime_start_failure_is_persisted_without_success_claim(tmp_path: Path
             from danus.web_console.runtime import RuntimeOperationError
             raise RuntimeOperationError("worker launch failed")
 
+    secret = b"failing-runtime-lifecycle-secret"
     runtime = FailingRuntime(tmp_path / "projects")
-    settings = AppSettings(database_path=tmp_path / "console.sqlite3", password_hash=hash_password("correct horse battery staple"), cookie_secure=True, allowed_origins={"https://testserver"})
+    settings = AppSettings(
+        database_path=tmp_path / "console.sqlite3",
+        password_hash=hash_password("correct horse battery staple"),
+        cookie_secure=True,
+        allowed_origins={"https://testserver"},
+        lifecycle_hmac_secret=secret,
+    )
     app = create_app(settings=settings, runtime=runtime)
-    with TestClient(app, base_url="https://testserver") as client:
+    with TestClient(
+        app, base_url="https://testserver", client=("127.0.0.1", 50123),
+    ) as client:
         csrf = _login(client)
         headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
-        project = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
+        project = client.post(
+            "/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers,
+        ).json()
         runtime.assign_all(project["runtime_name"])
-        response = client.post(f"/api/projects/{project['id']}/runs", json={"duration_seconds": 60}, headers=headers)
+        intent = client.post(
+            f"/api/projects/{project['id']}/runs",
+            json={"duration_seconds": 60}, headers=headers,
+        )
+        assert intent.status_code == 202
+        token = project_lifecycle_capability(
+            secret, project["id"], project["runtime_name"],
+        )
+        response = client.post(
+            f"/internal/api/projects/{project['id']}/lifecycle",
+            json={"action": "start"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
         assert response.status_code == 502
-        assert response.json() == {"detail": "project run could not be started"}
+        assert response.json() == {"detail": "project workers could not be started"}
         import sqlite3
         with sqlite3.connect(tmp_path / "console.sqlite3") as db:
-            assert db.execute("SELECT status FROM runs").fetchone()[0] == "failed"
-        assert runtime.cleared_deadlines == ["A"]
+            status, outcome = db.execute(
+                "SELECT status,outcome FROM runs"
+            ).fetchone()
+        assert status == "starting"
+        assert outcome == "start_failed: worker launch failed"
+        assert runtime.cleared_deadlines == []
 
 
 def test_real_runtime_adapter_keeps_two_project_contexts_isolated(tmp_path: Path):
@@ -429,7 +612,15 @@ def test_main_agent_session_resume_attachment_and_project_isolation(tmp_path: Pa
             return {"session_id": sid, "reply": "reply:" + kwargs["message"], "status": "completed", "seconds": 0.1, "read_status": "not_read"}
     main = FakeMainAgent()
     runtime = FakeRuntime(tmp_path / "projects")
-    settings = AppSettings(database_path=tmp_path / "console.sqlite3", password_hash=hash_password("correct horse battery staple"), cookie_secure=True, allowed_origins={"https://testserver"})
+    lifecycle_secret = b"main-agent-lifecycle-secret"
+    settings = AppSettings(
+        database_path=tmp_path / "console.sqlite3",
+        password_hash=hash_password("correct horse battery staple"),
+        cookie_secure=True,
+        allowed_origins={"https://testserver"},
+        lifecycle_base_url="http://127.0.0.1:8080",
+        lifecycle_hmac_secret=lifecycle_secret,
+    )
     app = create_app(settings=settings, runtime=runtime, main_agent=main)
     with TestClient(app, base_url="https://testserver") as client:
         csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
@@ -442,6 +633,12 @@ def test_main_agent_session_resume_attachment_and_project_isolation(tmp_path: Pa
         assert second.status_code == 201 and second.json()["session_id"] == "session-A"
         assert main.calls[0]["context_dir"] == tmp_path / "projects" / "A"
         assert main.calls[0]["attachments"][0]["path"].startswith(str(tmp_path / "projects" / "A"))
+        assert main.calls[0]["lifecycle_url"] == (
+            f"http://127.0.0.1:8080/internal/api/projects/{a['id']}/lifecycle"
+        )
+        assert main.calls[0]["lifecycle_token"] == project_lifecycle_capability(
+            lifecycle_secret, a["id"], a["runtime_name"],
+        )
         listed_messages = client.get(f"/api/projects/{a['id']}/messages").json()
         assert listed_messages[0]["attachment_ids"] == [uploaded["id"]]
         assert client.get(f"/api/projects/{a['id']}/files").json()[0]["read_status"] == "not_read"
@@ -879,7 +1076,7 @@ def test_config_project_capacity_and_assignment_gate_are_server_enforced(tmp_pat
             json={"duration_seconds": 60}, headers=headers,
         )
         assert accepted.status_code == 202
-        assert runtime.started == [project["runtime_name"]]
+        assert runtime.started == []
 
 
 def test_orchestration_projection_reads_real_session_guidance_and_tasks(tmp_path: Path):

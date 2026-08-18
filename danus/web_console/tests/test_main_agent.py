@@ -186,6 +186,35 @@ def test_codex_environment_passes_server_side_provider_credentials(tmp_path: Pat
     assert env["OPENAI_BASE_URL"] == "https://example.invalid/v1"
 
 
+def test_main_agent_environment_receives_only_project_scoped_lifecycle_capability(
+    tmp_path: Path, monkeypatch,
+):
+    captured = {}
+    monkeypatch.setenv("DANUS_WEB_LIFECYCLE_HMAC_SECRET", "must-not-leak")
+    monkeypatch.setenv("DANUS_WEB_LIFECYCLE_URL", "http://127.0.0.1/other-project")
+    monkeypatch.setenv("DANUS_WEB_LIFECYCLE_TOKEN", "other-project-token")
+
+    def runner(_cmd, **kwargs):
+        captured.update(kwargs["env"])
+        return SimpleNamespace(returncode=0, stdout=_codex_success(), stderr="")
+
+    adapter = MainAgentAdapter(backend="codex", runner=runner, codex_bin="codex")
+    adapter.send(
+        **_args(tmp_path),
+        lifecycle_url=(
+            "http://127.0.0.1:8080/internal/api/projects/project-a/lifecycle"
+        ),
+        lifecycle_token="project-a-capability",
+    )
+
+    assert captured["DANUS_WEB_LIFECYCLE_URL"].endswith(
+        "/internal/api/projects/project-a/lifecycle"
+    )
+    assert captured["DANUS_WEB_LIFECYCLE_TOKEN"] == "project-a-capability"
+    assert "other-project" not in json.dumps(captured)
+    assert "DANUS_WEB_LIFECYCLE_HMAC_SECRET" not in captured
+
+
 def test_codex_environment_passes_only_explicit_danus_strategy_configuration(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("DANUS_CONSULT_TRANSPORT", "gpt_pro")
     monkeypatch.setenv("DANUS_CONSULT_API_KEY", "strategy-key")

@@ -596,6 +596,13 @@ def test_main_force_stop_refuses_live_unrelated_pid_without_signal(tmp: Path):
             "start_time": "stale-start",
             "cmdline": cli._expected_worker_cmdline(wl),
         }), encoding="utf-8")
+        wl.status.write_text(json.dumps({"state": "retrying", "round": 3}), encoding="utf-8")
+
+        status = cli.do_status("P/high")[0]
+        assert status["alive"] is False
+        assert status["identity_verified"] is False
+        assert status["persisted_state"] == "retrying"
+        assert status["state"] == "stale" and status["label"] == "dead"
 
         original_killpg = cli.os.killpg
         signals = []
