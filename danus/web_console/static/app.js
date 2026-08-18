@@ -1,5 +1,12 @@
 const $ = (id) => document.getElementById(id);
 
+function replaceMarkupIfChanged(element, markup) {
+  if (element.__danusMarkup === markup) return false;
+  element.innerHTML = markup;
+  element.__danusMarkup = markup;
+  return true;
+}
+
 const state = {
   csrf: null,
   current: null,
@@ -685,12 +692,16 @@ function renderMarkdown(value) {
   let html = "";
   let code = false;
   let codeLines = [];
-  let listType = null;
+  const listStack = [];
 
-  const closeList = () => {
-    if (!listType) return;
-    html += `</${listType}>`;
-    listType = null;
+  const closeTopList = () => {
+    const list = listStack.pop();
+    if (!list) return;
+    if (list.itemOpen) html += "</li>";
+    html += `</${list.type}>`;
+  };
+  const closeLists = () => {
+    while (listStack.length) closeTopList();
   };
 
   for (let index = 0; index < lines.length; index += 1) {
@@ -701,7 +712,7 @@ function renderMarkdown(value) {
         codeLines = [];
         code = false;
       } else {
-        closeList();
+        closeLists();
         code = true;
       }
       continue;
@@ -711,12 +722,12 @@ function renderMarkdown(value) {
       continue;
     }
     if (!line.trim()) {
-      closeList();
+      closeLists();
       continue;
     }
     const tableHead = markdownTableCells(line);
     if (tableHead.length > 1 && isMarkdownTableDivider(lines[index + 1])) {
-      closeList();
+      closeLists();
       const rows = [];
       index += 2;
       while (index < lines.length && lines[index].trim()) {
@@ -735,41 +746,41 @@ function renderMarkdown(value) {
     }
     const heading = line.match(/^(#{1,3})\s+(.+)$/);
     if (heading) {
-      closeList();
+      closeLists();
       const level = heading[1].length;
       html += `<h${level}>${inlineMarkdown(heading[2])}</h${level}>`;
       continue;
     }
-    const unordered = line.match(/^\s*[-*]\s+(.+)$/);
-    if (unordered) {
-      if (listType !== "ul") {
-        closeList();
-        html += "<ul>";
-        listType = "ul";
+    const listItem = line.match(/^([ \t]*)([-*+•]|\d+[.)、])\s+(.+)$/);
+    if (listItem) {
+      const indent = listItem[1].replace(/\t/g, "  ").length;
+      const type = /^\d/.test(listItem[2]) ? "ol" : "ul";
+      while (listStack.length && indent < listStack[listStack.length - 1].indent) closeTopList();
+      if (listStack.length && indent === listStack[listStack.length - 1].indent && type !== listStack[listStack.length - 1].type) closeTopList();
+      if (!listStack.length || indent > listStack[listStack.length - 1].indent) {
+        html += `<${type}>`;
+        listStack.push({ type, indent, itemOpen: false });
       }
-      html += `<li>${inlineMarkdown(unordered[1])}</li>`;
+      const current = listStack[listStack.length - 1];
+      if (current.itemOpen) html += "</li>";
+      html += `<li>${inlineMarkdown(listItem[3])}`;
+      current.itemOpen = true;
       continue;
     }
-    const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
-    if (ordered) {
-      if (listType !== "ol") {
-        closeList();
-        html += "<ol>";
-        listType = "ol";
-      }
-      html += `<li>${inlineMarkdown(ordered[1])}</li>`;
+    if (listStack.length && /^\s+/.test(line)) {
+      html += `<br>${inlineMarkdown(line.trim())}`;
       continue;
     }
     if (/^\s*>\s?/.test(line)) {
-      closeList();
+      closeLists();
       html += `<blockquote>${inlineMarkdown(line.replace(/^\s*>\s?/, ""))}</blockquote>`;
       continue;
     }
-    closeList();
+    closeLists();
     html += `<p>${inlineMarkdown(line)}</p>`;
   }
   if (code) html += `<pre><code>${esc(codeLines.join("\n"))}</code></pre>`;
-  closeList();
+  closeLists();
   return html || '<p class="muted">暂无内容</p>';
 }
 
@@ -887,9 +898,9 @@ function renderProjectShell(project) {
         <div class="project-header-copy"><p class="eyebrow">PROJECT / ${esc(project.name)}</p><div class="project-title-row"><h1>${esc(project.name)}</h1><span id="main-status" class="status-pill idle"><i></i>Main Agent 待命</span></div><p class="project-problem">${esc(project.problem || "还没有描述问题")}</p><div class="project-config-chips"><span>Worker · ${esc(model)}</span><span>并发 · ${esc(capacity)}</span></div></div>
         <div class="project-header-actions"><button id="workers-logs-open" class="secondary-button workers-logs-button" type="button" aria-expanded="false" aria-controls="worker-rail"><span aria-hidden="true">☷</span>Workers / Logs</button><button id="run-start" class="secondary-button"><span class="button-dot"></span>启动 workers</button><button id="delete-project" class="quiet-button danger-text">删除</button></div>
       </header>
-      <section class="lifecycle-controls" aria-label="Worker lifecycle and recovery controls">
-        <div class="lifecycle-target"><label for="lifecycle-worker-target">Operational target</label><select id="lifecycle-worker-target"><option value="">All Workers</option></select><small>这些是 host safety / desired-state controls；不会分配任务或修改研究策略。</small></div>
-        <div class="lifecycle-actions"><button id="run-pause" class="control-button" type="button">Pause after round</button><button id="run-resume" class="control-button" type="button">Resume</button><button id="run-stop" class="control-button" type="button">Graceful stop</button><button id="run-force-stop" class="control-button danger" type="button">Force stop now</button><button id="run-reclaim" class="control-button warning" type="button">Reclaim dry-run</button></div>
+      <section class="lifecycle-controls" aria-label="Worker controls">
+        <div class="lifecycle-copy"><strong>Worker controls</strong><small>当前项目的全部 Workers</small></div>
+        <div class="lifecycle-actions"><button id="run-pause" class="control-button" type="button">本轮后暂停</button><button id="run-resume" class="control-button" type="button">继续运行</button><button id="run-force-stop" class="control-button danger" type="button">立即强制停止</button></div>
         <div id="lifecycle-safety" class="lifecycle-safety" role="status"></div>
       </section>
       <div id="conversation-scroll" class="conversation-scroll">
@@ -903,7 +914,6 @@ function renderProjectShell(project) {
     <div id="worker-rail-resizer" class="rail-resizer rail-resizer-right" role="separator" aria-label="调整 Worker 侧栏宽度" aria-orientation="vertical" tabindex="0"></div>
     <aside id="worker-rail" class="worker-rail" aria-label="Worker fleet"><div class="rail-header"><div><p class="eyebrow">OBSERVABILITY</p><h2>Workers / Logs</h2></div><div class="rail-header-actions"><span id="worker-count" class="count-badge">0</span><button id="worker-rail-close" class="close-button worker-rail-close" type="button" aria-label="关闭 Workers / Logs">×</button></div></div><p class="rail-intro">点选一个 Worker，查看结构化 round transcript、loop.log 与 raw bounded tails。</p><div id="workers" class="worker-list"></div><div class="rail-runtime"><div class="rail-runtime-top"><span class="status-dot online"></span><span id="run-state">Run 尚未启动</span></div><div class="rail-runtime-bar"><span id="run-progress-bar"></span></div><p id="run-progress-detail">主 agent 负责方向，workers 并行推进证明。</p></div></aside>
     <aside id="worker-drawer" class="worker-drawer" hidden aria-label="Worker details"></aside>
-    <div id="reclaim-modal" class="reclaim-backdrop" hidden><section class="reclaim-plan" role="dialog" aria-modal="true" aria-labelledby="reclaim-plan-title"><div class="drawer-header"><div><p class="eyebrow">IDENTITY-VERIFIED RECOVERY</p><h2 id="reclaim-plan-title">Reclaim dry-run</h2></div><button id="reclaim-close" class="close-button" type="button" aria-label="关闭 reclaim dry-run">×</button></div><div id="reclaim-plan-body"></div><div class="reclaim-actions"><button id="reclaim-cancel" class="secondary-button" type="button">Cancel</button><button id="reclaim-confirm" class="primary-button" type="button">Confirm reclaim</button></div></section></div>
   </div>`;
   bindProjectControls();
   bindRailResizer("worker-rail-resizer", "worker");
@@ -938,17 +948,7 @@ function bindProjectControls() {
   $("run-start").addEventListener("click", startRun);
   $("run-pause").addEventListener("click", pauseRun);
   $("run-resume").addEventListener("click", resumeRun);
-  $("run-stop").addEventListener("click", stopRun);
   $("run-force-stop").addEventListener("click", forceStopRun);
-  $("run-reclaim").addEventListener("click", reclaimDryRun);
-  $("lifecycle-worker-target").addEventListener("change", () => {
-    state.reclaimPlan = null;
-    renderLifecycleControls();
-  });
-  $("reclaim-close").addEventListener("click", closeReclaimPlan);
-  $("reclaim-cancel").addEventListener("click", closeReclaimPlan);
-  $("reclaim-confirm").addEventListener("click", confirmReclaim);
-  $("reclaim-modal").addEventListener("click", (event) => { if (event.target === $("reclaim-modal")) closeReclaimPlan(); });
   $("delete-project").addEventListener("click", deleteProject);
   $("upload-form").addEventListener("submit", handleUpload);
   $("upload").addEventListener("change", () => {
@@ -1061,14 +1061,15 @@ function renderMessages() {
   ));
   if (pendingMessage && !persistedPending && !messages.some((message) => message.id === pendingMessage.id)) messages.push(pendingMessage);
   if (!messages.length) {
-    chat.innerHTML = '<div class="chat-empty"><div class="main-agent-avatar large">M</div><p class="eyebrow">MAIN AGENT</p><h2>项目已经准备好了。</h2><p>问一个问题、上传一份材料，或者让 Main Agent 先给出拆解方向。</p><div class="suggestion-row"><button data-suggestion="先分析问题，给出三个互相独立的解决方向。">先拆解问题</button><button data-suggestion="先检查现有材料中最关键的假设。">检查关键假设</button></div></div>';
+    const markup = '<div class="chat-empty"><div class="main-agent-avatar large">M</div><p class="eyebrow">MAIN AGENT</p><h2>项目已经准备好了。</h2><p>问一个问题、上传一份材料，或者让 Main Agent 先给出拆解方向。</p><div class="suggestion-row"><button data-suggestion="先分析问题，给出三个互相独立的解决方向。">先拆解问题</button><button data-suggestion="先检查现有材料中最关键的假设。">检查关键假设</button></div></div>';
+    if (!replaceMarkupIfChanged(chat, markup)) return;
     chat.querySelectorAll("[data-suggestion]").forEach((button) => button.addEventListener("click", () => {
       $("message").value = button.dataset.suggestion;
       $("message").focus();
     }));
     return;
   }
-  chat.innerHTML = messages.map((message) => {
+  const markup = messages.map((message) => {
     const user = message.role === "user";
     const isFailed = message.status === "failed";
     const pending = message.status === "submitted" || message.status === "pending" || message.status === "retrying";
@@ -1077,6 +1078,7 @@ function renderMessages() {
     const execution = user ? renderMainAgentEvents(message.id) : "";
     return `<article class="message-row ${user ? "user" : "assistant"} ${pending ? "is-pending" : ""} ${isFailed ? "is-failed" : ""}"><div class="message-avatar ${user ? "user-avatar" : "main-agent-avatar"}">${user ? "L" : "M"}</div><div class="message-content"><div class="message-meta"><strong>${user ? "你" : "Main Agent"}</strong><span>${formatTime(message.created_at)}</span>${pending ? `<span class="message-status"><i></i>${esc(status)}</span>` : ""}</div><div class="message-bubble">${body}</div>${execution}</div></article>`;
   }).join("");
+  if (!replaceMarkupIfChanged(chat, markup)) return;
   if (scroll) window.requestAnimationFrame(() => {
     scroll.scrollTop = followTail ? scroll.scrollHeight : previousScrollTop;
   });
@@ -1733,7 +1735,7 @@ function gracefulStopProgressText(progress) {
 }
 
 function lifecycleTargetValue() {
-  return $("lifecycle-worker-target")?.value || "";
+  return "";
 }
 
 function lifecycleTargetWorkers(target = lifecycleTargetValue()) {
@@ -1757,41 +1759,24 @@ function reclaimCandidate(worker) {
 }
 
 function renderLifecycleControls() {
-  const select = $("lifecycle-worker-target");
-  if (!select) return;
-  const previous = select.value;
-  select.innerHTML = '<option value="">All Workers</option>' + state.workers.map((worker) => `<option value="${esc(worker.worker)}">${esc(worker.worker)}</option>`).join("");
-  select.value = state.workers.some((worker) => worker.worker === previous) ? previous : "";
-  const workers = lifecycleTargetWorkers(select.value);
-  const activeRun = state.runtime.run;
+  const workers = state.workers.slice();
   const live = workers.filter((worker) => worker.alive);
   const paused = workers.filter((worker) => worker.pause_requested || worker.desired_state === "paused");
-  const stopPending = workers.filter((worker) => worker.stop_requested);
-  const forceSafety = forceStopSafety(select.value);
-  const reclaimable = workers.filter(reclaimCandidate);
+  const forceSafety = forceStopSafety("");
   const pause = $("run-pause");
   const resume = $("run-resume");
-  const stop = $("run-stop");
   const force = $("run-force-stop");
-  const reclaim = $("run-reclaim");
   const mainAgentBusy = Boolean(currentPendingMessage());
   if (pause) pause.disabled = mainAgentBusy || !live.some((worker) => !worker.pause_requested && !worker.stop_requested);
   if (resume) resume.disabled = mainAgentBusy || !paused.length;
-  if (stop) stop.disabled = mainAgentBusy || (!activeRun && !live.length) || (live.length > 0 && stopPending.length === live.length);
   if (force) {
     force.disabled = !forceSafety.allowed;
     force.title = forceSafety.reason;
   }
-  if (reclaim) {
-    reclaim.disabled = !reclaimable.length;
-    reclaim.title = reclaimable.length ? "Preview identity-verified stale artifact cleanup" : "No concrete mismatch/dead process record is currently detected";
-  }
   const safety = $("lifecycle-safety");
   if (safety) {
-    const target = select.value || "all Workers";
-    const desired = workers.length ? workers.map((worker) => `${worker.worker}: ${workerDesiredState(worker).label}`).join(" · ") : "No Workers";
     safety.className = `lifecycle-safety ${forceSafety.allowed ? "safe" : "blocked"}`;
-    safety.innerHTML = `<strong>${esc(target)}</strong><span>${esc(desired)}</span><small>${esc(forceSafety.reason)}${reclaimable.length ? ` · ${reclaimable.length} reclaim candidate${reclaimable.length === 1 ? "" : "s"}` : ""}</small>`;
+    safety.innerHTML = `<strong>全部 Workers</strong><span>${live.length} 运行中 · ${paused.length} 已暂停</span><small>强制停止仅在所有运行进程身份匹配时可用。</small>`;
   }
 }
 
@@ -1936,13 +1921,11 @@ function updateRuntime() {
   const bar = $("run-progress-bar");
   if (bar) bar.style.width = `${progress.expected_workers ? Math.min(100, Math.round((progress.stopped_workers / progress.expected_workers) * 100)) : 0}%`;
   const start = $("run-start");
-  const stop = $("run-stop");
   const mainAgentBusy = Boolean(currentPendingMessage());
   if (start) {
     start.disabled = Boolean(activeRun || live || !ready || mainAgentBusy);
     start.title = mainAgentBusy ? "等待当前 Main Agent 回复完成" : ready ? "启动已完成 Main Agent 分工的 Worker swarm" : "先让 Main Agent 完成所有 Worker 的 TASK.md 分工";
   }
-  if (stop) stop.disabled = !activeRun || mainAgentBusy;
   renderLifecycleControls();
 }
 
