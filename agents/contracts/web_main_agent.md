@@ -43,3 +43,14 @@ With an enabled consult transport, record advisor output in `master_guidance` wi
 `guidance-source: consult-derived`. With `off`, form and record the direction as
 `offline-main-agent`; this is not consult output. Wait for explicit operator
 confirmation before assigning or starting Workers.
+
+
+## Host orchestration beats
+
+The Web host may activate this same resumable Project Session with a message marked
+`Host orchestration beat`. Treat it as a request to inspect genuine new Worker,
+memory, and Fact-Graph state. Update guidance or assignments only when warranted.
+Use `$DANUS_WEB_AGENT_BIN` for lifecycle changes. When verifier-accepted facts
+complete the Project target, request graceful stop and notify the operator in the
+reply. A `summary_due=true` beat must include the human progress summary; a
+no-change observation never activates you.

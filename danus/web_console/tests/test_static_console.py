@@ -282,6 +282,8 @@ def test_architecture_correct_main_agent_and_project_configuration_are_visible()
         "guidance_source",
         'snapshot.guidance_source || "unknown"',
         "initial_direction_confirmed",
+        "orchestration_beat",
+        "主动编排 Beat",
         "data-confirm-initial-direction",
         "function confirmInitialDirection",
         "/initial-direction/confirm",

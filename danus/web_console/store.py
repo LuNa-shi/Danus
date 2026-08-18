@@ -86,6 +86,12 @@ class ConsoleStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, project_id TEXT,
                     outcome TEXT NOT NULL, created_at REAL NOT NULL, details TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS orchestration_beat_state (
+                    project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                    fingerprint TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL,
+                    last_beat_at REAL NOT NULL, last_consult_at REAL NOT NULL,
+                    last_summary_at REAL NOT NULL, updated_at REAL NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_runs_project_status ON runs(project_id, status);
                 CREATE INDEX IF NOT EXISTS idx_main_agent_events_project_id ON main_agent_events(project_id, id);
                 """
@@ -384,6 +390,25 @@ class ConsoleStore:
     def update_run(self, run_id: str, *, status: str, stopped_at: float | None = None, outcome: str | None = None) -> None:
         with self._lock, self._connect() as conn:
             conn.execute("UPDATE runs SET status=?, stopped_at=?, outcome=? WHERE id=?", (status, stopped_at, outcome, run_id))
+
+    def orchestration_beat_state(self, project_id: str) -> dict[str, Any] | None:
+        with self._lock, self._connect() as conn:
+            return self._dict(conn.execute(
+                "SELECT * FROM orchestration_beat_state WHERE project_id=?", (project_id,),
+            ).fetchone())
+
+    def update_orchestration_beat_state(
+        self, project_id: str, *, fingerprint: str, status: str, reason: str,
+        last_beat_at: float, last_consult_at: float, last_summary_at: float,
+    ) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO orchestration_beat_state(project_id,fingerprint,status,reason,last_beat_at,last_consult_at,last_summary_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET "
+                "fingerprint=excluded.fingerprint,status=excluded.status,reason=excluded.reason,last_beat_at=excluded.last_beat_at,"
+                "last_consult_at=excluded.last_consult_at,last_summary_at=excluded.last_summary_at,updated_at=excluded.updated_at",
+                (project_id, fingerprint, status, reason, last_beat_at, last_consult_at, last_summary_at, time.time()),
+            )
 
     def audit(self, action: str, outcome: str, project_id: str | None = None, details: str = "{}") -> None:
         with self._lock, self._connect() as conn:

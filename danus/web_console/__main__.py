@@ -32,6 +32,9 @@ def main() -> None:
     parser.add_argument("--agents-root", default=os.environ.get("DANUS_AGENTS_ROOT", str(runtime_root / "projects")))
     parser.add_argument("--max-file-bytes", type=int, default=int(os.environ.get("DANUS_WEB_MAX_FILE_BYTES", str(25 * 1024 * 1024))))
     parser.add_argument("--default-max-parallel-workers", type=int, default=positive_int_env("DANUS_WEB_DEFAULT_MAX_PARALLEL_WORKERS", "DANUS_MAX_PARALLEL_WORKERS", default=1))
+    parser.add_argument("--orchestration-poll-seconds", type=float, default=float(os.environ.get("DANUS_WEB_ORCHESTRATION_POLL_SECONDS", "30")))
+    parser.add_argument("--orchestration-consult-interval-seconds", type=float, default=float(os.environ.get("DANUS_WEB_ORCHESTRATION_CONSULT_INTERVAL_SECONDS", str(2 * 3600))))
+    parser.add_argument("--human-summary-interval-seconds", type=float, default=float(os.environ.get("DANUS_WEB_HUMAN_SUMMARY_INTERVAL_SECONDS", "3600")))
     args = parser.parse_args()
     password_hash = args.password_hash
     if not password_hash:
@@ -50,6 +53,9 @@ def main() -> None:
                              cookie_secure=cookie_secure, allowed_origins=allowed,
                              max_file_bytes=args.max_file_bytes,
                              default_max_parallel_workers=args.default_max_parallel_workers,
+                             orchestration_poll_seconds=args.orchestration_poll_seconds,
+                             orchestration_consult_interval_seconds=args.orchestration_consult_interval_seconds,
+                             human_summary_interval_seconds=args.human_summary_interval_seconds,
                              lifecycle_base_url=f"http://127.0.0.1:{args.port}"),
         runtime=DanusRuntimeAdapter(Path(args.agents_root).resolve()),
         main_agent=MainAgentAdapter(backend=args.main_agent_backend),

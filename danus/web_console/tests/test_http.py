@@ -1826,3 +1826,105 @@ def test_broker_scopes_status_and_assignment_without_shared_python_access(tmp_pa
         assert worker["worker"] == "high"
         assert worker["assigned"] is True
         assert worker["task"] == "prove the scoped lemma"
+
+
+def test_host_orchestration_beats_run_without_browser_timer_and_reuse_session(tmp_path: Path):
+    class Main:
+        backend = "codex"
+        def __init__(self):
+            self.calls = []
+        def send(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"session_id": kwargs.get("session_id") or "beat-session", "reply": "beat handled", "status": "completed", "seconds": 0.01, "read_status": "unknown", "attempts": 1}
+
+    main = Main()
+    runtime = FakeMemoryRuntime(tmp_path / "projects")
+    settings = AppSettings(
+        database_path=tmp_path / "console.sqlite3",
+        password_hash=hash_password("correct horse battery staple"),
+        cookie_secure=True, allowed_origins={"https://testserver"},
+        lifecycle_hmac_secret=_LIFECYCLE_SECRET,
+        orchestration_poll_seconds=0.05,
+        orchestration_consult_interval_seconds=3600,
+        human_summary_interval_seconds=3600,
+    )
+    app = create_app(settings=settings, runtime=runtime, main_agent=main)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post("/api/projects", json={"name": "A", "problem": "alpha", "roles": "high:1"}, headers=headers).json()
+        runtime.assign_all(project["runtime_name"])
+        app.state.console_store.confirm_initial_direction(project["id"], time.time())
+        assert client.post(f"/api/projects/{project['id']}/runs", json={"duration_seconds": 60}, headers=headers).status_code == 202
+        for _ in range(100):
+            if len(main.calls) >= 1: break
+            time.sleep(0.02)
+        assert len(main.calls) == 1
+        assert "Host orchestration beat" in main.calls[0]["message"]
+        assert main.calls[0]["session_id"] is None
+        assert main.calls[0]["lifecycle_url"].endswith(f"/projects/{project['id']}/lifecycle")
+        time.sleep(0.2)
+        assert len(main.calls) == 1
+
+        runtime.statuses[project["runtime_name"]][0]["round"] = 2
+        for _ in range(100):
+            if len(main.calls) >= 2: break
+            time.sleep(0.02)
+        assert len(main.calls) == 2
+        assert main.calls[1]["session_id"] == "beat-session"
+
+        manual = client.post(f"/api/projects/{project['id']}/messages", json={"text": "status?", "attachment_ids": []}, headers=headers)
+        assert manual.status_code == 201
+        assert main.calls[-1]["session_id"] == "beat-session"
+        messages = client.get(f"/api/projects/{project['id']}/messages").json()
+        assert any(row["role"] == "system" and "Host orchestration beat" in row["text"] for row in messages)
+        assert any(row["role"] == "assistant" and row["text"] == "beat handled" for row in messages)
+
+
+def test_orchestration_beats_are_concurrent_across_projects(tmp_path: Path):
+    class Main:
+        backend = "codex"
+        def __init__(self): self.started = set(); self.both = threading.Event(); self.release = threading.Event()
+        def send(self, **kwargs):
+            self.started.add(kwargs["project_state"]["project_id"])
+            if len(self.started) == 2: self.both.set()
+            assert self.release.wait(timeout=3)
+            return {"session_id": f"sid-{kwargs['project_state']['project_id']}", "reply": "ok", "status": "completed", "seconds": .01, "read_status": "unknown", "attempts": 1}
+    main = Main(); runtime = FakeMemoryRuntime(tmp_path / "projects")
+    settings = AppSettings(database_path=tmp_path / "db.sqlite3", password_hash=hash_password("correct horse battery staple"), cookie_secure=True, allowed_origins={"https://testserver"}, lifecycle_hmac_secret=_LIFECYCLE_SECRET, orchestration_poll_seconds=.05)
+    app = create_app(settings=settings, runtime=runtime, main_agent=main)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        for name in ("A", "B"):
+            project = client.post("/api/projects", json={"name": name, "problem": name, "roles": "high:1"}, headers=headers).json()
+            runtime.assign_all(name); app.state.console_store.confirm_initial_direction(project["id"], time.time())
+            assert client.post(f"/api/projects/{project['id']}/runs", json={"duration_seconds": 60}, headers=headers).status_code == 202
+        assert main.both.wait(timeout=2)
+        main.release.set()
+
+
+def test_failed_orchestration_beat_is_retried_and_audited(tmp_path: Path):
+    class Main:
+        backend = "codex"
+        def __init__(self): self.calls = 0
+        def send(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1: raise MainAgentError("temporary beat failure")
+            return {"session_id": "sid", "reply": "recovered", "status": "completed", "seconds": .01, "read_status": "unknown", "attempts": 1}
+    main = Main(); runtime = FakeMemoryRuntime(tmp_path / "projects")
+    settings = AppSettings(database_path=tmp_path / "db.sqlite3", password_hash=hash_password("correct horse battery staple"), cookie_secure=True, allowed_origins={"https://testserver"}, lifecycle_hmac_secret=_LIFECYCLE_SECRET, orchestration_poll_seconds=.05)
+    app = create_app(settings=settings, runtime=runtime, main_agent=main)
+    with TestClient(app, base_url="https://testserver") as client:
+        csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        project = client.post("/api/projects", json={"name": "A", "problem": "alpha", "roles": "high:1"}, headers=headers).json()
+        runtime.assign_all("A"); app.state.console_store.confirm_initial_direction(project["id"], time.time())
+        client.post(f"/api/projects/{project['id']}/runs", json={"duration_seconds": 60}, headers=headers)
+        for _ in range(150):
+            if main.calls >= 2: break
+            time.sleep(.02)
+        assert main.calls >= 2
+        projection = client.get(f"/api/projects/{project['id']}/orchestration").json()
+        assert projection["orchestration_beat"]["status"] == "completed"
+        assert projection["orchestration_beat"]["fingerprint"]
+        messages = client.get(f"/api/projects/{project['id']}/messages").json()
+        assert any(row["status"] == "failed" and row["role"] == "system" for row in messages)
+        assert any(row["text"] == "recovered" for row in messages)
