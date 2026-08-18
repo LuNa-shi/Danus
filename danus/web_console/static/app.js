@@ -1269,7 +1269,7 @@ function renderMainAgentControl() {
   const unassigned = Array.isArray(snapshot.unassigned_workers) ? snapshot.unassigned_workers : state.workers.filter((worker) => worker.assigned === false).map((worker) => worker.worker);
   const guidance = snapshot.master_guidance || snapshot.guidance || memoryKindEntry("master_guidance");
   const elaboration = snapshot.elaboration || memoryKindEntry("elaboration");
-  const guidanceSource = snapshot.guidance_source || (configuredStrategyTransport() === "off" ? "offline-main-agent" : "consult-derived");
+  const guidanceSource = snapshot.guidance_source || "unknown";
   const guidanceTransport = snapshot.guidance_transport || configuredStrategyTransport();
   const guidanceLabels = { "offline-main-agent": "offline Main-Agent guidance", "consult-derived": "consult-derived guidance", unknown: "guidance with unknown provenance" };
   const guidanceLabel = guidanceLabels[guidanceSource] || guidanceLabels.unknown;
