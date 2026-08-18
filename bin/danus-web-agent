@@ -41,12 +41,14 @@ esac
 
 response_file=$(mktemp)
 trap 'rm -f "$response_file"' EXIT
-status=$(curl --silent --show-error --max-time 30 \
-  --output "$response_file" --write-out '%{http_code}' \
-  --request POST --header 'Accept: application/json' \
-  --header "Authorization: Bearer $token" \
-  --header 'Content-Type: application/json' \
-  --data "$payload" "$url")
+# Feed the capability through curl's config stdin so it never appears in the
+# process argv exposed by /proc/<pid>/cmdline.
+status=$(printf 'header = "Authorization: Bearer %s"\n' "$token" | \
+  curl --config - --silent --show-error --max-time 30 \
+    --output "$response_file" --write-out '%{http_code}' \
+    --request POST --header 'Accept: application/json' \
+    --header 'Content-Type: application/json' \
+    --data "$payload" "$url")
 if [[ $status =~ ^2 ]]; then
   cat "$response_file"
   printf '\n'

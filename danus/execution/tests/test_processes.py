@@ -141,6 +141,21 @@ def test_force_stop_opens_pidfd_before_identity_revalidation_and_keeps_it_throug
     assert not wl.process_identity.exists()
 
 
+def test_force_stop_safely_adopts_a_matching_legacy_worker_before_signaling(tmp_path: Path):
+    wl, proc_root, _identity = _worker_with_procfs(tmp_path)
+    wl.process_identity.unlink()
+    ops = FakeProcessOps()
+
+    result = force_stop_worker(
+        wl, procfs=RecordingProcFS(proc_root, ops.events), ops=ops,
+        term_timeout=0.2, kill_timeout=0.2, poll_interval=0.1,
+    )
+
+    assert result == "killed"
+    assert ("signal_pidfd", 77, signal.SIGTERM) in ops.events
+    assert not wl.process_identity.exists()
+
+
 def test_force_stop_fails_closed_without_pidfd_and_keeps_recoverable_metadata(tmp_path: Path):
     wl, proc_root, _identity = _worker_with_procfs(tmp_path)
     ops = FakeProcessOps(pidfd=None)

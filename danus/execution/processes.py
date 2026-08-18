@@ -438,13 +438,23 @@ def force_stop_worker(
     on_signal: Callable[[str], None] | None = None,
 ) -> str:
     """Stop a verified Worker subtree exclusively through stable pidfds."""
+    persisted = read_worker_identity(wl)
     pid = read_pid(wl)
+    if pid is None and persisted is not None:
+        pid = persisted.pid
     if not process_alive(pid, procfs=procfs, ops=ops) or pid is None:
         clear_worker_process_metadata(wl)
         return "not-running"
     current = capture_worker_identity(wl, pid, procfs=procfs, ops=ops)
-    persisted = read_worker_identity(wl)
-    if current is None or persisted is None or persisted != current:
+    if current is None:
+        return "identity-mismatch"
+    if persisted is None:
+        # Upgrade a legacy detached Worker only after the live process exactly
+        # matches its expected command and Worker directory. The subsequent
+        # pidfd freeze revalidates this identity before any signal is sent.
+        write_worker_identity(wl, current)
+        persisted = current
+    if persisted != current:
         return "identity-mismatch"
     try:
         pgid = ops.getpgid(pid)

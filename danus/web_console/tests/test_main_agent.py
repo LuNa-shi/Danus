@@ -276,6 +276,9 @@ def test_codex_environment_exposes_only_the_self_bootstrapping_broker(tmp_path: 
     assert "PYTHONPATH" not in env
     assert result.returncode == 0, result.stderr
     assert "danus-web-agent" in result.stdout
+    wrapper_text = Path(env["DANUS_WEB_AGENT_BIN"]).read_text(encoding="utf-8")
+    assert '--header "Authorization: Bearer $token"' not in wrapper_text
+    assert "curl --config -" in wrapper_text
 
 
 def test_codex_allows_cli_configured_model_when_server_does_not_set_one(tmp_path: Path, monkeypatch):
