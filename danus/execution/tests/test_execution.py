@@ -81,6 +81,7 @@ def test_worker_layout_paths():
     assert wl.project_dir == Path("/x/proj")
     assert wl.task.name == L.TASK_FILE and wl.role.name == L.ROLE_FILE
     assert wl.pid.name == L.PID_FILE and wl.lock.name == L.LOCK_FILE
+    assert wl.process_identity.name == L.PROCESS_IDENTITY_FILE
     assert wl.stop.name == L.STOP_FILE and wl.status.name == L.STATUS_FILE
     assert wl.logs.name == L.LOGS_DIR
     assert wl.codex_config == Path("/x/proj/workers/high/.codex/config.toml")

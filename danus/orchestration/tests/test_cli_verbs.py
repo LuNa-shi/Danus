@@ -86,7 +86,7 @@ def _patch_spawn():
             "pid": pid,
             "boot_id": "test-boot",
             "start_time": "test-start",
-            "cmdline": ["python", "-m", "danus.execution", str(wl.dir.resolve())],
+            "cmdline": cli._expected_worker_cmdline(wl),
         }
 
     cli._capture_worker_identity = capture
@@ -104,7 +104,7 @@ def _verified_worker(wl: L.WorkerLayout, pid: int):
         "pid": pid,
         "boot_id": "test-boot",
         "start_time": f"test-start-{pid}",
-        "cmdline": ["python", "-m", "danus.execution", str(wl.dir.resolve())],
+        "cmdline": cli._expected_worker_cmdline(wl),
     }
     wl.pid.write_text(str(pid), encoding="utf-8")
     wl.process_identity.write_text(json.dumps(identity), encoding="utf-8")
@@ -472,7 +472,7 @@ def test_start_replaces_live_unrelated_pid_instead_of_skipping_worker(tmp: Path)
             "pid": os.getpid(),
             "boot_id": "boot-A",
             "start_time": "123",
-            "cmdline": ["python", "-m", "danus.execution", str(wl.dir.resolve())],
+            "cmdline": cli._expected_worker_cmdline(wl),
         }
         calls = 0
 
@@ -486,7 +486,7 @@ def test_start_replaces_live_unrelated_pid_instead_of_skipping_worker(tmp: Path)
         previous_capture = cli._capture_worker_identity
         cli._capture_worker_identity = capture
         try:
-            assert cli._start_one(wl) == "started"
+            assert cli.do_start("P/high") == [{"worker": "high", "result": "started"}]
             assert fake.calls == [wl.dir]
             assert json.loads((wl.dir / ".process.json").read_text()) == captured
         finally:
@@ -538,8 +538,12 @@ def test_stop_one_not_running_force_cleans_pid(tmp: Path):
         cli.do_new("P", roles="high:1")
         wl = _wl("P", "high")
         wl.pid.write_text("2000000000")               # dead pid
-        assert cli._stop_one(wl, force=True) == "not-running"
-        assert not wl.pid.exists()                     # stale pid removed
+        wl.process_identity.write_text('{"pid": 2000000000}')
+        assert cli.do_stop("P/high", force=True) == [
+            {"worker": "high", "result": "not-running"}
+        ]
+        assert not wl.pid.exists()                     # stale metadata removed
+        assert not wl.process_identity.exists()
 
 
 def test_stop_one_graceful_touches_stop(tmp: Path):
