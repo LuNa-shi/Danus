@@ -1238,7 +1238,8 @@ def test_config_project_capacity_and_assignment_gate_are_server_enforced(tmp_pat
         assert runtime.started == []
 
 
-def test_orchestration_projection_reads_real_session_guidance_and_tasks(tmp_path: Path):
+def test_orchestration_projection_reads_real_session_guidance_and_tasks(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("DANUS_CONSULT_TRANSPORT", "off")
     runtime = FakeMemoryRuntime(tmp_path / "projects")
     settings = AppSettings(
         database_path=tmp_path / "console.sqlite3",
@@ -1254,7 +1255,7 @@ def test_orchestration_projection_reads_real_session_guidance_and_tasks(tmp_path
         }, headers=headers).json()
         runtime.statuses[project["runtime_name"]][0].update({"assigned": True, "task": "Explore branch A"})
         runtime.memory_entries[project["runtime_name"]] = {"total": 2, "channels": [
-            {"kind": "master_guidance", "entries": [{"claim": "Split into branches A and B"}]},
+            {"kind": "master_guidance", "entries": [{"claim": "Split into branches A and B", "evidence": "guidance-source: offline-main-agent"}]},
             {"kind": "elaboration", "entries": [{"claim": "The missing bridge is compactness"}]},
         ]}
         app.state.console_store.upsert_agent_session(
@@ -1268,7 +1269,15 @@ def test_orchestration_projection_reads_real_session_guidance_and_tasks(tmp_path
         assert projection["unassigned_workers"] == ["xhigh"]
         assert projection["workers"][0]["task"] == "Explore branch A"
         assert projection["master_guidance"]["claim"] == "Split into branches A and B"
+        assert projection["guidance_source"] == "offline-main-agent"
+        assert projection["guidance_transport"] == "off"
         assert projection["elaboration"]["claim"] == "The missing bridge is compactness"
+
+        monkeypatch.setenv("DANUS_CONSULT_TRANSPORT", "gpt_pro")
+        runtime.memory_entries[project["runtime_name"]]["channels"][0]["entries"][0]["evidence"] = "guidance-source: consult-derived"
+        enabled_projection = client.get(f"/api/projects/{project['id']}/orchestration").json()
+        assert enabled_projection["guidance_source"] == "consult-derived"
+        assert enabled_projection["guidance_transport"] == "gpt_pro"
 
 def test_main_agent_event_retention_is_project_scoped(tmp_path: Path):
     store = ConsoleStore(tmp_path / "retention.sqlite3")

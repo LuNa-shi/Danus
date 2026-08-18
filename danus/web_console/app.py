@@ -244,6 +244,14 @@ def create_app(
                 return entries[0] if entries else None
         return None
 
+    def guidance_source(entry: dict[str, Any] | None, transport: str) -> str:
+        evidence = str((entry or {}).get("evidence") or "").lower()
+        if "guidance-source: offline-main-agent" in evidence:
+            return "offline-main-agent"
+        if "guidance-source: consult-derived" in evidence:
+            return "consult-derived"
+        return "unknown"
+
     def worker_is_live(worker: dict[str, Any]) -> bool:
         identity = worker.get("process_identity")
         if identity in {"matched", "mismatch", "dead", "unknown"}:
@@ -1344,6 +1352,8 @@ def create_app(
                 "deadline": active["deadline"],
                 **worker_progress(workers),
             }
+        guidance = latest_memory_entry(memory, "master_guidance")
+        guidance_transport = strategy_metadata()["transport"]
         return {
             "project": project_payload(project),
             "config": project_config(project),
@@ -1362,8 +1372,10 @@ def create_app(
                 }
                 for worker in workers
             ],
-            "master_guidance": latest_memory_entry(memory, "master_guidance"),
-            "guidance": latest_memory_entry(memory, "master_guidance"),
+            "master_guidance": guidance,
+            "guidance": guidance,
+            "guidance_source": guidance_source(guidance, guidance_transport),
+            "guidance_transport": guidance_transport,
             "elaboration": latest_memory_entry(memory, "elaboration"),
             "run": run_projection,
         }

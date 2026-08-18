@@ -243,7 +243,21 @@ def test_main_agent_prompt_honors_strategy_off_as_server_policy(tmp_path: Path, 
 
     assert "strategy consult is OFF" in prompt
     assert "Do not invoke `consult`" in prompt
-    assert "record the elaboration and master_guidance" in prompt
+    assert "offline-main-agent" in prompt
+    assert "must not describe it as consult-derived" in prompt
+
+
+def test_main_agent_prompt_requires_consult_derived_guidance_and_operator_confirmation(monkeypatch):
+    monkeypatch.setenv("DANUS_CONSULT_TRANSPORT", "gpt_pro")
+    prompt = MainAgentAdapter(backend="codex", codex_bin="codex")._prompt(**{
+        "message": "initialize",
+        "manifest": [],
+        "project_state": {"project_id": "p"},
+        "attachments": [],
+    })
+    assert "strategy consult transport is gpt_pro" in prompt
+    assert "consult-derived guidance" in prompt
+    assert "wait for operator confirmation before assigning Workers" in prompt
 
 
 def test_main_agent_prompt_never_hardcodes_strategy_model_when_enabled(tmp_path: Path, monkeypatch):

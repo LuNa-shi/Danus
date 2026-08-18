@@ -207,13 +207,17 @@ class MainAgentAdapter:
             strategy_policy = (
                 "SERVER STRATEGY POLICY: strategy consult is OFF for this deployment. "
                 "Do not invoke `consult` or any external strategy model. Use your Main Agent "
-                "orchestration judgment to record the elaboration and master_guidance through "
-                "the project-scoped Danus MCP tools, then assign Workers through `danus-web-agent`."
+                "orchestration judgment to prepare the elaboration and shared strategy. Record the "
+                "strategy in the `master_guidance` channel with `guidance-source: offline-main-agent` "
+                "in its evidence. This is offline Main-Agent-authored guidance: you must not describe "
+                "it as consult-derived. At initialization, present the direction to the operator and "
+                "wait for confirmation before assigning Workers through `danus-web-agent`."
             )
         else:
             strategy_policy = (
                 f"SERVER STRATEGY POLICY: strategy consult transport is {strategy_transport}. "
-                "Use the server-configured transport and model; do not hard-code or substitute a model id."
+                "Use the server-configured transport and model; do not hard-code or substitute a model id. "
+                "Record the advisor direction as consult-derived guidance and wait for operator confirmation before assigning Workers."
             )
         return "\n".join([
             "You are the Danus Main Agent for exactly one Project.",
