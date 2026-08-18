@@ -416,14 +416,35 @@ class MainAgentAdapter:
                 parsed = raw_detail
         lowered = str(tool or "").lower()
         if lowered in {"exec_command", "command_execution"}:
-            command = parsed.get("cmd") if isinstance(parsed, dict) else parsed
-            try:
-                parts = shlex.split(str(command or ""))
-            except ValueError:
-                parts = str(command or "").split()
+            command = (
+                parsed.get("cmd") or parsed.get("command") or ""
+                if isinstance(parsed, dict) else parsed
+            )
+            if isinstance(command, (list, tuple)):
+                parts = [str(part) for part in command]
+            else:
+                try:
+                    parts = shlex.split(str(command or ""))
+                except ValueError:
+                    parts = str(command or "").split()
             if not parts:
                 return "命令执行"
-            visible_count = 3 if parts[0].endswith("danus-web-agent") else 1
+            shell_names = {"sh", "bash", "zsh", "dash", "ksh"}
+            shell = Path(parts[0]).name
+            if shell in shell_names:
+                command_flag = next(
+                    (index for index, part in enumerate(parts[1:], start=1)
+                     if part.startswith("-") and not part.startswith("--") and "c" in part[1:]),
+                    None,
+                )
+                if command_flag is not None and command_flag + 1 < len(parts):
+                    try:
+                        inner_parts = shlex.split(parts[command_flag + 1])
+                    except ValueError:
+                        inner_parts = parts[command_flag + 1].split()
+                    if inner_parts:
+                        parts = inner_parts
+            visible_count = 2 if parts[0].endswith("danus-web-agent") else 1
             summary = " ".join(parts[:visible_count])
             hidden = isinstance(parsed, dict) and any(
                 re.search(r"(?i)(key|token|secret|password|authorization|session|cookie|credential)", str(key))

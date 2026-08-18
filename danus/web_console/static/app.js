@@ -1012,37 +1012,77 @@ function mainAgentEventLabel(type) {
   })[type] || "执行事件";
 }
 
-function mainAgentEventMeta(event) {
-  const values = [`event #${event.id ?? "—"}`, String(event.type || "event")];
-  if (event.status) values.push(String(event.status));
-  if (event.attempt != null) values.push(`attempt ${event.attempt}/${event.max_attempts || event.attempt}`);
-  if (event.delay_seconds != null) values.push(`retry in ${event.delay_seconds}s`);
-  if (event.duration_seconds != null) values.push(`duration ${event.duration_seconds}s`);
-  if (event.message_id) values.push(`message ${String(event.message_id).slice(0, 10)}`);
-  if (event.main_agent_session_id) values.push(`session ${String(event.main_agent_session_id).slice(0, 10)}`);
-  if (event.run_id) values.push(`run ${String(event.run_id).slice(0, 10)}`);
-  if (event.call_id) values.push(`call ${String(event.call_id).slice(0, 10)}`);
-  return values.join(" · ");
+function toolDisplayName(tool) {
+  return ({
+    exec_command: "命令",
+    web_search: "网页搜索",
+    file_change: "文件修改",
+    "tool result": "工具",
+  })[String(tool || "").toLowerCase()] || String(tool || "工具");
+}
+
+function summarizeToolEvents(events) {
+  const calls = [];
+  const byCallId = new Map();
+  events.forEach((event) => {
+    if (!["tool.started", "tool.completed"].includes(String(event.type || ""))) return;
+    const callId = String(event.call_id || "");
+    const eventTool = String(event.tool || "tool");
+    let call = callId ? byCallId.get(callId) : null;
+    if (!call && event.type === "tool.completed" && !callId) {
+      call = calls.slice().reverse().find((candidate) => (
+        candidate.status === "started" && candidate.tool === eventTool
+      ));
+    }
+    if (!call) {
+      call = { tool: eventTool, status: "started", duration: null };
+      calls.push(call);
+      if (callId) byCallId.set(callId, call);
+    }
+    if (eventTool !== "tool result") call.tool = eventTool;
+    if (event.type === "tool.completed") call.status = event.status === "failed" ? "failed" : "completed";
+    if (event.duration_seconds != null) call.duration = Number(event.duration_seconds);
+  });
+  if (!calls.length) return null;
+  const counts = new Map();
+  calls.forEach((call) => counts.set(call.tool, (counts.get(call.tool) || 0) + 1));
+  const tools = [...counts.entries()].map(([tool, count]) => `${toolDisplayName(tool)}${count > 1 ? ` × ${count}` : ""}`);
+  const failed = calls.filter((call) => call.status === "failed").length;
+  const running = calls.filter((call) => call.status === "started").length;
+  const stateText = failed ? `${failed} 个失败` : running ? `${running} 个执行中` : "已完成";
+  return `工具活动 · ${tools.join(" · ")} · ${stateText}`;
+}
+
+function renderMainAgentOutputEvent(event) {
+  const detail = String(event.detail || "").trim();
+  if (!detail) return "";
+  const type = String(event.type || "event");
+  const label = ({
+    "agent.progress": "进度",
+    "agent.message": "Main Agent",
+    "turn.retry": "自动续接",
+    "turn.failed": "执行失败",
+  })[type] || mainAgentEventLabel(type);
+  return `<article class="main-agent-output-event ${esc(type.replace(/\./g, "-"))}"><div class="main-agent-output-label"><strong>${esc(label)}</strong><time>${formatTime(event.created_at)}</time></div><div class="main-agent-output-body main-agent-event-message">${renderMarkdown(detail)}</div></article>`;
 }
 
 function renderMainAgentEvents(messageId) {
   const events = state.mainAgentEvents
-    .filter((event) => event.message_id === messageId);
+    .filter((event) => event.message_id === messageId)
+    .slice()
+    .sort((left, right) => Number(left.id || 0) - Number(right.id || 0));
   if (!events.length) return "";
-  const orderedEvents = events.slice().sort((left, right) => Number(left.id || 0) - Number(right.id || 0));
   const message = state.messages.find((row) => row.id === messageId);
   const live = message && ["submitted", "retrying", "pending"].includes(message.status);
-  const rows = orderedEvents.map((event) => {
-    const type = String(event.type || "event");
-    const label = mainAgentEventLabel(type);
-    const tool = event.tool ? `<strong>${esc(event.tool)}</strong>` : "";
-    const detail = String(event.detail || "");
-    const detailMarkup = detail
-      ? (type === "agent.message" ? `<div class="main-agent-event-message">${renderMarkdown(detail)}</div>` : `<pre>${esc(detail)}</pre>`)
-      : '<div class="main-agent-event-empty">No additional safe detail was emitted.</div>';
-    return `<li class="main-agent-event ${esc(type.replace(/\./g, "-"))}" data-event-id="${esc(event.id)}"><i></i><div><div class="main-agent-event-head"><span>${esc(label)}</span>${tool}<time>${formatTime(event.created_at)}</time></div><small class="main-agent-event-meta">${esc(mainAgentEventMeta(event))}</small>${detailMarkup}</div></li>`;
-  }).join("");
-  return `<details class="main-agent-events ${live ? "is-live" : ""}" open><summary><span>Emitted progress + tool trace · 执行过程</span><small>${orderedEvents.length} 个持久事件${live ? " · 实时更新" : ""}</small></summary><div class="main-agent-event-boundary"><strong>运行时提供的安全事件流</strong><span>Shows the safe progress/tool events made available by the Main Agent runtime; private chain-of-thought is not exposed.</span></div><ol>${rows}</ol></details>`;
+  const outputTypes = new Set(["agent.progress", "agent.message", "turn.retry", "turn.failed"]);
+  const outputMarkup = events
+    .filter((event) => outputTypes.has(String(event.type || "")))
+    .map(renderMainAgentOutputEvent)
+    .filter(Boolean)
+    .join("");
+  const toolSummary = summarizeToolEvents(events);
+  if (!outputMarkup && !toolSummary) return "";
+  return `<section class="main-agent-events ${live ? "is-live" : ""}"><div class="main-agent-events-head"><div><strong>Main Agent 输出与安全进度</strong><small>${live ? "实时更新" : "本次执行记录"}</small></div><span>仅显示运行时输出，不包含隐藏思维链</span></div>${outputMarkup ? `<div class="main-agent-output-stream">${outputMarkup}</div>` : ""}${toolSummary ? `<div class="main-agent-tool-summary" title="${esc(toolSummary)}"><i></i><span>${esc(toolSummary)}</span></div>` : ""}</section>`;
 }
 
 function renderMessages() {

@@ -749,6 +749,37 @@ def test_claude_streams_safe_tool_results_and_turn_events(tmp_path: Path):
     assert events[4]["duration_seconds"] == 0.125
 
 
+def test_exec_command_detail_unwraps_shell_launchers_before_redaction():
+    assert MainAgentAdapter._tool_call_detail(
+        "exec_command", ["/usr/bin/zsh", "-lc", "danus-web-agent status"],
+    ) == "命令：danus-web-agent status"
+    assert MainAgentAdapter._tool_call_detail(
+        "exec_command", {"cmd": "/bin/bash -lc 'printf hello && pwd'"},
+    ) == "命令：printf"
+    assert MainAgentAdapter._tool_call_detail(
+        "exec_command", ["/bin/bash", "--norc", "-c", "danus-web-agent status"],
+    ) == "命令：danus-web-agent status"
+    assignment = MainAgentAdapter._tool_call_detail(
+        "exec_command", ["/bin/zsh", "-lc", "danus-web-agent assign secret-worker --task secret-task"],
+    )
+    assert assignment == "命令：danus-web-agent assign"
+    assert "secret-worker" not in assignment
+    assert "secret-task" not in assignment
+    assert MainAgentAdapter._tool_call_detail(
+        "exec_command", ["/bin/bash", "--rcfile", "/tmp/bashrc", "-c", "git status --short"],
+    ) == "命令：git"
+    secret = MainAgentAdapter._tool_call_detail(
+        "exec_command", ["/bin/sh", "-c", "curl -H 'Authorization: Bearer top-secret' https://example.test"],
+    )
+    assert secret == "命令：curl"
+    assert "top-secret" not in secret
+    unclassified = MainAgentAdapter._tool_call_detail(
+        "exec_command", ["/bin/sh", "-c", "echo arbitrary-unclassified-secret"],
+    )
+    assert unclassified == "命令：echo"
+    assert "arbitrary-unclassified-secret" not in unclassified
+
+
 def test_codex_tool_result_keeps_safe_broker_outcome_and_hides_unclassified_text():
     broker = MainAgentAdapter._codex_progress_events(json.dumps({
         "type": "response_item",

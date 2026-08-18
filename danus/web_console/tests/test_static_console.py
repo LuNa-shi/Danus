@@ -389,7 +389,8 @@ def test_main_agent_retry_status_is_polled_and_execution_events_are_visible():
     assert "function currentPendingMessage()" in app
     assert "function renderMainAgentEvents(messageId)" in app
     assert "main-agent-events" in app
-    assert "执行过程" in app
+    assert "Main Agent 输出与安全进度" in app
+    assert "main-agent-tool-summary" in app
     assert '"tool.started"' in app
     assert "async function refreshPendingMessages()" in app
     assert "state.pendingTimer = window.setInterval" in app
@@ -515,18 +516,34 @@ def test_worker_drawer_keeps_structured_transcript_and_exposes_bounded_raw_logs(
     assert ".log-fetch-error" in css
 
 
-def test_main_agent_timeline_shows_every_safe_emitted_event_and_polling_keeps_operations_live():
+def test_tool_activity_summary_groups_started_and_completed_events_by_call():
     app = _asset("app.js")
+    functions = "\n".join((
+        _javascript_function(app, "toolDisplayName"),
+        _javascript_function(app, "summarizeToolEvents"),
+    ))
+    events = [
+        {"type": "tool.started", "tool": "exec_command", "call_id": "call-1"},
+        {"type": "tool.completed", "tool": "tool result", "call_id": "call-1", "status": "completed"},
+        {"type": "tool.started", "tool": "web_search", "call_id": "call-2"},
+    ]
+    script = functions + f"\nconsole.log(JSON.stringify(summarizeToolEvents({json.dumps(events)})));"
+    result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+    assert json.loads(result.stdout) == "工具活动 · 命令 · 网页搜索 · 1 个执行中"
+
+
+def test_main_agent_timeline_prioritizes_output_and_compacts_tool_activity():
+    app = _asset("app.js")
+    css = _asset("style.css")
 
     for token in (
-        'events.slice().sort((left, right) => Number(left.id || 0) - Number(right.id || 0))',
-        'data-event-id="${esc(event.id)}"',
-        "function mainAgentEventMeta",
-        "main_agent_session_id",
-        "event.run_id",
-        "event.call_id",
-        "Emitted progress + tool trace",
-        "private chain-of-thought is not exposed",
+        "function summarizeToolEvents",
+        "function renderMainAgentOutputEvent",
+        "main-agent-output-stream",
+        "main-agent-tool-summary",
+        "工具活动",
+        "Main Agent 输出与安全进度",
         'api(`/api/projects/${projectAtStart}/workers`)',
         'api(`/api/projects/${projectAtStart}/runtime`)',
         "pendingLogRequest(projectAtStart)",
@@ -534,6 +551,11 @@ def test_main_agent_timeline_shows_every_safe_emitted_event_and_polling_keeps_op
         "renderWorkerDrawer();",
     ):
         assert token in app
+
+    assert '<pre>${esc(detail)}</pre>' not in app
+    assert "data-event-id" not in app
+    assert ".main-agent-tool-summary" in css
+    assert ".main-agent-output-event" in css
 
 
 def test_lifecycle_recovery_controls_call_only_host_safety_endpoints_with_confirmation():
