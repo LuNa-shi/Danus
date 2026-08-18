@@ -32,6 +32,12 @@ _Avoid_: Fact edit, Worker command
 Within one Project, the Main Agent retains Danus' strategic orchestration capabilities: it can inspect project state and truth stores, record strategy, and decide how Workers should be coordinated. The Web Console presents these capabilities through conversation rather than making independent strategy decisions.
 _Avoid_: Web strategy, operator Worker override
 
+
+**Main Agent Turn**:
+One bounded request/response attempt within an activated Main Agent Process. A Turn
+belongs to the persistent Project Session but does not create a new Session.
+_Avoid_: Session, Process
+
 **Main Agent Process**:
 The Claude Code process activated to handle a Main Agent Session interaction. It is not a Worker and need not remain running while the Session is inactive.
 _Avoid_: Main Agent Session, Worker

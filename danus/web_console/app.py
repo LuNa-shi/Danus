@@ -1641,12 +1641,12 @@ def create_app(
         def record_main_agent_progress(event: dict[str, Any]) -> None:
             event_type = str(event.get("type") or "")
             allowed_types = {
-                "turn.started", "agent.progress", "agent.message", "tool.started", "tool.completed",
+                "session.started", "process.started", "turn.started", "agent.progress", "agent.message", "tool.started", "tool.completed",
                 "turn.retry", "turn.completed", "turn.failed",
             }
             if event_type in allowed_types:
                 safe_payload: dict[str, Any] = {}
-                for key in ("tool", "detail", "status", "call_id", "error_code"):
+                for key in ("tool", "detail", "status", "call_id", "error_code", "session_id", "process_id", "turn_id"):
                     value = event.get(key)
                     if value is not None:
                         safe_payload[key] = str(value)[:4000 if key == "detail" else 200]
