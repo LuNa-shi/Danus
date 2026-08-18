@@ -2002,3 +2002,19 @@ def test_summary_and_paper_actions_require_explicit_operator_forks(tmp_path: Pat
         assert client.post(f"/api/projects/{project['id']}/write-paper", json={"confirm": "A"}, headers=headers).status_code == 400
         paper = client.post(f"/api/projects/{project['id']}/write-paper", json={"confirm": "A", "paper_id": "thmA", "stop_workers": False}, headers=headers)
         assert paper.status_code == 200 and paper.json()["stop_workers"] is False
+
+
+def test_internal_artifact_actions_require_confirmation_and_forward_forks(tmp_path: Path):
+    app, runtime = _app(tmp_path)
+    with TestClient(app, base_url="https://testserver", client=("127.0.0.1", 50123)) as client:
+        csrf = _login(client); headers = {"Authorization": f"Bearer {project_lifecycle_capability(_LIFECYCLE_SECRET, 'missing', 'missing')}", "Origin": "https://testserver"}
+        project = client.post("/api/projects", json={"name":"A", "problem":"x", "roles":"high:1"}, headers={"X-CSRF-Token":csrf,"Origin":"https://testserver"}).json()
+        token = project_lifecycle_capability(_LIFECYCLE_SECRET, project["id"], project["runtime_name"]); headers["Authorization"] = f"Bearer {token}"
+        url = f"/internal/api/projects/{project['id']}/lifecycle"
+        assert client.post(url, json={"action":"human-summary"}, headers=headers).status_code == 409
+        response = client.post(url, json={"action":"write-paper", "paper_id":"p", "fact_ids":["f"], "instructions":"i", "stop_workers":False, "operator_confirmed":True}, headers=headers)
+        assert response.status_code == 200 and response.json()["paper_id"] == "p"
+        assert runtime.stopped == []
+        response = client.post(url, json={"action":"write-paper", "paper_id":"p2", "fact_ids":[], "stop_workers":True, "operator_confirmed":True}, headers=headers)
+        assert response.status_code == 200 and response.json()["graceful_stop"]["workers"][0]["alive"] is False
+        assert runtime.stopped == [project["runtime_name"]]
