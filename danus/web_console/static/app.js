@@ -1877,7 +1877,7 @@ function renderMemory() {
 
 function artifactTypeLabel(file) {
   const kind = String(file.kind || "output");
-  return { target: "TARGET.md", report: "human-summary", paper: "Paper", output: "Output" }[kind] || "Artifact";
+  return { target: "TARGET.md", report: "human-summary", "verification-ledger": "Verification Ledger", paper: "Paper", output: "Output" }[kind] || "Artifact";
 }
 async function artifactAction(action, options = {}) {
   if (!state.current || !state.project) return;
@@ -1889,9 +1889,17 @@ async function artifactAction(action, options = {}) {
       const fact_ids = rawFacts.split(",").map((value) => value.trim()).filter(Boolean);
       if (!fact_ids.length) return;
       const paper_id = (window.prompt("Paper ID（默认论文留空）") || "").trim() || null;
-      await api(`/api/projects/${state.current}/finalize`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ fact_ids, paper_id }) });
+      await api(`/api/projects/${state.current}/finalize`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirm: confirmation, fact_ids, paper_id }) });
     } else {
       const endpoint = action === "human-summary" ? "human-summary" : "write-paper";
+      if (action === "human-summary") {
+        options.language = (window.prompt("报告语言（留空使用项目默认）") || "").trim() || null;
+      } else {
+        options.paper_id = (window.prompt("Paper ID（默认论文留空）") || "").trim() || null;
+        const selected = (window.prompt("可选：论文 Fact IDs（逗号分隔）") || "").split(",").map((value) => value.trim()).filter(Boolean);
+        options.fact_ids = selected.length ? selected : null;
+        options.instructions = (window.prompt("可选：论文写作说明") || "").trim() || null;
+      }
       await api(`/api/projects/${state.current}/${endpoint}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirm: confirmation, ...options }) });
     }
     notify("产物工作流已完成；正在刷新产物", "success"); await refreshProjectData();
@@ -2391,7 +2399,7 @@ async function deleteProject() {
 document.addEventListener("click", (event) => {
   if (event.target.closest("[data-confirm-initial-direction]")) confirmInitialDirection();
   const artifactButton = event.target.closest("[data-artifact-action]");
-  if (artifactButton) artifactAction(artifactButton.dataset.artifactAction, artifactButton.dataset.artifactAction === "write-paper" ? { stop_workers: false } : {});
+  if (artifactButton) artifactAction(artifactButton.dataset.artifactAction, artifactButton.dataset.artifactAction === "write-paper" ? { stop_workers: window.confirm("生成论文前停止 Workers？确定=停止，取消=保持运行") } : {});
 });
 
 $("project-list").addEventListener("click", (event) => {

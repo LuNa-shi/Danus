@@ -1964,11 +1964,13 @@ def test_artifact_projection_is_project_scoped_and_secure(tmp_path: Path):
         (project_dir / "report").mkdir(); (project_dir / "report" / "report.md").write_text("safe report")
         (project_dir / "paper").mkdir(); (project_dir / "paper" / "main.tex").write_text("\\documentclass{article}")
         (project_dir / "papers" / "thmB").mkdir(parents=True); (project_dir / "papers" / "thmB" / "main.pdf").write_bytes(b"pdf")
+        (project_dir / "report" / "internal-link").symlink_to(project_dir / "PROBLEM.md")
         projection = client.get(f"/api/projects/{a['id']}/artifacts").json()
         paths = {row["path"] for row in projection["files"]}
         assert {"TARGET.md", "report/report.md", "paper/main.tex", "papers/thmB/main.pdf"} <= paths
         assert all(row["path"] != "TARGET.md" for row in client.get(f"/api/projects/{b['id']}/artifacts").json()["files"])
         assert client.get(f"/api/projects/{a['id']}/artifacts/report/report.md").text == "safe report"
+        assert all(row["path"] != "report/internal-link" for row in client.get(f"/api/projects/{a['id']}/artifacts").json()["files"])
         assert client.get(f"/api/projects/{a['id']}/artifacts/../TARGET.md").status_code in {400, 404}
         assert client.get(f"/api/projects/{a['id']}/artifacts/%2e%2e%2fTARGET.md").status_code in {400, 404}
 
@@ -1982,9 +1984,9 @@ def test_finalize_suggestions_and_approved_target_are_csrf_and_project_scoped(tm
         project = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
         assert client.get(f"/api/projects/{project['id']}/finalize/suggestions").json()["suggested"] == ["fact_a"]
         assert client.post(f"/api/projects/{project['id']}/finalize", json={"fact_ids": ["fact_a"]}, headers={"Origin": "https://testserver"}).status_code == 403
-        response = client.post(f"/api/projects/{project['id']}/finalize", json={"fact_ids": ["fact_a"], "paper_id": "thmA"}, headers=headers)
+        response = client.post(f"/api/projects/{project['id']}/finalize", json={"confirm": "A", "fact_ids": ["fact_a"], "paper_id": "thmA"}, headers=headers)
         assert response.status_code == 200 and response.json()["paper_id"] == "thmA"
-        assert client.post(f"/api/projects/{project['id']}/finalize", json={"fact_ids": ["fact_a"], "paper_id": "../escape"}, headers=headers).status_code == 400
+        assert client.post(f"/api/projects/{project['id']}/finalize", json={"confirm": "A", "fact_ids": ["fact_a"], "paper_id": "../escape"}, headers=headers).status_code == 400
 
 
 def test_summary_and_paper_actions_require_explicit_operator_forks(tmp_path: Path):

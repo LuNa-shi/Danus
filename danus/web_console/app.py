@@ -1344,7 +1344,9 @@ def create_app(
         project = project_or_404(project_id)
         if isinstance(project, JSONResponse): return project
         payload = await request.json()
-        if not isinstance(payload, dict) or not isinstance(payload.get("fact_ids"), list) or not payload["fact_ids"]:
+        if not isinstance(payload, dict) or payload.get("confirm") != project["name"]:
+            return _error(409, "project-name confirmation required")
+        if not isinstance(payload.get("fact_ids"), list) or not payload["fact_ids"]:
             return _error(400, "fact_ids are required")
         paper_id = payload.get("paper_id")
         if paper_id is not None and (not isinstance(paper_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", paper_id)):
@@ -1368,6 +1370,8 @@ def create_app(
         if not isinstance(payload, dict) or payload.get("confirm") != project["name"]: return _error(409, "project-name confirmation required")
         try:
             result = await asyncio.to_thread(runtime.write_human_summary, project["runtime_name"], payload.get("language"))
+            if result.get("status") != "ok":
+                store.audit("human_summary", "failure", project_id, details=json.dumps(result)[:2000]); return JSONResponse(result, status_code=502)
             store.audit("human_summary", "success", project_id, details=json.dumps(result)[:2000]); return result
         except (RuntimeErrorBase, OSError) as exc: store.audit("human_summary", "failure", project_id, details=str(exc)[:200]); return _error(502, "human summary failed")
 
@@ -1381,10 +1385,22 @@ def create_app(
         payload = await request.json()
         if not isinstance(payload, dict) or payload.get("confirm") != project["name"]: return _error(409, "project-name confirmation required")
         stop_workers = payload.get("stop_workers")
+        paper_id = payload.get("paper_id")
+        fact_ids = payload.get("fact_ids")
+        instructions = payload.get("instructions")
+        language = payload.get("language")
         if not isinstance(stop_workers, bool): return _error(400, "stop_workers fork is required")
+        if paper_id is not None and (not isinstance(paper_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", paper_id)): return _error(400, "invalid paper_id")
+        if fact_ids is not None and (not isinstance(fact_ids, list) or len(fact_ids) > 128 or any(not isinstance(fid, str) or len(fid) > 200 for fid in fact_ids)): return _error(400, "fact_ids must be a bounded list of strings")
+        if instructions is not None and (not isinstance(instructions, str) or len(instructions) > 12000): return _error(400, "instructions must be at most 12000 characters")
+        if language is not None and (not isinstance(language, str) or len(language) > 80): return _error(400, "language must be at most 80 characters")
         try:
-            result = await asyncio.to_thread(runtime.write_paper_artifact, project["runtime_name"], paper_id=payload.get("paper_id"), stop_workers=stop_workers, fact_ids=payload.get("fact_ids"), instructions=payload.get("instructions"))
-            store.audit("write_paper", "success", project_id, details=json.dumps({"paper_id": payload.get("paper_id"), "stop_workers": stop_workers})[:2000]); return result
+            result = await asyncio.to_thread(runtime.write_paper_artifact, project["runtime_name"], paper_id=paper_id, stop_workers=stop_workers, fact_ids=fact_ids, instructions=instructions)
+            if result.get("status") != "ok":
+                store.audit("write_paper", "failure", project_id, details=json.dumps(result)[:2000]); return JSONResponse(result, status_code=409 if result.get("status") == "needs_target" else 502)
+            if stop_workers:
+                result["graceful_stop"] = await asyncio.to_thread(runtime.stop_project, project["runtime_name"])
+            store.audit("write_paper", "success", project_id, details=json.dumps({"paper_id": paper_id, "stop_workers": stop_workers})[:2000]); return result
         except (RuntimeErrorBase, OSError, ValueError) as exc: store.audit("write_paper", "failure", project_id, details=str(exc)[:200]); return _error(502, "paper generation failed")
 
     @app.post("/api/projects/{project_id}/artifacts-actions")
@@ -1420,9 +1436,14 @@ def create_app(
         project = project_or_404(project_id)
         if isinstance(project, JSONResponse): return project
         try:
+            projection = runtime.artifacts_projection(project["runtime_name"])
+            allowed_paths = {str(row.get("path") or "") for row in projection.get("files", [])}
+            if artifact_path not in allowed_paths:
+                return _error(404, "artifact not found")
             body, content_type = runtime.artifact_bytes(project["runtime_name"], artifact_path)
             from fastapi.responses import Response
-            return Response(body, media_type=content_type, headers={"Content-Disposition": f'inline; filename="{Path(artifact_path).name}"'})
+            safe_name = quote(Path(artifact_path).name, safe="._-")
+            return Response(body, media_type=content_type, headers={"Content-Disposition": f"inline; filename*=UTF-8''{safe_name}"})
         except (RuntimeErrorBase, RuntimeError, OSError, ValueError): return _error(404, "artifact not found")
 
     @app.get("/api/projects/{project_id}/reports")

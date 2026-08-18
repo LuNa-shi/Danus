@@ -658,8 +658,12 @@ class DanusRuntimeAdapter:
                              stop_workers: bool = False, fact_ids: list[str] | None = None,
                              instructions: str | None = None) -> dict[str, Any]:
         from danus.write_paper.server import paper_write
-        return paper_write(project=str(self._project_dir(runtime_name)), paper_id=paper_id,
-                           stop_workers=stop_workers, fact_ids=fact_ids, instructions=instructions)
+        result = paper_write(project=str(self._project_dir(runtime_name)), paper_id=paper_id,
+                             stop_workers=False, fact_ids=fact_ids, instructions=instructions)
+        if stop_workers and result.get("status") == "ok":
+            result["graceful_stop_requested"] = True
+            result["graceful_stop"] = "host supervisor must execute the confirmed stop intent"
+        return result
 
     def finalize_suggestions(self, runtime_name: str) -> dict[str, Any]:
         from danus.core import FactGraph
@@ -699,15 +703,17 @@ class DanusRuntimeAdapter:
                 rel = str(relative)
                 seen.add(rel)
                 lower = rel.lower()
-                kind = "target" if relative.name == "TARGET.md" else "report" if rel.startswith("report/") or rel.startswith("reports/") else "paper" if rel.startswith("paper/") or rel.startswith("papers/") else "output"
+                kind = "target" if relative.name == "TARGET.md" else "verification-ledger" if relative.name.upper() in {"VERIFY_LEDGER.MD", "REFERENCE_LEDGER.MD"} else "report" if rel.startswith("report/") or rel.startswith("reports/") else "paper" if rel.startswith("paper/") or rel.startswith("papers/") else "output"
                 rows.append({"path": rel, "name": relative.name, "size": size, "kind": kind, "content_type": "application/pdf" if lower.endswith(".pdf") else "text/plain" if lower.endswith((".md", ".txt", ".log")) else "text/latex" if lower.endswith((".tex", ".ltx")) else "application/octet-stream"})
         return {"files": rows}
 
     def artifact_bytes(self, runtime_name: str, relative: str, *, max_bytes: int = 2 * 1024 * 1024) -> tuple[bytes, str]:
         root = self._project_dir(runtime_name)
-        if not relative or Path(relative).is_absolute() or "\\" in relative or any(part in {"", ".", ".."} for part in Path(relative).parts):
+        relative_path = Path(relative)
+        allowed = relative == "TARGET.md" or relative_path.parts[0] in {"report", "paper", "papers", "outputs", "reports"}
+        if not allowed or not relative or relative_path.is_absolute() or "\\" in relative or any(part in {"", ".", ".."} for part in relative_path.parts):
             raise RuntimeOperationError("invalid artifact path")
-        path = root / relative
+        path = root / relative_path
         resolved = path.resolve()
         if root not in resolved.parents or path.is_symlink() or not path.is_file():
             raise RuntimeOperationError("artifact not found")
