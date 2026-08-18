@@ -26,6 +26,7 @@ const state = {
   reports: { files: [] },
   outputs: { files: [] },
   runtime: {},
+  runtimeError: null,
   config: {},
   orchestration: {},
   activeWorker: null,
@@ -108,8 +109,8 @@ function renderRunBudget() {
     custom.value = hasPreset ? "" : String(Number((duration / 3600).toFixed(4)));
     custom.hidden = hasPreset;
     customWrap.hidden = hasPreset;
-    preview.className = "run-budget-preview active";
-    preview.textContent = `已选择 ${formatRunBudget(duration)} · 截止 ${formatDeadline(activeRun.deadline)}`;
+    preview.className = `run-budget-preview active${state.runtimeError ? " stale" : ""}`;
+    preview.textContent = `已选择 ${formatRunBudget(duration)} · 截止 ${formatDeadline(activeRun.deadline)}${state.runtimeError ? " · 状态刷新失败，显示上次成功获取的 Run Budget 与 Deadline" : ""}`;
     return;
   }
   custom.hidden = preset.value !== "custom";
@@ -120,8 +121,8 @@ function renderRunBudget() {
     preview.textContent = budget.error;
     return;
   }
-  preview.className = "run-budget-preview";
-  preview.textContent = `${formatRunBudget(budget.seconds)} · 如果现在启动，预计截止 ${formatDeadline(Date.now() / 1000 + budget.seconds)}`;
+  preview.className = `run-budget-preview${state.runtimeError ? " stale" : ""}`;
+  preview.textContent = `${formatRunBudget(budget.seconds)} · 如果现在启动，预计截止 ${formatDeadline(Date.now() / 1000 + budget.seconds)}${state.runtimeError ? " · 运行状态暂不可用" : ""}`;
 }
 
 function lifecycleIntentMessage(action, worker) {
@@ -1089,6 +1090,7 @@ async function openProject(id) {
   state.activeWorker = null;
   state.workers = [];
   state.runtime = {};
+  state.runtimeError = null;
   state.orchestration = {};
   state.logs = [];
   state.logMetaByWorker = {};
@@ -2069,17 +2071,19 @@ function updateRuntime() {
   const runState = $("run-state");
   if (runState) runState.textContent = progressText;
   const detail = $("run-progress-detail");
-  if (detail) detail.textContent = activeRun
-    ? `${progress.stop_pending_workers} stop pending · ${progress.stopped_workers} stopped · ${progress.stale_workers} stale`
-    : "主 agent 负责正常方向与分工；此处仅显示 host-observed lifecycle state。";
+  if (detail) detail.textContent = state.runtimeError
+    ? "运行状态刷新失败；显示上次成功获取的 Run Budget 与 Deadline。"
+    : activeRun
+      ? `${progress.stop_pending_workers} stop pending · ${progress.stopped_workers} stopped · ${progress.stale_workers} stale`
+      : "主 agent 负责正常方向与分工；此处仅显示 host-observed lifecycle state。";
   const bar = $("run-progress-bar");
   if (bar) bar.style.width = `${progress.expected_workers ? Math.min(100, Math.round((progress.stopped_workers / progress.expected_workers) * 100)) : 0}%`;
   const start = $("run-start");
   const mainAgentBusy = Boolean(currentPendingMessage());
   const budget = currentRunBudgetSelection();
   if (start) {
-    start.disabled = Boolean(activeRun || live || !ready || mainAgentBusy || !budget.valid);
-    start.title = !budget.valid ? budget.error : mainAgentBusy ? "等待当前 Main Agent 回复完成" : ready ? `以 ${formatRunBudget(budget.seconds)} Run Budget 启动 Worker swarm` : "先让 Main Agent 完成所有 Worker 的 TASK.md 分工";
+    start.disabled = Boolean(activeRun || live || !ready || mainAgentBusy || !budget.valid || Boolean(state.runtimeError));
+    start.title = state.runtimeError ? "运行状态暂不可用；保留上次 Run Budget 与 Deadline 并禁止重复启动" : !budget.valid ? budget.error : mainAgentBusy ? "等待当前 Main Agent 回复完成" : ready ? `以 ${formatRunBudget(budget.seconds)} Run Budget 启动 Worker swarm` : "先让 Main Agent 完成所有 Worker 的 TASK.md 分工";
   }
   renderRunBudget();
   renderLifecycleControls();
@@ -2125,7 +2129,12 @@ async function refreshPendingMessages() {
       const projection = workersResult.value;
       state.workers = Array.isArray(projection) ? projection : (projection.workers || []);
     }
-    if (runtimeResult.status === "fulfilled") state.runtime = runtimeResult.value;
+    if (runtimeResult.status === "fulfilled") {
+      state.runtime = runtimeResult.value;
+      state.runtimeError = null;
+    } else {
+      state.runtimeError = runtimeResult.reason;
+    }
     if (orchestrationResult.status === "fulfilled") state.orchestration = orchestrationResult.value;
     if (logsResult.status === "fulfilled" && logsResult.value && logWorkerAtStart) {
       applyLogProjection(logsResult.value, logWorkerAtStart);
@@ -2183,7 +2192,12 @@ async function refreshProject() {
     state.workers = Array.isArray(workersResult) ? workersResult : (workersResult.workers || []);
     state.facts = value(results[3], { nodes: [], edges: [] });
     state.memory = value(results[4], { total: 0, channels: [] });
-    state.runtime = value(results[5], {});
+    if (results[5].status === "fulfilled") {
+      state.runtime = results[5].value;
+      state.runtimeError = null;
+    } else {
+      state.runtimeError = results[5].reason;
+    }
     if (logWorkerAtStart && results[6].status === "fulfilled") {
       applyLogProjection(results[6].value, logWorkerAtStart);
     } else if (logWorkerAtStart) {

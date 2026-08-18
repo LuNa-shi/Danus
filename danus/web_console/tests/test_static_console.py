@@ -720,6 +720,7 @@ def test_operator_can_select_preview_and_submit_a_non_default_run_budget():
         assert token in app
     assert "duration_seconds: 3600" not in app
     assert ".run-budget-control" in css
+    assert "grid-template-columns: minmax(130px, .55fr) minmax(0, 1.2fr) minmax(180px, 1fr)" in css
     assert ".run-budget-preview.error" in css
     assert ".run-budget-control, .lifecycle-controls { grid-template-columns: 1fr" in css
 
@@ -740,3 +741,18 @@ def test_custom_run_budget_validation_is_bounded_and_supports_twelve_hours():
     invalid_script = function + f"\nconsole.log(JSON.stringify({json.dumps(cases[-2:])}.map(([preset, hours]) => runBudgetSelection(preset, hours))));"
     invalid_result = subprocess.run(["node", "-e", invalid_script], check=True, capture_output=True, text=True)
     assert json.loads(invalid_result.stdout) == [case[2] for case in cases[-2:]]
+
+
+def test_runtime_poll_failure_preserves_last_good_run_budget_and_disables_start():
+    app = _asset("app.js")
+    css = _asset("style.css")
+
+    assert "runtimeError: null" in app
+    assert 'if (results[5].status === "fulfilled")' in app
+    assert "state.runtimeError = results[5].reason" in app
+    assert "state.runtime = value(results[5], {})" not in app
+    assert 'if (runtimeResult.status === "fulfilled")' in app
+    assert "state.runtimeError = runtimeResult.reason" in app
+    assert "显示上次成功获取的 Run Budget 与 Deadline" in app
+    assert "Boolean(state.runtimeError)" in app
+    assert ".run-budget-preview.stale" in css
