@@ -713,6 +713,8 @@ def test_operator_can_select_preview_and_submit_a_non_default_run_budget():
         'id="run-budget-preview"',
         "预计截止",
         "已选择",
+        "activeRun.duration_seconds",
+        "[...preset.options].some",
         "duration_seconds: budget.seconds",
     ):
         assert token in app

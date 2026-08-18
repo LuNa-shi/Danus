@@ -98,16 +98,22 @@ function renderRunBudget() {
   const preview = $("run-budget-preview");
   if (!preset || !custom || !customWrap || !preview) return;
   const activeRun = state.runtime.run;
-  custom.hidden = preset.value !== "custom";
-  customWrap.hidden = preset.value !== "custom";
   preset.disabled = Boolean(activeRun);
   custom.disabled = Boolean(activeRun);
   if (activeRun) {
     const duration = Number(activeRun.duration_seconds || Math.max(0, Number(activeRun.deadline || 0) - Number(activeRun.started_at || 0)));
+    const presetValue = String(duration);
+    const hasPreset = [...preset.options].some((option) => option.value === presetValue);
+    preset.value = hasPreset ? presetValue : "custom";
+    custom.value = hasPreset ? "" : String(Number((duration / 3600).toFixed(4)));
+    custom.hidden = hasPreset;
+    customWrap.hidden = hasPreset;
     preview.className = "run-budget-preview active";
     preview.textContent = `已选择 ${formatRunBudget(duration)} · 截止 ${formatDeadline(activeRun.deadline)}`;
     return;
   }
+  custom.hidden = preset.value !== "custom";
+  customWrap.hidden = preset.value !== "custom";
   const budget = currentRunBudgetSelection();
   if (!budget.valid) {
     preview.className = "run-budget-preview error";
