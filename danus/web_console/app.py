@@ -43,6 +43,27 @@ class AppSettings:
 def _error(status: int, detail: str) -> JSONResponse:
     return JSONResponse({"detail": detail}, status_code=status)
 
+
+def _public_main_agent_error(exc: MainAgentError) -> str:
+    if exc.code == "timeout" and not exc.safe_to_retry:
+        return "Main Agent 执行超时；可能已有部分操作完成。请先检查执行记录，不要直接重试，以免重复操作。"
+    if exc.retryable and not exc.safe_to_retry:
+        return "上游中断发生在执行过程中；已保留会话。请先检查执行记录，再发送明确后续指令，避免重复操作。"
+    messages = {
+        "server_overloaded": "上游模型当前繁忙；自动重试后仍未完成，请稍后再试。",
+        "rate_limit_exceeded": "上游请求频率受限；自动重试后仍未完成，请稍后再试。",
+        "service_unavailable": "上游模型服务暂时不可用，请稍后再试。",
+        "upstream_timeout": "上游模型响应超时，请稍后再试。",
+        "request_timeout": "上游模型响应超时，请稍后再试。",
+        "timeout": "上游模型响应超时，请稍后再试。",
+    }
+    if exc.code in messages:
+        return messages[exc.code]
+    if str(exc) == "main agent turn timed out":
+        return "Main Agent 本次执行超时，请稍后重试。"
+    return "Main Agent 未能完成本次回复；请稍后重试或联系管理员。"
+
+
 def _runtime_name(name: str) -> str:
     # Keep runtime names path-safe and stable; DB ids are opaque to clients.
     validate_runtime_name(name)
@@ -834,6 +855,16 @@ def create_app(
             return project
         return store.messages(project_id)
 
+    @app.get("/api/projects/{project_id}/main-agent-events")
+    async def list_main_agent_events(project_id: str, request: Request, after: int = 0, limit: int = 1000):
+        if isinstance((auth := auth_required(request)), JSONResponse):
+            return auth
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse):
+            return project
+        events = store.main_agent_events(project_id, after_id=after, limit=limit)
+        return {"events": events, "last_id": events[-1]["id"] if events else max(0, after)}
+
     @app.post("/api/projects/{project_id}/messages")
     async def send_message(project_id: str, request: Request):
         current = auth_required(request)
@@ -870,37 +901,126 @@ def create_app(
         message_id = uuid.uuid4().hex
         now = time.time()
         store.add_message({"id": message_id, "project_id": project_id, "role": "user", "text": text, "status": "submitted", "created_at": now, "error": None}, [row["id"] for row in attachment_rows])
-        existing_session = store.agent_session(project_id) or {}
-        existing_session_id = existing_session.get("session_id") if existing_session.get("backend") == main_agent_backend else None
-        store.upsert_agent_session(project_id, existing_session_id, "active", now, backend=main_agent_backend)
-        try:
-            manifest = [metadata(row) for row in store.files(project_id)]
-            # Re-read the session identity inside the serialized worker call so
-            # concurrent browser submits cannot fork the logical session.
+        manifest = [metadata(row) for row in store.files(project_id)]
+
+        def record_main_agent_progress(event: dict[str, Any]) -> None:
+            event_type = str(event.get("type") or "")
+            allowed_types = {
+                "turn.started", "agent.message", "tool.started", "tool.completed",
+                "turn.retry", "turn.completed", "turn.failed",
+            }
+            if event_type in allowed_types:
+                safe_payload: dict[str, Any] = {}
+                for key in ("tool", "detail", "status"):
+                    value = event.get(key)
+                    if value is not None:
+                        safe_payload[key] = str(value)[:4000 if key == "detail" else 200]
+                for key in ("attempt", "max_attempts", "delay_seconds"):
+                    value = event.get(key)
+                    if isinstance(value, (int, float)):
+                        safe_payload[key] = value
+                store.add_main_agent_event(
+                    project_id=project_id, message_id=message_id,
+                    event_type=event_type, payload=safe_payload,
+                )
+
+            if event.get("status") != "retrying":
+                return
+            attempt = max(1, int(event.get("attempt") or 1))
+            max_attempts = max(attempt, int(event.get("max_attempts") or attempt))
+            delay = max(0.0, float(event.get("delay_seconds") or 0.0))
+            detail = (
+                f"上游模型繁忙，正在自动续接（第 {attempt}/{max_attempts} 次尝试"
+                f"，{delay:g} 秒后继续）"
+            )
+            store.update_message(message_id, status="retrying", error=detail[:200])
+            progress_session_id = event.get("session_id")
+            if progress_session_id:
+                store.upsert_agent_session(
+                    project_id, str(progress_session_id), "active", time.time(),
+                    backend=main_agent_backend,
+                )
+
+        async with lock_for(project_id):
+            session = store.agent_session(project_id) or {}
+            session_id = session.get("session_id") if session.get("backend") == main_agent_backend else None
+            store.upsert_agent_session(
+                project_id, session_id, "active", time.time(), backend=main_agent_backend,
+            )
+
             def invoke_main_agent():
-                session = store.agent_session(project_id) or {}
-                return main_agent.send(context_dir=runtime.project_context_dir(project["runtime_name"]), session_id=session.get("session_id") if session.get("backend") == main_agent_backend else None, message=text, manifest=manifest, project_state={"project_id": project_id, "name": project["name"], "problem": project["problem"]}, attachments=attachments)
-            async def invoke_serialized():
-                async with lock_for(project_id):
-                    return await asyncio.to_thread(invoke_main_agent)
-            result = await invoke_serialized()
-            if result.get("read_status") == "read":
-                for row in attachment_rows:
-                    store.update_file_status(row["id"], read_status="read")
-            store.update_message(message_id, status="completed")
-            store.upsert_agent_session(project_id, result["session_id"], "inactive", time.time(), backend=main_agent_backend)
-            reply_id = uuid.uuid4().hex
-            store.add_message({"id": reply_id, "project_id": project_id, "role": "assistant", "text": result["reply"], "status": "completed", "created_at": time.time(), "error": None})
-            store.audit("message", "success", project_id)
-            return JSONResponse({"message_id": message_id, "reply_id": reply_id, **result}, status_code=201)
-        except Exception as exc:
-            store.update_message(message_id, status="failed", error=str(exc)[:200])
-            failed_session = store.agent_session(project_id) or {}
-            failed_session_id = failed_session.get("session_id") if failed_session.get("backend") == main_agent_backend else None
-            store.upsert_agent_session(project_id, failed_session_id, "inactive", time.time(), backend=main_agent_backend)
-            store.audit("message", "failure", project_id)
-            store.add_message({"id": uuid.uuid4().hex, "project_id": project_id, "role": "assistant", "text": "", "status": "failed", "created_at": time.time(), "error": str(exc)[:200]})
-            return _error(502, "main agent message failed")
+                return main_agent.send(
+                    context_dir=runtime.project_context_dir(project["runtime_name"]),
+                    session_id=session_id,
+                    message=text,
+                    manifest=manifest,
+                    project_state={"project_id": project_id, "name": project["name"], "problem": project["problem"]},
+                    attachments=attachments,
+                    on_progress=record_main_agent_progress,
+                )
+
+            try:
+                result = await asyncio.to_thread(invoke_main_agent)
+                if result.get("read_status") == "read":
+                    for row in attachment_rows:
+                        store.update_file_status(row["id"], read_status="read")
+                store.update_message(message_id, status="completed")
+                store.upsert_agent_session(
+                    project_id, result["session_id"], "inactive", time.time(),
+                    backend=main_agent_backend,
+                )
+                reply_id = uuid.uuid4().hex
+                store.add_message({
+                    "id": reply_id, "project_id": project_id,
+                    "role": "assistant", "text": result["reply"], "status": "completed",
+                    "created_at": time.time(), "error": None,
+                })
+                store.audit("message", "success", project_id)
+                return JSONResponse({
+                    "message_id": message_id, "reply_id": reply_id, **result,
+                }, status_code=201)
+            except Exception as exc:
+                known_failure = isinstance(exc, MainAgentError)
+                public_error = _public_main_agent_error(exc) if known_failure else "Main Agent 内部错误；请联系管理员。"
+                error_code = getattr(exc, "code", None) if known_failure else None
+                provider_retryable = bool(getattr(exc, "retryable", False)) if known_failure else False
+                retryable = bool(getattr(exc, "safe_to_retry", False)) if known_failure else False
+                attempts = max(1, int(getattr(exc, "attempts", 1))) if known_failure else 1
+                store.update_message(message_id, status="failed", error=public_error)
+                last_events = store.main_agent_events(project_id, limit=1)
+                last_event = last_events[-1] if last_events else None
+                if not last_event or last_event.get("message_id") != message_id or last_event.get("type") != "turn.failed":
+                    store.add_main_agent_event(
+                        project_id=project_id, message_id=message_id,
+                        event_type="turn.failed",
+                        payload={"status": "failed", "detail": public_error[:4000]},
+                    )
+                failed_session = store.agent_session(project_id) or {}
+                failed_session_id = (
+                    getattr(exc, "session_id", None)
+                    or (failed_session.get("session_id") if failed_session.get("backend") == main_agent_backend else None)
+                )
+                store.upsert_agent_session(
+                    project_id, failed_session_id, "inactive", time.time(),
+                    backend=main_agent_backend,
+                )
+                store.audit("message", "failure", project_id, details=json.dumps({
+                    "error_code": error_code, "provider_retryable": provider_retryable,
+                    "retryable": retryable, "attempts": attempts,
+                }, sort_keys=True))
+                store.add_message({
+                    "id": uuid.uuid4().hex, "project_id": project_id,
+                    "role": "assistant", "text": "", "status": "failed",
+                    "created_at": time.time(), "error": public_error,
+                })
+                return JSONResponse({
+                    "detail": public_error,
+                    "error_code": error_code,
+                    "provider_retryable": provider_retryable,
+                    "retryable": retryable,
+                    "attempts": attempts,
+                }, status_code=502)
+
 
     from fastapi.staticfiles import StaticFiles
     app.mount("/static", StaticFiles(directory=Path(__file__).with_name("static")), name="static")

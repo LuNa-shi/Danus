@@ -347,3 +347,43 @@ def test_worker_panel_floats_over_unchanged_layout_and_preserves_direct_transcri
     assert "还没有任务或运行记录。" in app
     assert "Main Agent 分配任务或 Worker 开始运行后" in app
     assert "Main Agent assignment" not in app
+
+
+def test_main_agent_retry_status_is_polled_and_execution_events_are_visible():
+    app = _asset("app.js")
+    css = _asset("style.css")
+
+    assert "pendingTimer: null" in app
+    assert "mainAgentEvents: []" in app
+    assert "function currentPendingMessage()" in app
+    assert "function renderMainAgentEvents(messageId)" in app
+    assert "main-agent-events" in app
+    assert "执行过程" in app
+    assert '"tool.started"' in app
+    assert "async function refreshPendingMessages()" in app
+    assert "state.pendingTimer = window.setInterval" in app
+    assert 'retrying: "上游模型繁忙，正在自动续接"' in app
+    assert 'message.status === "retrying"' in app
+    assert "data-main-agent-continue" not in app
+
+def test_main_agent_polling_recovers_inflight_turns_and_is_project_scoped():
+    app = _asset("app.js")
+
+    for token in (
+        "refreshingProject: null",
+        "pendingRefreshingProject: null",
+        "state.refreshingProject === projectAtStart",
+        "state.pendingRefreshingProject === projectAtStart",
+        "const restoredPending = state.messages.slice().reverse().find",
+        "persisted: true",
+        "if (restoredPending) startPendingPolling()",
+        "const hasTerminalEvent = state.mainAgentEvents.some",
+        "const hasFollowingAssistant = state.messages.some",
+        "persistedTurnTerminal && (hasTerminalEvent || hasFollowingAssistant)",
+        "if (state.current === projectAtStart)",
+        "const followTail = !scroll ||",
+        "scroll.scrollTop = followTail ? scroll.scrollHeight : previousScrollTop",
+    ):
+        assert token in app
+
+    assert 'notify(localMessage.error || "Main Agent 暂时不可用", "error");' in app
