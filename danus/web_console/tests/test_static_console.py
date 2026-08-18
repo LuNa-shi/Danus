@@ -88,14 +88,15 @@ def test_worker_observability_is_structured_and_uses_markdown_transcripts():
     assert "function renderTranscript" in app
     assert '["exec", "apply patch"].includes(lower)' in app
     assert "/^(web search:|patch:\\s)/i" in app
-    assert "renderMarkdown(block.text)" in app
+    assert "renderMarkdown(safeWorkerDisplayText(text))" in app
+    assert "summarizeWorkerToolBlocks" in app
     assert ".map(normalizeLogLine)" in app
     assert ".filter(Boolean)" in app
     assert "<code>${esc(line)}</code>" not in app
     assert ".worker-state.terminal" in css
     assert ".worker-checkpoint" in css
     assert ".worker-metadata" in css
-    assert ".trace-markdown" in css
+    assert ".worker-tool-summary" in css
 
 
 def test_markdown_tables_render_as_safe_structured_tables():
@@ -292,21 +293,20 @@ def test_worker_trace_separates_output_and_collapses_tool_calls():
 
     for token in (
         "function transcriptBlocks",
-        "function toolTitle",
+        "function summarizeWorkerToolBlocks",
         "function renderWorkerMessage",
         'class="message-row assistant worker-message',
-        'class="trace-tool',
-        'data-trace-id="',
+        'class="main-agent-tool-summary worker-tool-summary',
         "rememberDrawerView",
-        "openTools",
         "followTail",
         "followBottom ? trace.scrollHeight",
     ):
         assert token in app
-    assert "<details class=\"trace-tool" in app
+    assert '<details class="trace-tool' not in app
+    assert "data-trace-id" not in app
+    assert "openTools" not in app
     assert ".worker-message .message-bubble" in css
-    assert ".trace-tool > summary" in css
-    assert ".trace-tool-body" in css
+    assert ".worker-tool-summary" in css
 
 
 def test_worker_round_history_is_complete_numeric_selectable_and_scroll_aware():
@@ -324,7 +324,7 @@ def test_worker_round_history_is_complete_numeric_selectable_and_scroll_aware():
         "function latestWorkerRoundSelection",
         "groups[groups.length - 1].round",
         "const selectedRound = latestWorkerRoundSelection(workerName)",
-        "[selectedRound]: { scrollTop: 0, followTail: true, forceBottom: true, openTools: [] }",
+        "[selectedRound]: { scrollTop: 0, followTail: true, forceBottom: true }",
         'const roundTabs = [{ value: "all", label: "全部轮次" }',
         'data-worker-round="${esc(tab.value)}"',
         "function renderWorkerRoundTranscript",
@@ -373,7 +373,7 @@ def test_worker_panel_floats_over_unchanged_layout_and_preserves_direct_transcri
     assert 'renderWorkerMessage("worker", block.text, worker)' in app
     assert 'fromMainAgent ? "Main Agent"' in app
     assert 'fromMainAgent ? "Delegated task" : "Worker"' in app
-    assert '<div class="message-bubble">${renderMarkdown(text)}</div>' in app
+    assert '<div class="message-bubble">${renderMarkdown(safeWorkerDisplayText(text))}</div>' in app
     assert '<div class="trace-list">${renderWorkerRoundTranscript(groups, selectedRound, worker)}</div>' in app
     assert "还没有任务或运行记录。" in app
     assert "Main Agent 分配任务或 Worker 开始运行后" in app
@@ -503,7 +503,7 @@ def test_worker_drawer_keeps_structured_transcript_and_exposes_bounded_raw_logs(
         "max_bytes",
         "日志文件存在，但当前为空",
         "日志获取失败",
-        "本轮日志存在，但 transcript parser 没有可显示消息",
+        "本轮日志有记录，但没有可显示的 Worker 输出",
         "async function refreshWorkerLogs",
         "tail=200&max_bytes=65536",
     ):
@@ -646,3 +646,52 @@ def test_markdown_lists_support_common_markers_nesting_and_continuation_lines():
     assert "<ul><li>第一项<br>续行说明<ul><li>子项 A</li></ul></li>" in rendered
     assert "<li>第二项</li><li>第三项</li></ul>" in rendered
     assert "<ol><li>有序一</li><li>有序二</li></ol>" in rendered
+
+
+def test_worker_transcript_prioritizes_output_and_compacts_tools_like_main_agent():
+    app = _asset("app.js")
+    css = _asset("style.css")
+
+    assert "function summarizeWorkerToolBlocks" in app
+    assert "worker-tool-summary" in app
+    assert '<details class="trace-tool' not in app
+    assert '<pre><code>${esc(block.text)}</code></pre>' not in app
+    assert ".worker-tool-summary" in css
+    assert '<details class="raw-log-panel"' in app
+    assert "原始日志（按需展开）" in app
+    assert "rawLogsWereOpen" in app
+
+
+def test_worker_display_hides_host_temporary_paths_in_transcripts_and_raw_logs():
+    app = _asset("app.js")
+    function = _javascript_function(app, "safeWorkerDisplayText")
+    value = "cat /tmp/rlm-math-issue41-s1-v2-handoff-20260818.md /tmp /tmp/ /var/tmp /dev/shm/result.txt; Use /tmp. /var/tmp: /dev/shm。"
+    script = function + f"\nconsole.log(JSON.stringify(safeWorkerDisplayText({json.dumps(value)})));"
+    result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+    rendered = json.loads(result.stdout)
+
+    assert "/tmp/" not in rendered
+    assert "/var/tmp/" not in rendered
+    assert rendered == "cat [临时文件] [临时文件] [临时文件] [临时文件] [临时文件]; Use [临时文件]. [临时文件]: [临时文件]。"
+    assert "safeWorkerDisplayText(entry.lines.join" in app
+    assert "renderMarkdown(safeWorkerDisplayText(text))" in app
+    assert "safeWorkerDisplayText(compactValue(worker.task" in app
+
+
+def test_worker_tool_summary_is_one_line_and_contains_no_command_or_path_detail():
+    app = _asset("app.js")
+    functions = "\n".join((
+        _javascript_function(app, "summarizeWorkerToolBlocks"),
+    ))
+    blocks = [
+        {"kind": "tool", "status": "completed", "text": "cat /tmp/private-handoff.md"},
+        {"kind": "tool", "status": "failed", "text": "python /tmp/fail.py"},
+        {"kind": "mcp", "status": "completed", "title": "danus/fact_submit"},
+    ]
+    script = functions + f"\nconsole.log(JSON.stringify(summarizeWorkerToolBlocks({json.dumps(blocks)})));"
+    result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+    rendered = json.loads(result.stdout)
+
+    assert rendered == "工具活动 · 命令 × 2 · MCP · 1 个失败"
+    assert "/tmp/" not in rendered
+    assert "cat" not in rendered

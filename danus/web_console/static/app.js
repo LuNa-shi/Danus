@@ -385,19 +385,26 @@ function textFromEventValue(value) {
   return "";
 }
 
+function safeWorkerDisplayText(value) {
+  return String(value ?? "").replace(
+    /(?:\/(?:var\/)?tmp|\/dev\/shm)(?:\/[^\s"'`<>()\[\]{},;!?]*)?(?=$|[\s"'`<>()\[\]{},;!?.:，。；：！？])/g,
+    "[临时文件]",
+  );
+}
+
 function normalizeLogLine(line) {
   const text = String(line ?? "").trim();
   if (!text) return "";
-  if (!text.startsWith("{")) return text;
+  if (!text.startsWith("{")) return safeWorkerDisplayText(text);
   try {
     const event = JSON.parse(text);
     const payload = event.payload || event.item || event;
     const parsed = textFromEventValue(payload);
-    if (parsed) return parsed;
+    if (parsed) return safeWorkerDisplayText(parsed);
   } catch {
-    return text;
+    return safeWorkerDisplayText(text);
   }
-  return text;
+  return safeWorkerDisplayText(text);
 }
 
 function workerRoundLogGroups(workerName) {
@@ -505,7 +512,7 @@ function renderRawWorkerLog(workerName, selectedName) {
   const rawBody = entry.empty
     ? '<div class="raw-log-empty"><strong>日志文件存在，但当前为空。</strong><span>Worker 可能尚未写入第一行。</span></div>'
     : entry.lines?.length
-      ? `<pre class="raw-log-tail"><code>${esc(entry.lines.join("\n"))}</code></pre>`
+      ? `<pre class="raw-log-tail"><code>${esc(safeWorkerDisplayText(entry.lines.join("\n")))}</code></pre>`
       : '<div class="raw-log-empty"><strong>日志存在，但 bounded tail 没有返回完整行。</strong><span>可刷新后重试。</span></div>';
   return `${errorMarkup}<div class="raw-log-tabs" role="tablist" aria-label="选择 raw Worker log">${tabs}</div><div class="raw-log-metadata"><span><strong>Source</strong>${esc(entry.name)}</span><span><strong>Kind</strong>${esc(entry.kind || "other")}</span><span><strong>Size</strong>${esc(formatBytes(entry.size))}</span><span><strong>Modified</strong>${esc(modified)}</span><span><strong>Returned</strong>${esc(entry.returned_lines || 0)} lines</span><span><strong>Bounds</strong>tail ${esc(meta.tail || 200)} · ${esc(formatBytes(meta.max_bytes || 65536))}</span><span><strong>Refresh</strong>${esc(refreshed)}</span><span><strong>Truncation</strong>${entry.truncated ? "truncated" : "complete within bounds"}</span></div>${rawBody}`;
 }
@@ -601,11 +608,17 @@ function transcriptBlocks(lines) {
   return blocks;
 }
 
-function toolTitle(block) {
-  if (block.title) return block.title;
-  const first = String(block.text || "").split("\n").find(Boolean) || "工具调用";
-  const shell = first.match(/\/bin\/(?:zsh|bash|sh)\s+-lc\s+["'](.+?)["']\s+in\s+/);
-  return shortText(shell?.[1] || first.replace(/\s+in\s+\/.*$/, ""), 105);
+function summarizeWorkerToolBlocks(blocks) {
+  if (!blocks.length) return null;
+  const commandCount = blocks.filter((block) => block.kind !== "mcp").length;
+  const mcpCount = blocks.filter((block) => block.kind === "mcp").length;
+  const failed = blocks.filter((block) => block.status === "failed" || /(?:failed|error|non-zero|exited with)/i.test(block.text || "")).length;
+  const running = blocks.filter((block) => block.status === "running").length;
+  const tools = [];
+  if (commandCount) tools.push(`命令${commandCount > 1 ? ` × ${commandCount}` : ""}`);
+  if (mcpCount) tools.push(`MCP${mcpCount > 1 ? ` × ${mcpCount}` : ""}`);
+  const status = failed ? `${failed} 个失败` : running ? `${running} 个执行中` : "已完成";
+  return `工具活动 · ${tools.join(" · ")} · ${status}`;
 }
 
 function renderWorkerMessage(role, text, worker) {
@@ -613,7 +626,7 @@ function renderWorkerMessage(role, text, worker) {
   const avatarClass = fromMainAgent ? "main-agent-avatar" : workerIdentityClass(worker);
   const avatar = fromMainAgent ? "M" : initials(worker?.worker);
   const label = fromMainAgent ? "Main Agent" : compactValue(worker?.worker, "Worker");
-  return `<article class="message-row assistant worker-message ${fromMainAgent ? "worker-assignment" : "worker-response"}"><div class="message-avatar ${avatarClass}">${esc(avatar)}</div><div class="message-content"><div class="message-meta"><strong>${esc(label)}</strong><span>${fromMainAgent ? "Delegated task" : "Worker"}</span></div><div class="message-bubble">${renderMarkdown(text)}</div></div></article>`;
+  return `<article class="message-row assistant worker-message ${fromMainAgent ? "worker-assignment" : "worker-response"}"><div class="message-avatar ${avatarClass}">${esc(avatar)}</div><div class="message-content"><div class="message-meta"><strong>${esc(label)}</strong><span>${fromMainAgent ? "Delegated task" : "Worker"}</span></div><div class="message-bubble">${renderMarkdown(safeWorkerDisplayText(text))}</div></div></article>`;
 }
 
 function renderTranscript(lines, worker, options = {}) {
@@ -622,19 +635,21 @@ function renderTranscript(lines, worker, options = {}) {
   if (options.includeAssignment !== false && worker?.assigned === true && String(worker.task || "").trim()) {
     visible.unshift({ id: "assignment", kind: "assignment", text: worker.task });
   }
-  const rendered = visible.map((block) => {
-    if (block.kind === "assignment") return renderWorkerMessage("main-agent", block.text, worker);
-    if (block.kind === "agent") {
-      return renderWorkerMessage("worker", block.text, worker);
-    }
-    const isMcp = block.kind === "mcp";
-    const failed = block.status === "failed" || /(?:failed|error|non-zero|exited with)/i.test(block.text || "");
-    const status = failed ? "失败" : block.status === "running" ? "运行中" : "完成";
-    const body = isMcp ? `<div class="trace-markdown">${renderMarkdown(block.text)}</div>` : `<pre><code>${esc(block.text)}</code></pre>`;
-    return `<details class="trace-tool ${isMcp ? "mcp" : "shell"} ${failed ? "failed" : ""}" data-trace-id="${esc(`${options.idPrefix || ""}${block.id}`)}"><summary><span class="trace-tool-icon">${isMcp ? "M" : "›_"}</span><span class="trace-tool-copy"><strong>${esc(toolTitle(block))}</strong><small>${isMcp ? "Danus MCP" : "Shell / tool"}</small></span><span class="trace-tool-status">${status}</span><span class="trace-tool-chevron">⌄</span></summary><div class="trace-tool-body">${body}</div></details>`;
-  }).join("");
+  const outputMarkup = visible
+    .filter((block) => ["assignment", "agent"].includes(block.kind))
+    .map((block) => block.kind === "assignment"
+      ? renderWorkerMessage("main-agent", block.text, worker)
+      : renderWorkerMessage("worker", block.text, worker))
+    .join("");
+  const toolSummary = summarizeWorkerToolBlocks(
+    visible.filter((block) => !["assignment", "agent"].includes(block.kind)),
+  );
+  const toolMarkup = toolSummary
+    ? `<div class="main-agent-tool-summary worker-tool-summary" title="${esc(toolSummary)}"><i></i><span>${esc(toolSummary)}</span></div>`
+    : "";
+  const rendered = `${outputMarkup}${toolMarkup}`;
   if (rendered || options.emptyMarkup === false) return rendered;
-  return '<div class="drawer-empty"><span>⌁</span><p>还没有任务或运行记录。</p><small>Main Agent 分配任务或 Worker 开始运行后，完整对话会显示在这里。</small></div>';
+  return '<div class="drawer-empty"><span>⌁</span><p>还没有任务或运行记录。</p><small>Main Agent 分配任务或 Worker 开始运行后，Worker 输出会显示在这里。</small></div>';
 }
 
 function renderWorkerRoundTranscript(groups, selectedRound, worker) {
@@ -648,8 +663,7 @@ function renderWorkerRoundTranscript(groups, selectedRound, worker) {
       emptyMarkup: false,
       idPrefix: `round-${group.round}-`,
     });
-    const sources = group.entries.map((entry) => entry.name).join(" · ");
-    return `<section class="round-transcript-group" data-round="${esc(group.round)}"><div class="round-transcript-heading"><strong>第 ${esc(group.round)} 轮</strong><small>${esc(group.lines.length)} 行 · ${esc(sources)}</small></div>${transcript || '<div class="round-log-empty">本轮日志存在，但 transcript parser 没有可显示消息；请查看下方 raw tail。</div>'}</section>`;
+    return `<section class="round-transcript-group" data-round="${esc(group.round)}"><div class="round-transcript-heading"><strong>第 ${esc(group.round)} 轮</strong><small>Worker 输出与工具摘要</small></div>${transcript || '<div class="round-log-empty">本轮日志有记录，但没有可显示的 Worker 输出；可按需展开下方原始日志。</div>'}</section>`;
   }).join("");
   if (assignment || rounds) return `${assignment}${rounds}`;
   return renderTranscript([], worker);
@@ -1184,7 +1198,7 @@ function renderWorkers() {
     const desired = workerDesiredState(worker);
     const selected = state.activeWorker === worker.worker;
     const action = workerCurrentAction(worker);
-    const task = worker.assigned === false ? "尚未由 Main Agent 分工" : compactValue(worker.task, "等待任务投影");
+    const task = worker.assigned === false ? "尚未由 Main Agent 分工" : safeWorkerDisplayText(compactValue(worker.task, "等待任务投影"));
     return `<button class="worker-card ${selected ? "is-selected" : ""}" data-worker="${esc(worker.worker)}">
       <span class="worker-avatar ${workerIdentityClass(worker)}">${esc(initials(worker.worker))}</span>
       <span class="worker-card-copy">
@@ -1213,7 +1227,7 @@ function openWorkerDrawer(workerName) {
     selectedRound,
     selectedRawLog: latestRawLogSelection(workerName),
     positions: {
-      [selectedRound]: { scrollTop: 0, followTail: true, forceBottom: true, openTools: [] },
+      [selectedRound]: { scrollTop: 0, followTail: true, forceBottom: true },
     },
   };
   setWorkerRailOpen(false);
@@ -1243,7 +1257,6 @@ function rememberDrawerView(drawer) {
     scrollTop: trace.scrollTop,
     followTail: isTraceNearBottom(trace),
     forceBottom: false,
-    openTools: [...trace.querySelectorAll("details[data-trace-id][open]")].map((node) => node.dataset.traceId),
   };
 }
 
@@ -1254,7 +1267,7 @@ function selectWorkerRound(workerName, selectedRound) {
   rememberDrawerView(drawer);
   const view = state.drawerViews[workerName] || { selectedRound, positions: {} };
   view.selectedRound = selectedRound;
-  view.positions[selectedRound] = { scrollTop: 0, followTail: true, forceBottom: true, openTools: [] };
+  view.positions[selectedRound] = { scrollTop: 0, followTail: true, forceBottom: true };
   state.drawerViews[workerName] = view;
   renderWorkerDrawer({ remember: false });
 }
@@ -1271,6 +1284,7 @@ function renderWorkerDrawer(options = {}) {
   if (!drawer) return;
   if (options.remember !== false) rememberDrawerView(drawer);
   const metadataWasOpen = Boolean(drawer.querySelector(".worker-metadata")?.open);
+  const rawLogsWereOpen = Boolean(drawer.querySelector(".raw-log-panel")?.open);
   const worker = state.workers.find((item) => item.worker === state.activeWorker);
   if (!worker) {
     drawer.hidden = true;
@@ -1285,13 +1299,13 @@ function renderWorkerDrawer(options = {}) {
   const view = state.drawerViews[worker.worker] || { selectedRound: latestRound, selectedRawLog: latestRawLogSelection(worker.worker), positions: {} };
   if (view.selectedRound !== "all" && !groups.some((group) => String(group.round) === view.selectedRound)) {
     view.selectedRound = latestRound;
-    view.positions[latestRound] = { scrollTop: 0, followTail: true, forceBottom: true, openTools: [] };
+    view.positions[latestRound] = { scrollTop: 0, followTail: true, forceBottom: true };
   }
   if (!rawEntries.some((entry) => entry.name === view.selectedRawLog)) view.selectedRawLog = latestRawLogSelection(worker.worker);
   view.positions ||= {};
   const selectedRound = view.selectedRound || latestRound;
   const selectedRawLog = view.selectedRawLog || "";
-  const saved = view.positions[selectedRound] || { scrollTop: 0, followTail: true, forceBottom: true, openTools: [] };
+  const saved = view.positions[selectedRound] || { scrollTop: 0, followTail: true, forceBottom: true };
   view.positions[selectedRound] = saved;
   state.drawerViews[worker.worker] = view;
   const roundTabs = [{ value: "all", label: "全部轮次" }, ...groups.map((group) => ({ value: String(group.round), label: `第 ${group.round} 轮` }))];
@@ -1324,10 +1338,10 @@ function renderWorkerDrawer(options = {}) {
         <div><span>Failures</span><strong>${esc(worker.consecutive_failures || 0)}</strong></div>
         <div><span>Retry</span><strong>${worker.next_retry_at ? esc(formatTime(worker.next_retry_at)) : "—"}</strong></div>
         <div><span>Local memory</span><strong>${esc(worker.local_memory_count || 0)}</strong></div>
-      </div>${checkpoint ? `<section class="worker-checkpoint"><div><span>CHECKPOINT</span><small>${esc(checkpoint.source || "local memory")}${checkpoint.round != null ? ` · round ${esc(checkpoint.round)}` : ""}${checkpoint.fact_id ? ` · fact ${esc(checkpoint.fact_id)}` : ""}</small></div><div class="state-panel-markdown">${renderMarkdown(checkpoint.message)}</div></section>` : ""}</details>
+      </div>${checkpoint ? `<section class="worker-checkpoint"><div><span>CHECKPOINT</span><small>${esc(checkpoint.source || "local memory")}${checkpoint.round != null ? ` · round ${esc(checkpoint.round)}` : ""}${checkpoint.fact_id ? ` · fact ${esc(checkpoint.fact_id)}` : ""}</small></div><div class="state-panel-markdown">${renderMarkdown(safeWorkerDisplayText(checkpoint.message))}</div></section>` : ""}</details>
     <div class="drawer-trace-body">
-      <section class="drawer-section"><div class="drawer-section-heading"><div><p class="eyebrow">STRUCTURED ROUND TRANSCRIPT</p><h3>执行轨迹</h3></div><span>${groups.length ? `${esc(groups.length)} 个保留轮次` : "暂无轮次日志"}</span></div><div class="worker-round-tabs" role="tablist" aria-label="选择 Worker 轮次">${roundTabs.map((tab) => `<button class="worker-round-tab ${tab.value === selectedRound ? "is-active" : ""}" type="button" role="tab" aria-selected="${tab.value === selectedRound ? "true" : "false"}" data-worker-round="${esc(tab.value)}">${esc(tab.label)}</button>`).join("")}</div><div class="trace-list">${renderWorkerRoundTranscript(groups, selectedRound, worker)}</div></section>
-      <section class="raw-log-panel"><div class="drawer-section-heading"><div><p class="eyebrow">RAW BOUNDED LOGS</p><h3>loop.log + retained round logs</h3></div><button class="log-refresh-button" type="button" data-refresh-worker-log="${esc(worker.worker)}" ${state.logsRefreshing === worker.worker ? "disabled" : ""}>${state.logsRefreshing === worker.worker ? "Refreshing…" : "Refresh"}</button></div>${renderRawWorkerLog(worker.worker, selectedRawLog)}</section>
+      <section class="drawer-section"><div class="drawer-section-heading"><div><p class="eyebrow">STRUCTURED WORKER OUTPUT</p><h3>Worker 输出</h3></div><span>${groups.length ? `${esc(groups.length)} 个保留轮次` : "暂无轮次日志"}</span></div><div class="worker-round-tabs" role="tablist" aria-label="选择 Worker 轮次">${roundTabs.map((tab) => `<button class="worker-round-tab ${tab.value === selectedRound ? "is-active" : ""}" type="button" role="tab" aria-selected="${tab.value === selectedRound ? "true" : "false"}" data-worker-round="${esc(tab.value)}">${esc(tab.label)}</button>`).join("")}</div><div class="trace-list">${renderWorkerRoundTranscript(groups, selectedRound, worker)}</div></section>
+      <details class="raw-log-panel" ${rawLogsWereOpen ? "open" : ""}><summary><span><small>RAW BOUNDED LOGS</small><strong>原始日志（按需展开）</strong></span><em>loop.log + round logs</em></summary><div class="raw-log-panel-content"><div class="raw-log-toolbar"><button class="log-refresh-button" type="button" data-refresh-worker-log="${esc(worker.worker)}" ${state.logsRefreshing === worker.worker ? "disabled" : ""}>${state.logsRefreshing === worker.worker ? "Refreshing…" : "Refresh"}</button></div>${renderRawWorkerLog(worker.worker, selectedRawLog)}</div></details>
     </div>
     <div class="drawer-footer"><span class="status-dot ${worker.alive ? "online" : "offline"}"></span><span>${worker.alive ? "identity-matched Worker loop" : `not live · ${esc(processIdentityLabel(worker))}`}</span><span class="drawer-footer-spacer"></span><span>author: ${esc(worker.author || worker.worker)}</span></div>`;
   $("worker-drawer-close").addEventListener("click", closeWorkerDrawer);
@@ -1342,8 +1356,6 @@ function renderWorkerDrawer(options = {}) {
   });
   const trace = drawer.querySelector(".trace-list");
   if (trace) {
-    const open = new Set(saved.openTools || []);
-    trace.querySelectorAll("details[data-trace-id]").forEach((node) => { node.open = open.has(node.dataset.traceId); });
     window.requestAnimationFrame(() => {
       const followBottom = saved.forceBottom || saved.followTail;
       trace.scrollTop = followBottom ? trace.scrollHeight : Math.min(saved.scrollTop || 0, Math.max(0, trace.scrollHeight - trace.clientHeight));
