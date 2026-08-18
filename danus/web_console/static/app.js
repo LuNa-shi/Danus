@@ -976,18 +976,10 @@ async function handleStarterSubmit(event) {
   const button = event.currentTarget.querySelector("button[type=submit]");
   const text = input.value.trim();
   if (!text) return;
-  button.disabled = true;
-  button.classList.add("is-loading");
-  try {
-    const setup = { name: shortProjectName(text), problem: text, roles: "high:1,xhigh:1", model: defaultWorkerModel() || null, max_parallel_workers: defaultParallelWorkers() };
-    const project = await createProject(setup);
-    await sendMessageText(mainAgentInitializationMessage(setup));
-    notify(`已创建项目「${project.name}」`, "success");
-  } catch (error) {
-    notify(error.message || "项目创建失败", "error");
-    button.disabled = false;
-    button.classList.remove("is-loading");
-  }
+  $("project-name").value = shortProjectName(text);
+  $("problem").value = text;
+  openProjectModal();
+  notify("请选择并确认 Worker roster 后创建项目");
 }
 
 function renderProjectShell(project) {
@@ -1273,6 +1265,7 @@ function renderMainAgentControl() {
   const guidanceTransport = snapshot.guidance_transport || configuredStrategyTransport();
   const guidanceLabels = { "offline-main-agent": "offline Main-Agent guidance", "consult-derived": "consult-derived guidance", unknown: "guidance with unknown provenance" };
   const guidanceLabel = guidanceLabels[guidanceSource] || guidanceLabels.unknown;
+  const guidanceConfirmable = ["offline-main-agent", "consult-derived"].includes(guidanceSource);
   const sessionStatus = currentPendingMessage() ? "active" : (main.status || snapshot.main_agent_status || (state.messages.some((message) => message.role === "assistant" && message.status === "completed") ? "inactive" : "not_started"));
   const activeRun = state.runtime.run;
   const statusLabels = { active: "会话执行中", inactive: "会话可恢复", not_started: "尚未激活", failed: "上次会话失败" };
@@ -1280,6 +1273,7 @@ function renderMainAgentControl() {
     { label: "问题讨论", done: sessionStatus !== "not_started", hint: sessionStatus === "not_started" ? "等待首次 Main Agent 对话" : "项目会话已建立" },
     { label: "战略提炼", done: Boolean(elaboration), hint: elaboration ? "已有 elaboration" : "等待真实策略记录" },
     { label: guidanceLabel, done: Boolean(guidance), hint: guidance ? `共享方向已记录 · ${guidanceTransport}` : `等待 ${guidanceLabel} · ${guidanceTransport}` },
+    { label: "初始方向确认", done: snapshot.initial_direction_confirmed === true, warning: Boolean(guidance) && snapshot.initial_direction_confirmed !== true, hint: snapshot.initial_direction_confirmed === true ? "操作员已确认，可派工" : "等待操作员明确确认" },
     { label: "Worker 分工", done: total > 0 && assigned === total, warning: assigned < total, hint: `${assigned} / ${total} 已分配` },
     { label: "监控与汇总", done: Boolean(activeRun), hint: activeRun ? `Run ${activeRun.status}` : "Run 尚未启动" },
   ];
@@ -1289,7 +1283,23 @@ function renderMainAgentControl() {
   container.innerHTML = `<div class="main-agent-control-head"><div class="main-agent-identity"><span class="main-agent-avatar">M</span><div><p class="eyebrow">MAIN AGENT · STRATEGIC ORCHESTRATOR</p><h2>负责 strategy、master guidance、派工与汇总</h2></div></div><div class="main-agent-session ${esc(sessionStatus)}"><i></i><span>${esc(statusLabels[sessionStatus] || sessionStatus)}</span><small>${esc(backend)}</small></div></div>
     <div class="orchestration-steps">${steps.map((step) => `<div class="orchestration-step ${step.done ? "is-done" : ""} ${step.warning ? "is-warning" : ""}"><span class="step-mark">${step.done ? "✓" : step.warning ? "!" : "·"}</span><span><strong>${esc(step.label)}</strong><small>${esc(step.hint)}</small></span></div>`).join("")}</div>
     ${runningUnassigned ? `<div class="orchestration-warning"><strong>当前 Run 在 Main Agent 完成分工前就启动了</strong><span>未分配：${esc(unassigned.join("、") || `${total - assigned} 个 workers`)}。这不是有效的 Danus 策略循环；请先在中间对话要求 Main Agent 完成 consult / guidance / assign。</span></div>` : ""}
-    ${guidance ? `<details class="main-guidance"><summary><span>最新 ${esc(guidanceLabel)}</span><small>guidance_source=${esc(guidanceSource)} · 由 Main Agent 的策略流程写入，不是前端生成</small></summary><div>${renderMarkdown(orchestrationText(guidance))}</div></details>` : ""}`;
+    ${guidance ? `<details class="main-guidance"><summary><span>最新 ${esc(guidanceLabel)}</span><small>guidance_source=${esc(guidanceSource)} · 由 Main Agent 的策略流程写入，不是前端生成</small></summary><div>${renderMarkdown(orchestrationText(guidance))}</div></details>` : ""}
+    ${guidance && guidanceConfirmable && snapshot.initial_direction_confirmed !== true ? `<button type="button" class="button primary" data-confirm-initial-direction>确认初始方向并允许 Main Agent 派工</button>` : ""}`;
+}
+
+async function confirmInitialDirection() {
+  if (!state.current || !state.project) return false;
+  const confirmation = window.prompt(`输入「${state.project.name}」确认初始方向`);
+  if (confirmation !== state.project.name) return false;
+  try {
+    await api(`/api/projects/${state.current}/initial-direction/confirm`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirm: confirmation }),
+    });
+    state.orchestration.initial_direction_confirmed = true;
+    renderMainAgentControl();
+    notify("初始方向已确认；Main Agent 现在可以派工", "success");
+    return await sendMessageText("我确认当前显示的初始方向。请按已确认的 guidance 为所选 Worker roster 分配 TASK.md；先不要启动 Worker swarm。完成后列出每个 Worker 的任务。");
+  } catch (error) { notify(error.message || "初始方向确认失败", "error"); return false; }
 }
 
 function renderWorkers() {
@@ -2351,6 +2361,10 @@ async function deleteProject() {
     notify(error.message || "项目删除失败", "error");
   }
 }
+
+document.addEventListener("click", (event) => {
+  if (event.target.closest("[data-confirm-initial-direction]")) confirmInitialDirection();
+});
 
 $("project-list").addEventListener("click", (event) => {
   const item = event.target.closest("[data-project-id]");

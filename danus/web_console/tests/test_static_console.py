@@ -281,12 +281,20 @@ def test_architecture_correct_main_agent_and_project_configuration_are_visible()
         "consult-derived guidance",
         "guidance_source",
         'snapshot.guidance_source || "unknown"',
+        "initial_direction_confirmed",
+        "data-confirm-initial-direction",
+        "function confirmInitialDirection",
+        "/initial-direction/confirm",
+        "请选择并确认 Worker roster 后创建项目",
         "max_parallel_workers",
         "worker.assigned",
         "/orchestration`",
     ):
         assert token in app
     assert "danus:rail-widths:v1" in app
+    starter = app[app.index("async function handleStarterSubmit"):app.index("function renderProjectShell")]
+    assert 'roles: "high:1,xhigh:1"' not in starter
+    assert '$("problem").value = text' in starter
     assert ".main-agent-control" in css
     assert ".rail-resizer" in css
     assert ".orchestration-warning" in css
