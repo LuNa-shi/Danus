@@ -248,6 +248,7 @@ class MainAgentAdapter:
         *,
         lifecycle_url: str | None = None,
         lifecycle_token: str | None = None,
+        artifact_confirmation_token: str | None = None,
     ) -> dict[str, str]:
         """Build a minimal server-side environment for the Main Agent.
 
@@ -300,6 +301,12 @@ class MainAgentAdapter:
         if lifecycle_url is not None and lifecycle_token is not None:
             env["DANUS_WEB_LIFECYCLE_URL"] = lifecycle_url
             env["DANUS_WEB_LIFECYCLE_TOKEN"] = lifecycle_token
+        if artifact_confirmation_token is not None:
+            if (not isinstance(artifact_confirmation_token, str)
+                    or not artifact_confirmation_token
+                    or len(artifact_confirmation_token) > 512):
+                raise MainAgentError("invalid artifact confirmation capability")
+            env["DANUS_WEB_ARTIFACT_CONFIRMATION_TOKEN"] = artifact_confirmation_token
         # Codex receives the broker wrapper only by its exact environment path;
         # remove the repository bin directory so generic `danus start/stop`
         # cannot be selected from PATH. Claude has an explicit Bash allowlist,
@@ -951,7 +958,8 @@ class MainAgentAdapter:
              attachments: list[dict[str, Any]],
              on_progress: Callable[[dict[str, Any]], None] | None = None,
              lifecycle_url: str | None = None,
-             lifecycle_token: str | None = None) -> dict[str, Any]:
+             lifecycle_token: str | None = None,
+             artifact_confirmation_token: str | None = None) -> dict[str, Any]:
         raw_root = Path(context_dir)
         if raw_root.is_symlink():
             raise MainAgentError("project context directory must not be a symlink")
@@ -965,12 +973,32 @@ class MainAgentAdapter:
             root,
             lifecycle_url=lifecycle_url,
             lifecycle_token=lifecycle_token,
+            artifact_confirmation_token=artifact_confirmation_token,
         )
+        progress_sink = on_progress
+        if artifact_confirmation_token is not None and on_progress is not None:
+            def progress_sink(event: dict[str, Any]) -> None:
+                safe_event = {
+                    key: (
+                        value.replace(artifact_confirmation_token, "<REDACTED>")
+                        if isinstance(value, str) else value
+                    )
+                    for key, value in event.items()
+                }
+                on_progress(safe_event)
         result = self._send_codex(
             root=root, session_id=session_id, prompt=prompt, env=env,
-            on_progress=on_progress,
+            on_progress=progress_sink,
         ) if self.backend == "codex" else self._send_claude(
             root=root, session_id=session_id, prompt=prompt, env=env,
-            on_progress=on_progress,
+            on_progress=progress_sink,
         )
+        if artifact_confirmation_token is not None:
+            result = {
+                key: (
+                    value.replace(artifact_confirmation_token, "<REDACTED>")
+                    if isinstance(value, str) else value
+                )
+                for key, value in result.items()
+            }
         return result

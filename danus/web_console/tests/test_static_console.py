@@ -329,8 +329,18 @@ def test_initialization_message_covers_off_and_enabled_consult_modes():
 
 def test_artifacts_are_typed_and_viewable():
     app = _asset("app.js")
-    for token in ("function artifactTypeLabel", "function artifactHref", "TARGET.md", "human-summary", "paper", "查看 / 下载"):
+    for token in (
+        "function artifactTypeLabel", "function artifactHref", "TARGET.md",
+        "human-summary", "paper", "查看 / 下载", "/artifacts-actions",
+        "artifact_intent_id: artifactIntentId", "sendMessageText(intent.instruction",
+        "无条件清空该项目的全部对话和事件历史、重置 Main Agent Session",
+    ):
         assert token in app
+    assert "DANUS_WEB_ARTIFACT_CONFIRMATION_TOKEN" not in app
+    artifact_action = app.split("async function artifactAction", 1)[1].split(
+        "function artifactHref", 1,
+    )[0]
+    assert "${endpoint}" not in artifact_action
 
 
 def test_worker_trace_separates_output_and_collapses_tool_calls():

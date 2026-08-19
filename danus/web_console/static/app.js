@@ -1892,14 +1892,14 @@ async function artifactAction(action, options = {}) {
   const confirmation = window.prompt(`输入「${state.project.name}」确认 ${action}`);
   if (confirmation !== state.project.name) return;
   try {
+    let payload = { action, confirm: confirmation };
     if (action === "finalize") {
       const rawFacts = window.prompt("输入要记录的已验证 Fact IDs（逗号分隔）") || "";
       const fact_ids = rawFacts.split(",").map((value) => value.trim()).filter(Boolean);
       if (!fact_ids.length) return;
       const paper_id = (window.prompt("Paper ID（默认论文留空）") || "").trim() || null;
-      await api(`/api/projects/${state.current}/finalize`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirm: confirmation, fact_ids, paper_id }) });
+      payload = { ...payload, fact_ids, paper_id };
     } else {
-      const endpoint = action === "human-summary" ? "human-summary" : "write-paper";
       if (action === "human-summary") {
         options.language = (window.prompt("报告语言（留空使用项目默认）") || "").trim() || null;
       } else {
@@ -1908,9 +1908,15 @@ async function artifactAction(action, options = {}) {
         options.fact_ids = selected.length ? selected : null;
         options.instructions = (window.prompt("可选：论文写作说明") || "").trim() || null;
       }
-      await api(`/api/projects/${state.current}/${endpoint}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirm: confirmation, ...options }) });
+      payload = { ...payload, ...options };
     }
-    notify("产物工作流已完成；正在刷新产物", "success"); await refreshProjectData();
+    const intent = await api(`/api/projects/${state.current}/artifacts-actions`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+    });
+    if (!intent?.intent_id || !intent?.instruction) throw new Error("服务端未创建有效的产物确认");
+    const activated = await sendMessageText(intent.instruction, "", intent.intent_id);
+    if (!activated) throw new Error("Main Agent 未能执行已确认的产物操作");
+    notify("Main Agent 已完成产物工作流；正在刷新产物", "success"); await refreshProjectData();
   } catch (error) { notify(error.message || "产物操作失败", "error"); }
 }
 function artifactHref(file) { return `/api/projects/${encodeURIComponent(state.current)}/artifacts/${String(file.path || file.name || "").split("/").map(encodeURIComponent).join("/")}`; }
@@ -2294,7 +2300,7 @@ function setComposerBusy(isBusy) {
   form.querySelector("button[type=submit]").disabled = isBusy;
 }
 
-async function sendMessageText(text, attachmentId = "") {
+async function sendMessageText(text, attachmentId = "", artifactIntentId = null) {
   const clean = String(text || "").trim();
   if (!clean || !state.current || currentPendingMessage()) return false;
   const projectAtStart = state.current;
@@ -2308,7 +2314,7 @@ async function sendMessageText(text, attachmentId = "") {
   $("message").value = "";
   startPendingPolling();
   try {
-    await api(`/api/projects/${projectAtStart}/messages`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: clean, attachment_ids: attachmentId ? [attachmentId] : [] }) });
+    await api(`/api/projects/${projectAtStart}/messages`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: clean, attachment_ids: attachmentId ? [attachmentId] : [], artifact_intent_id: artifactIntentId }) });
     if (state.pendingMessage === localMessage) state.pendingMessage = null;
     if (state.current === projectAtStart) await refreshProject();
     return true;
@@ -2369,6 +2375,16 @@ async function stopRun() {
   }
 }
 
+function uploadFilenameHeader(filename) {
+  const normalized = String(filename || "").normalize("NFC");
+  return Array.from(new TextEncoder().encode(normalized), (byte) => {
+    const character = String.fromCharCode(byte);
+    return /[A-Za-z0-9._~-]/.test(character)
+      ? character
+      : `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+  }).join("");
+}
+
 async function handleUpload(event) {
   event.preventDefault();
   const file = $("upload").files?.[0];
@@ -2376,14 +2392,24 @@ async function handleUpload(event) {
   try {
     const form = new FormData();
     form.append("file", file);
-    const response = await api(`/api/projects/${state.current}/files`, { method: "POST", body: form });
+    let response;
+    try {
+      response = await api(`/api/projects/${state.current}/files`, {
+        method: "POST", headers: { "X-Danus-Upload-Filename": uploadFilenameHeader(file.name) }, body: form,
+      });
+    } catch (error) {
+      if (error.status !== 409 || !error.data?.conflict_id) throw error;
+      response = error.data;
+    }
     if (response.conflict_id) {
       const choice = window.prompt(`文件冲突：${response.current.filename}。输入 replace / new_version / cancel`, "new_version");
-      if (choice) await api(`/api/projects/${state.current}/file-conflicts/${response.conflict_id}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ choice }) });
+      if (!choice) return;
+      if (choice === "replace" && !window.confirm("Replace 会永久删除旧文件字节，并且无条件清空该项目的全部对话和事件历史、重置 Main Agent Session。请先确保所有 Worker 已停止。确定继续？")) return;
+      response = await api(`/api/projects/${state.current}/file-conflicts/${response.conflict_id}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ choice }) });
     }
     $("upload").value = "";
     await refreshProject();
-    notify("资料已加入项目", "success");
+    notify(response.cleanup_pending ? "文件变更已提交，旧字节正在后台清理" : "资料已加入项目", response.cleanup_pending ? "info" : "success");
   } catch (error) {
     notify(error.message || "资料上传失败", "error");
   }

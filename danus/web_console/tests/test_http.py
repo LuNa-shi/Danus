@@ -1,6 +1,7 @@
 """Authenticated Web Console HTTP seam tests for the first vertical slice."""
 from __future__ import annotations
 
+import copy
 import json
 import sqlite3
 import threading
@@ -14,7 +15,9 @@ from danus.execution import layout as L
 from danus.web_console.config import ProviderModelCatalog
 from danus.web_console.app import AppSettings, _public_main_agent_error, create_app
 from danus.web_console.main_agent import MainAgentError
-from danus.web_console.security import hash_password, project_lifecycle_capability
+from danus.web_console.security import (
+    artifact_confirmation_capability, hash_password, project_lifecycle_capability,
+)
 from danus.web_console.store import ConsoleStore
 
 
@@ -89,10 +92,58 @@ class FakeRuntime:
             {**worker, "alive": False, "state": "stopped"}
             for worker in self.statuses.get(runtime_name, [])
         ]
-        return {"workers": self.statuses[runtime_name]}
+        return {
+            "workers": [
+                {**worker, "result": "not-running"}
+                for worker in self.statuses[runtime_name]
+            ],
+        }
 
     def status_project(self, runtime_name):
         return {"config": self.configs.get(runtime_name, {}), "workers": self.statuses.get(runtime_name, [])}
+
+    def worker_exit_projection(self, runtime_name):
+        """Test adapter implementation of the production full-exit contract."""
+        projection = copy.deepcopy(self.status_project(runtime_name))
+        workers = projection.get("workers")
+        if not isinstance(workers, list):
+            return projection
+        terminal = {
+            "created", "deadline", "error", "max_rounds", "reclaimed",
+            "stopped", "terminated",
+        }
+        for index, worker in enumerate(workers):
+            if not isinstance(worker, dict):
+                continue
+            raw_alive = worker.get("raw_alive") is True
+            alive = worker.get("alive") is True
+            worker.setdefault(
+                "process_identity",
+                "matched" if alive else "mismatch" if raw_alive else "dead",
+            )
+            worker.setdefault("alive", False)
+            worker.setdefault("raw_alive", False)
+            if "process_exit_proof" in worker:
+                continue
+            state = str(worker.get("state") or "").lower()
+            if state == "created":
+                source = "never_started"
+                pgid = None
+            else:
+                source = "host_process_group"
+                pgid = 2_000_000_000 + index
+            verified = worker["process_identity"] == "dead" and state in terminal
+            worker["process_exit_proof"] = {
+                "status": "verified_dead" if verified else "blocked",
+                "reason": None if verified else "process_group_live_or_reused",
+                "inspection_complete": True,
+                "source": source,
+                "pgid": pgid,
+                "live_process_count": 0 if verified else 1,
+                "project_reference_count": 0,
+                "descendant_membership_verified": verified,
+            }
+        return projection
 
     def pause_project(self, runtime_name, *, worker=None):
         self.controls.append(("pause", runtime_name, worker))
@@ -222,6 +273,26 @@ def _broker_start(client: TestClient, project: dict, *, secret: bytes = _LIFECYC
 
 def _broker_stop(client: TestClient, project: dict, *, secret: bytes = _LIFECYCLE_SECRET):
     return _broker_lifecycle(client, project, "stop", secret=secret)
+
+
+def _confirmed_artifact_token(client: TestClient, app, project: dict, headers: dict, payload: dict) -> tuple[str, dict]:
+    response = client.post(
+        f"/api/projects/{project['id']}/artifacts-actions",
+        json={"confirm": project["name"], **payload}, headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    public = response.json()
+    assert "token" not in json.dumps(public).lower()
+    row = app.state.console_store.artifact_confirmation_intent(public["intent_id"])
+    assert row is not None
+    dispatched = app.state.console_store.dispatch_artifact_confirmation_intent(
+        row["id"], project["id"], row["actor_session_id"], now=time.time(),
+    )
+    assert dispatched is not None
+    token = artifact_confirmation_capability(
+        _LIFECYCLE_SECRET, row["id"], project["id"], row["action"], row["payload_digest"],
+    )
+    return token, public
 
 
 def test_authentication_cookie_csrf_and_project_boundary(tmp_path: Path):
@@ -738,7 +809,10 @@ def test_project_file_library_dedup_conflict_replace_version_and_cancel(tmp_path
         project = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
         pid = project["id"]
         def upload(name, body):
-            return client.post(f"/api/projects/{pid}/files", files={"file": (name, body)}, headers=headers)
+            return client.post(
+                f"/api/projects/{pid}/files", files={"file": (name, body)},
+                headers={**headers, "X-Danus-Upload-Filename": name},
+            )
         first = upload("notes.md", b"one")
         assert first.status_code == 201 and first.json()["sha256"]
         same = upload("notes.md", b"one")
@@ -749,18 +823,18 @@ def test_project_file_library_dedup_conflict_replace_version_and_cancel(tmp_path
         replaced = client.post(f"/api/projects/{pid}/file-conflicts/{conflict_data['conflict_id']}", json={"choice": "replace"}, headers=headers)
         assert replaced.status_code == 200 and replaced.json()["current"] is True
         files = client.get(f"/api/projects/{pid}/files").json()
-        assert len(files) == 2 and sum(f["current"] for f in files) == 1
+        assert len(files) == 1 and sum(f["current"] for f in files) == 1
         conflict2 = upload("notes.md", b"three")
         assert conflict2.status_code == 409
         versioned = client.post(f"/api/projects/{pid}/file-conflicts/{conflict2.json()['conflict_id']}", json={"choice": "new_version"}, headers=headers)
         assert versioned.status_code == 200
         files = client.get(f"/api/projects/{pid}/files").json()
-        assert len(files) == 3 and sum(f["current"] for f in files) == 1
+        assert len(files) == 2 and sum(f["current"] for f in files) == 1
         conflict3 = upload("notes.md", b"four")
         assert conflict3.status_code == 409
         cancelled = client.post(f"/api/projects/{pid}/file-conflicts/{conflict3.json()['conflict_id']}", json={"choice": "cancel"}, headers=headers)
         assert cancelled.status_code == 200
-        assert len(client.get(f"/api/projects/{pid}/files").json()) == 3
+        assert len(client.get(f"/api/projects/{pid}/files").json()) == 2
         assert runtime.started == []
 
 
@@ -769,7 +843,11 @@ def test_cancelled_or_replaced_hash_can_be_uploaded_again(tmp_path: Path):
     with TestClient(app, base_url="https://testserver") as client:
         csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
         project = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json(); pid = project["id"]
-        def upload(body): return client.post(f"/api/projects/{pid}/files", files={"file": ("notes.md", body)}, headers=headers)
+        def upload(body):
+            return client.post(
+                f"/api/projects/{pid}/files", files={"file": ("notes.md", body)},
+                headers={**headers, "X-Danus-Upload-Filename": "notes.md"},
+            )
         first = upload(b"one").json(); conflict = upload(b"two").json()
         assert client.post(f"/api/projects/{pid}/file-conflicts/{conflict['conflict_id']}", json={"choice":"cancel"}, headers=headers).status_code == 200
         retry = upload(b"two")
@@ -796,9 +874,16 @@ def test_project_file_allowlist_and_isolation(tmp_path: Path):
         headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
         a = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
         b = client.post("/api/projects", json={"name": "B", "problem": "beta"}, headers=headers).json()
-        bad = client.post(f"/api/projects/{a['id']}/files", files={"file": ("run.sh", b"echo nope")}, headers=headers)
+        bad = client.post(
+            f"/api/projects/{a['id']}/files", files={"file": ("run.sh", b"echo nope")},
+            headers={**headers, "X-Danus-Upload-Filename": "run.sh"},
+        )
         assert bad.status_code == 400
-        good = client.post(f"/api/projects/{a['id']}/files", files={"file": ("paper.tex", b"\\section{A}")}, headers=headers)
+        good = client.post(
+            f"/api/projects/{a['id']}/files",
+            files={"file": ("paper.tex", b"\\section{A}")},
+            headers={**headers, "X-Danus-Upload-Filename": "paper.tex"},
+        )
         assert good.status_code == 201
         assert client.get(f"/api/projects/{b['id']}/files").json() == []
         assert client.get(f"/api/projects/{b['id']}/files/{good.json()['id']}").status_code == 404
@@ -827,7 +912,10 @@ def test_main_agent_session_resume_attachment_and_project_isolation(tmp_path: Pa
         csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
         a = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
         b = client.post("/api/projects", json={"name": "B", "problem": "beta"}, headers=headers).json()
-        uploaded = client.post(f"/api/projects/{a['id']}/files", files={"file": ("source.md", b"source")}, headers=headers).json()
+        uploaded = client.post(
+            f"/api/projects/{a['id']}/files", files={"file": ("source.md", b"source")},
+            headers={**headers, "X-Danus-Upload-Filename": "source.md"},
+        ).json()
         first = client.post(f"/api/projects/{a['id']}/messages", json={"text": "hello", "attachment_ids": [uploaded["id"]]}, headers=headers)
         assert first.status_code == 201 and first.json()["session_id"] == "session-A"
         second = client.post(f"/api/projects/{a['id']}/messages", json={"text": "continue", "attachment_ids": []}, headers=headers)
@@ -1986,8 +2074,12 @@ def test_finalize_suggestions_and_approved_target_are_csrf_and_project_scoped(tm
         assert client.get(f"/api/projects/{project['id']}/finalize/suggestions").json()["suggested"] == ["fact_a"]
         assert client.post(f"/api/projects/{project['id']}/finalize", json={"fact_ids": ["fact_a"]}, headers={"Origin": "https://testserver"}).status_code == 403
         response = client.post(f"/api/projects/{project['id']}/finalize", json={"confirm": "A", "fact_ids": ["fact_a"], "paper_id": "thmA"}, headers=headers)
-        assert response.status_code == 200 and response.json()["paper_id"] == "thmA"
-        assert client.post(f"/api/projects/{project['id']}/finalize", json={"confirm": "A", "fact_ids": ["fact_a"], "paper_id": "../escape"}, headers=headers).status_code == 400
+        assert response.status_code == 410
+        intent_url = f"/api/projects/{project['id']}/artifacts-actions"
+        assert client.post(intent_url, json={"action":"finalize","confirm":"A","fact_ids":["fact_a"],"paper_id":"../escape"}, headers=headers).status_code == 400
+        intent = client.post(intent_url, json={"action":"finalize","confirm":"A","fact_ids":["fact_a"],"paper_id":"thmA"}, headers=headers)
+        assert intent.status_code == 200 and intent.json()["status"] == "intent_recorded"
+        assert "confirmation" not in json.dumps(intent.json()).lower()
 
 
 def test_summary_and_paper_actions_require_explicit_operator_forks(tmp_path: Path):
@@ -1997,12 +2089,15 @@ def test_summary_and_paper_actions_require_explicit_operator_forks(tmp_path: Pat
     with TestClient(app, base_url="https://testserver") as client:
         csrf = _login(client); headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
         project = client.post("/api/projects", json={"name": "A", "problem": "alpha"}, headers=headers).json()
-        assert client.post(f"/api/projects/{project['id']}/human-summary", json={"confirm": "wrong"}, headers=headers).status_code == 409
-        summary = client.post(f"/api/projects/{project['id']}/human-summary", json={"confirm": "A", "language": "Chinese"}, headers=headers)
-        assert summary.status_code == 200 and summary.json()["report_md_path"] == "report/report.md"
-        assert client.post(f"/api/projects/{project['id']}/write-paper", json={"confirm": "A"}, headers=headers).status_code == 400
-        paper = client.post(f"/api/projects/{project['id']}/write-paper", json={"confirm": "A", "paper_id": "thmA", "stop_workers": False}, headers=headers)
-        assert paper.status_code == 200 and paper.json()["stop_workers"] is False
+        assert client.post(f"/api/projects/{project['id']}/human-summary", json={"confirm": "wrong"}, headers=headers).status_code == 410
+        assert client.post(f"/api/projects/{project['id']}/write-paper", json={"confirm": "A"}, headers=headers).status_code == 410
+        intent_url = f"/api/projects/{project['id']}/artifacts-actions"
+        assert client.post(intent_url, json={"action":"human-summary","confirm":"wrong","language":"Chinese"}, headers=headers).status_code == 409
+        summary = client.post(intent_url, json={"action":"human-summary","confirm":"A","language":"Chinese"}, headers=headers)
+        assert summary.status_code == 200 and "human-summary" in summary.json()["instruction"]
+        assert client.post(intent_url, json={"action":"write-paper","confirm":"A"}, headers=headers).status_code == 400
+        paper = client.post(intent_url, json={"action":"write-paper","confirm":"A","paper_id":"thmA","stop_workers":False}, headers=headers)
+        assert paper.status_code == 200 and "--keep-workers" in paper.json()["instruction"]
 
 
 def test_internal_artifact_actions_require_confirmation_and_forward_forks(tmp_path: Path):
@@ -2013,10 +2108,20 @@ def test_internal_artifact_actions_require_confirmation_and_forward_forks(tmp_pa
         token = project_lifecycle_capability(_LIFECYCLE_SECRET, project["id"], project["runtime_name"]); headers["Authorization"] = f"Bearer {token}"
         url = f"/internal/api/projects/{project['id']}/lifecycle"
         assert client.post(url, json={"action":"human-summary"}, headers=headers).status_code == 409
-        response = client.post(url, json={"action":"write-paper", "paper_id":"p", "fact_ids":["f"], "instructions":"i", "stop_workers":False, "operator_confirmed":True}, headers=headers)
+        operator_headers = {"X-CSRF-Token": csrf, "Origin": "https://testserver"}
+        confirmation, _ = _confirmed_artifact_token(client, app, project, operator_headers, {
+            "action":"write-paper", "paper_id":"p", "fact_ids":["f"],
+            "instructions":"i", "stop_workers":False,
+        })
+        response = client.post(url, json={"action":"write-paper", "paper_id":"p", "fact_ids":["f"], "instructions":"i", "stop_workers":False, "confirmation_token":confirmation}, headers=headers)
         assert response.status_code == 200 and response.json()["paper_id"] == "p"
         assert runtime.stopped == []
-        response = client.post(url, json={"action":"write-paper", "paper_id":"p2", "fact_ids":[], "stop_workers":True, "operator_confirmed":True}, headers=headers)
+        replay = client.post(url, json={"action":"write-paper", "paper_id":"p", "fact_ids":["f"], "instructions":"i", "stop_workers":False, "confirmation_token":confirmation}, headers=headers)
+        assert replay.status_code == 409 and replay.json()["error_code"] == "replay"
+        confirmation, _ = _confirmed_artifact_token(client, app, project, operator_headers, {
+            "action":"write-paper", "paper_id":"p2", "fact_ids":[], "stop_workers":True,
+        })
+        response = client.post(url, json={"action":"write-paper", "paper_id":"p2", "fact_ids":[], "stop_workers":True, "confirmation_token":confirmation}, headers=headers)
         assert response.status_code == 200 and response.json()["graceful_stop"]["workers"][0]["alive"] is False
         assert runtime.stopped == [project["runtime_name"]]
 

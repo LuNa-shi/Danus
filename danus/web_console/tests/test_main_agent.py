@@ -89,7 +89,13 @@ def test_default_runner_timeout_terminates_the_entire_process_group(tmp_path: Pa
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline:
         stat = Path(f"/proc/{child_pid}/stat")
-        if not stat.exists() or stat.read_text().split()[2] == "Z":
+        try:
+            process_disappeared = (
+                not stat.exists() or stat.read_text().split()[2] == "Z"
+            )
+        except (FileNotFoundError, ProcessLookupError):
+            process_disappeared = True
+        if process_disappeared:
             break
         time.sleep(0.02)
     else:
@@ -213,6 +219,37 @@ def test_main_agent_environment_receives_only_project_scoped_lifecycle_capabilit
     assert captured["DANUS_WEB_LIFECYCLE_TOKEN"] == "project-a-capability"
     assert "other-project" not in json.dumps(captured)
     assert "DANUS_WEB_LIFECYCLE_HMAC_SECRET" not in captured
+
+
+def test_artifact_confirmation_is_turn_local_and_redacted_from_prompt_and_events(
+    tmp_path: Path, monkeypatch,
+):
+    token = "artifact-confirmation-secret-value"
+    monkeypatch.setenv("DANUS_WEB_ARTIFACT_CONFIRMATION_TOKEN", "inherited-must-not-leak")
+    calls = []
+    events = []
+
+    def runner(_cmd, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            returncode=0, stdout=_codex_success(message=f"tool accidentally echoed {token}"),
+            stderr="",
+        )
+
+    adapter = MainAgentAdapter(backend="codex", runner=runner, codex_bin="codex")
+    clean = adapter._env(tmp_path)
+    assert "DANUS_WEB_ARTIFACT_CONFIRMATION_TOKEN" not in clean
+
+    result = adapter.send(
+        **_args(tmp_path), artifact_confirmation_token=token,
+        on_progress=events.append,
+    )
+
+    assert calls[0]["env"]["DANUS_WEB_ARTIFACT_CONFIRMATION_TOKEN"] == token
+    assert token not in calls[0]["input"]
+    assert token not in json.dumps(events)
+    assert token not in json.dumps(result)
+    assert "<REDACTED>" in result["reply"]
 
 
 def test_codex_environment_passes_only_explicit_danus_strategy_configuration(tmp_path: Path, monkeypatch):

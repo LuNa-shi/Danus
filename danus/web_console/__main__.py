@@ -35,6 +35,7 @@ def main() -> None:
     parser.add_argument("--orchestration-poll-seconds", type=float, default=float(os.environ.get("DANUS_WEB_ORCHESTRATION_POLL_SECONDS", "30")))
     parser.add_argument("--orchestration-consult-interval-seconds", type=float, default=float(os.environ.get("DANUS_WEB_ORCHESTRATION_CONSULT_INTERVAL_SECONDS", str(2 * 3600))))
     parser.add_argument("--human-summary-interval-seconds", type=float, default=float(os.environ.get("DANUS_WEB_HUMAN_SUMMARY_INTERVAL_SECONDS", "3600")))
+    parser.add_argument("--artifact-confirmation-ttl-seconds", type=float, default=float(os.environ.get("DANUS_WEB_ARTIFACT_CONFIRMATION_TTL_SECONDS", str(20 * 60))))
     args = parser.parse_args()
     password_hash = args.password_hash
     if not password_hash:
@@ -56,6 +57,7 @@ def main() -> None:
                              orchestration_poll_seconds=args.orchestration_poll_seconds,
                              orchestration_consult_interval_seconds=args.orchestration_consult_interval_seconds,
                              human_summary_interval_seconds=args.human_summary_interval_seconds,
+                             artifact_confirmation_ttl_seconds=args.artifact_confirmation_ttl_seconds,
                              lifecycle_base_url=f"http://127.0.0.1:{args.port}"),
         runtime=DanusRuntimeAdapter(Path(args.agents_root).resolve()),
         main_agent=MainAgentAdapter(backend=args.main_agent_backend),

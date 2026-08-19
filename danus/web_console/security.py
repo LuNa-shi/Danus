@@ -65,6 +65,22 @@ def project_lifecycle_capability(
     return _b64(hmac.digest(secret, message, "sha256"))
 
 
+def artifact_confirmation_capability(
+    secret: bytes, intent_id: str, project_id: str, action: str,
+    payload_digest: str,
+) -> str:
+    """Derive an ephemeral proof without persisting or exposing its raw value."""
+    if not isinstance(secret, bytes) or len(secret) < 16:
+        raise ValueError("artifact confirmation secret must be at least 16 bytes")
+    values = (intent_id, project_id, action, payload_digest)
+    if any(not isinstance(value, str) or not value for value in values):
+        raise ValueError("artifact confirmation scope must be non-empty text")
+    message = b"danus-web-artifact-v1\0" + b"\0".join(
+        value.encode("utf-8") for value in values
+    )
+    return _b64(hmac.digest(secret, message, "sha256"))
+
+
 def verify_project_lifecycle_capability(
     token: str, secret: bytes, project_id: str, runtime_name: str,
 ) -> bool:
