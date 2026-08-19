@@ -32,7 +32,13 @@ from typing import Dict, List, Optional
 
 from danus.execution import layout as L
 from danus.execution import processes as P
+from danus.execution import systemd_scope as S
 from danus.execution.scaffold import atomic_write, do_new, spawn_loop
+
+# Tests may replace this call seam with a harmless Popen-like fake.  Production
+# keeps the exact imported object and therefore cannot enter legacy PID logic.
+_PRODUCTION_SPAWN = spawn_loop
+_ALLOW_LEGACY_PROCESS_TEST_SEAM = False
 
 def _reject_web_sandbox_control() -> None:
     if (
@@ -113,6 +119,14 @@ def _read_task_state(wl: L.WorkerLayout) -> Dict:
     except OSError:
         return {"task": "", "assigned": False}
     return {"task": task, "assigned": _task_assigned(task)}
+
+
+def _boundary_status(wl: L.WorkerLayout) -> S.WorkerBoundaryStatus | None:
+    """Return the host-owned status when this Worker has a durable ledger."""
+
+    if _ALLOW_LEGACY_PROCESS_TEST_SEAM and not S.ledger_path(wl).is_file():
+        return None
+    return S.inspect_worker_boundary(wl)
 
 
 # --------------------------------------------------------------------------- #
@@ -207,36 +221,53 @@ def _start_one(wl: L.WorkerLayout) -> str:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return "locked"
-        if P.worker_process_alive(wl):
-            # Migrate a legacy exact-command PID to the durable identity record.
-            if P.read_worker_identity(wl) is None:
-                pid = P.read_pid(wl)
-                identity = P.capture_worker_identity(wl, pid) if pid is not None else None
-                if identity is not None:
-                    P.write_worker_identity(wl, identity)
-            return "already-running"
-        # A raw live PID with no matching Worker identity is stale (commonly a
-        # namespace-local PID reused by an unrelated host process). Never let it
-        # suppress a new launch.
-        P.clear_worker_process_metadata(wl)
+        managed = _boundary_status(wl)
+        if managed is not None:
+            if managed.state == "active":
+                return "already-running"
+            if managed.state == "orphaned":
+                return "orphaned"
+            # ``inspect`` has already proven an absent/empty old cgroup and
+            # removed its ledger.  Start may now create a fresh invocation.
+            if (
+                not _ALLOW_LEGACY_PROCESS_TEST_SEAM
+                and (
+                    wl.pid.exists() or wl.process_identity.exists()
+                    or P.processes_with_argv_path(wl.dir)
+                )
+            ):
+                return "unmanaged-reclaim-required"
+        elif _ALLOW_LEGACY_PROCESS_TEST_SEAM and spawn_loop is not _PRODUCTION_SPAWN:
+            # Explicit test-only legacy seam; unreachable from env/config.
+            if P.worker_process_alive(wl):
+                return "already-running"
+            P.clear_worker_process_metadata(wl)
         wl.stop.unlink(missing_ok=True)  # clear a stale stop flag
         process = spawn_loop(wl.dir)
+        if isinstance(process, S.ManagedWorker):
+            observed = S.inspect_worker_boundary(wl)
+            if observed.state == "absent":
+                # The loop may legitimately reach max_rounds/deadline between
+                # publication and this inspection. ``inspect`` has already
+                # proven the exact slice empty and retained terminal status.
+                return "started"
+            if observed.state != "active":
+                raise S.SystemdBoundaryError(
+                    f"Worker boundary changed during start: {observed.state}"
+                )
+            return "started"
+
+        # Explicitly injected legacy test seams may still return a Popen-like
+        # object. Production ``spawn_loop`` always returns ManagedWorker, so no
+        # PID/PGID fallback is reachable from the deployed control path.
         pid = int(process.pid)
-        atomic_write(wl.pid, str(pid))
-        identity = None
-        for _ in range(20):
-            identity = P.capture_worker_identity(wl, pid)
-            if identity is not None or not P.process_alive(pid):
-                break
-            time.sleep(0.01)
+        identity = P.capture_worker_identity(wl, pid)
         if identity is None:
-            # The direct Popen handle identifies this exact new child. Terminate
-            # its whole start_new_session group, reap the leader, and verify the
-            # group is gone before removing recoverable metadata.
             if P.terminate_spawned_worker(process):
                 P.clear_worker_process_metadata(wl)
                 return "start-failed"
             return "start-cleanup-failed"
+        atomic_write(wl.pid, str(pid))
         P.write_worker_identity(wl, identity)
         return "started"
     finally:
@@ -262,8 +293,30 @@ def do_start(target: str, stagger: float = 0.2, root: Optional[Path] = None) -> 
 # --------------------------------------------------------------------------- #
 
 def worker_status(wl: L.WorkerLayout) -> Dict:
+    ledger_present = S.ledger_path(wl).is_file()
+    boundary_error: str | None = None
+    boundary = None
+    try:
+        boundary = _boundary_status(wl)
+    except S.SystemdBoundaryError as exc:
+        boundary_error = str(exc)
+
     pid = _read_pid(wl)
-    alive = _worker_alive(wl)
+    if boundary is not None:
+        # The ledger/cgroup seam is authoritative.  A PID is presentation data
+        # only and is never consulted for liveness or destructive actions.
+        alive = boundary.state == "active"
+        raw_alive = alive
+        boundary_pid = boundary.pid
+    elif ledger_present:
+        # A malformed/stale managed ledger must not fall back to a numeric PID.
+        alive = False
+        raw_alive = False
+        boundary_pid = None
+    else:
+        alive = _worker_alive(wl)
+        raw_alive = P.process_alive(pid)
+        boundary_pid = pid
     st = _read_status(wl)
     persisted_state = st.get("state", "—")
     state = persisted_state
@@ -277,7 +330,13 @@ def worker_status(wl: L.WorkerLayout) -> Dict:
             else st.get("last_round_at") or st.get("round_started_at") or st.get("updated_at"))
     age = (now - last) if isinstance(last, (int, float)) else None
 
-    if alive:
+    if ledger_present and boundary_error is not None:
+        state = "boundary-error"
+        label = "boundary-error"
+    elif boundary is not None and boundary.state == "orphaned":
+        state = "orphaned"
+        label = "orphaned"
+    elif alive:
         # a round legitimately runs for hours; only flag truly stale running rounds
         rs = st.get("round_started_at")
         hard = int(os.environ.get("DANUS_ROUND_HARD_TIMEOUT", "14400"))
@@ -290,13 +349,32 @@ def worker_status(wl: L.WorkerLayout) -> Dict:
                                    "terminated", "created") else "dead"
     config = _read_worker_config(wl)
     task_state = _read_task_state(wl)
-    raw_alive = P.process_alive(pid)
-    identity_status = "matched" if alive else "mismatch" if raw_alive else "dead"
+    if boundary is not None:
+        identity_status = (
+            "matched" if boundary.state == "active"
+            else "orphaned" if boundary.state == "orphaned"
+            else "dead"
+        )
+        if (
+            boundary.state == "absent"
+            and not _ALLOW_LEGACY_PROCESS_TEST_SEAM
+            and (
+                wl.pid.exists() or wl.process_identity.exists()
+                or P.processes_with_argv_path(wl.dir)
+            )
+        ):
+            identity_status = "unmanaged"
+            state = "unmanaged"
+            label = "unmanaged"
+    elif ledger_present:
+        identity_status = "unknown"
+    else:
+        identity_status = "matched" if alive else "mismatch" if raw_alive else "dead"
     return {
-        "worker": wl.name, "pid": pid, "alive": alive, "raw_alive": raw_alive,
+        "worker": wl.name, "pid": boundary_pid, "alive": alive, "raw_alive": raw_alive,
         "process_identity": identity_status, "state": state,
         "persisted_state": persisted_state,
-        "identity_verified": alive,
+        "identity_verified": bool(boundary is not None and boundary.state == "active") if boundary is not None else alive,
         "round": st.get("round", 0), "age_s": round(age, 1) if age is not None else None,
         "last_fact_id": st.get("last_fact_id"), "label": label,
         "task": task_state["task"],
@@ -311,6 +389,7 @@ def worker_status(wl: L.WorkerLayout) -> Dict:
         "model": config.get("MODEL") or config.get("PROJECT_MODEL") or None,
         "reasoning_effort": config.get("REASONING_EFFORT") or config.get("ROLE") or None,
         "author": config.get("DANUS_AUTHOR") or wl.name,
+        "boundary_reason": (boundary.reason if boundary is not None else boundary_error),
     }
 
 
@@ -337,8 +416,19 @@ def do_list(root: Optional[Path] = None) -> List[Dict]:
             except (json.JSONDecodeError, OSError):
                 meta = {}
         workers = L.list_workers(project, root)
-        live = sum(1 for w in workers
-                   if _worker_alive(L.WorkerLayout(L.worker_dir(project, w, root))))
+        live = 0
+        for w in workers:
+            wl = L.WorkerLayout(L.worker_dir(project, w, root))
+            ledger_present = S.ledger_path(wl).is_file()
+            try:
+                boundary = _boundary_status(wl)
+            except S.SystemdBoundaryError:
+                live += 0
+                continue
+            if boundary is not None:
+                live += int(boundary.state == "active")
+            elif _ALLOW_LEGACY_PROCESS_TEST_SEAM and not ledger_present:
+                live += int(_worker_alive(wl))
         out.append({"project": project, "workers": len(workers), "live": live,
                     "model": meta.get("model", "—")})
     return out
@@ -368,6 +458,21 @@ def _fmt_status(rows: List[Dict]) -> str:
 
 def _stop_one(wl: L.WorkerLayout, force: bool) -> str:
     _reject_web_sandbox_control()
+    managed = _boundary_status(wl)
+    if managed is not None:
+        if managed.state == "absent":
+            return "not-running"
+        if managed.state == "orphaned" and not force:
+            return "orphaned"
+        if force:
+            return S.stop_worker_boundary(wl, force=True)
+        if not wl.stop.exists():
+            wl.stop.touch()
+        return "stopping (graceful)"
+
+    # No durable ledger means this is an explicitly unmanaged/test seam. Keep
+    # the historical process path isolated here; production start always writes
+    # a systemd ledger before returning.
     if force:
         return P.force_stop_worker(wl)
     pid = P.read_pid(wl)

@@ -13,13 +13,20 @@ loop by default — see the verifier contract (``agents/contracts/verifier.md``)
 from __future__ import annotations
 
 import os
-from typing import Any, Dict
+from typing import Annotated, Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
+from .capability import CapabilityConfigurationError, verify_worker_capability
 from .launcher import _allocate_run_id, run_codex_verification
 from .prechecks import run_prechecks
+from .process_security import harden_secret_process
+
+
+# Importing the serving module handles HMAC material and provider credentials.
+# Fail before binding a port if the kernel cannot make this process nondumpable.
+harden_secret_process()
 
 
 class VerifyRequest(BaseModel):
@@ -40,11 +47,52 @@ async def health() -> Dict[str, Any]:
     return {"status": "ok", "pid": os.getpid()}
 
 
+def _authorize_worker(
+    authorization: Optional[str], project: Optional[str], worker: Optional[str],
+) -> None:
+    """Fail closed unless this is an exactly scoped Worker capability."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="verifier capability required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = authorization.removeprefix("Bearer ")
+    try:
+        valid = bool(
+            token and project and worker
+            and verify_worker_capability(token, project, worker)
+        )
+    except CapabilityConfigurationError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="verifier authorization unavailable",
+        ) from exc
+    if not valid:
+        # One generic response: callers cannot use the verifier as a scope/token
+        # oracle, and no bearer material is reflected in logs or response bodies.
+        raise HTTPException(status_code=403, detail="invalid verifier capability")
+
+
 @app.post("/verify")
-def verify(request: VerifyRequest) -> Dict[str, Any]:
+def verify(
+    request: VerifyRequest,
+    authorization: Annotated[Optional[str], Header(alias="Authorization")] = None,
+    danus_project: Annotated[Optional[str], Header(alias="X-Danus-Project")] = None,
+    danus_worker: Annotated[Optional[str], Header(alias="X-Danus-Worker")] = None,
+) -> Dict[str, Any]:
+    _authorize_worker(authorization, danus_project, danus_worker)
     rejected = run_prechecks(request.statement, request.proof)
     if rejected is not None:
         status_code, detail = rejected
         raise HTTPException(status_code=status_code, detail=detail)
-    run_id = _allocate_run_id(request.statement)
+    try:
+        run_id = _allocate_run_id(request.statement)
+    except Exception as exc:
+        # Allocation errors may carry a configured host path.  Keep the HTTP
+        # contract typed and redacted; no provider is started without a private
+        # unique audit directory.
+        raise HTTPException(
+            status_code=503, detail="verifier storage unavailable",
+        ) from exc
     return run_codex_verification(run_id=run_id, statement=request.statement, proof=request.proof)

@@ -111,10 +111,14 @@ def test_do_new_scaffolds_project(tmp: Path):
             assert (wl.dir / "AGENTS.md").resolve() == L.worker_md().resolve()
             assert (wl.dir / ".agents" / "skills").resolve() == L.worker_skills_dir().resolve()
             cfg = wl.codex_config.read_text()
-            assert 'DANUS_ROLE = "worker"' in cfg
-            assert 'args = ["-m", "danus.gateway"]' in cfg  # pinned MCP launch
-            assert "tool_timeout_sec = 3600" in cfg
-            assert f'DANUS_AUTHOR = "{w}"' in cfg and str(pdir) in cfg
+            assert "per-round one-shot pathname socket" in cfg
+            assert "High-precedence" in cfg
+            assert "mcp_servers" not in cfg
+            assert "danus.gateway.bridge" not in cfg
+            assert "DANUS_VERIFY_URL" not in cfg
+            assert "DANUS_VERIFY_CAPABILITY" not in cfg
+            assert "DANUS_PROJECT_DIR" not in cfg
+            assert wl.codex_config.stat().st_mode & 0o077 == 0
             role = wl.role.read_text()
             assert f"REASONING_EFFORT={eff}" in role and "MODEL=gpt-5.5" in role
             assert "(unassigned" in wl.task.read_text()
@@ -139,13 +143,16 @@ def test_do_new_refuses_existing(tmp: Path):
             pass
 
 
-def test_do_new_verify_url_from_env(tmp: Path):
+def test_do_new_keeps_verify_endpoint_out_of_provider_config(tmp: Path):
     with _project_env(tmp):
         with _env(DANUS_VERIFY_URL="http://127.0.0.1:9999/verify"):
             scaffold.do_new("Q", roles="high:1")
         cfg = L.WorkerLayout(L.worker_dir("Q", "high")).codex_config.read_text()
-        assert 'DANUS_VERIFY_URL = "http://127.0.0.1:9999/verify"' in cfg
-        assert f'PYTHONPATH = "{Path(scaffold.__file__).resolve().parents[2]}"' in cfg
+        assert "127.0.0.1:9999" not in cfg
+        assert "DANUS_VERIFY_URL" not in cfg
+        assert "one-shot pathname socket" in cfg
+        assert "danus.gateway.bridge" not in cfg
+        assert "PYTHONPATH" not in cfg
 
 
 # --- loop helpers (pure) --------------------------------------------------- #
@@ -251,7 +258,7 @@ def main() -> None:
               test_worker_layout_paths, test_resolve_and_target,
               test_do_new_scaffolds_project, test_do_new_supports_explicit_root,
               test_do_new_refuses_existing,
-              test_do_new_verify_url_from_env, test_parse_last_fact_id,
+              test_do_new_keeps_verify_endpoint_out_of_provider_config, test_parse_last_fact_id,
               test_deadline_passed, test_write_status_atomic_and_stamps,
               test_read_role_defaults_and_overrides]:
         if t in _NO_TMP:

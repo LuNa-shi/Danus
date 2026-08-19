@@ -20,7 +20,9 @@ Runs standalone (``python -m danus.execution.tests.test_loop``) and pytest.
 from __future__ import annotations
 
 import json
+import io
 import os
+import base64
 import runpy
 import signal
 import subprocess
@@ -29,6 +31,7 @@ import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import quote_from_bytes
 
 from danus.execution import layout as L
 from danus.execution import loop, scaffold
@@ -78,13 +81,131 @@ def _write_fake_codex(tmp: Path, body: str) -> Path:
     return p
 
 
+@contextmanager
+def _direct_round_boundary(wl: L.WorkerLayout, codex_bin: Path):
+    """Inject harmless gateway/provider seams for direct ``run_round`` tests.
+
+    Production still calls the real host gateway and systemd provider scope;
+    these Python object replacements are reachable only by this test process.
+    """
+
+    class _Gateway:
+        provider_socket_path = Path(loop.security.PROVIDER_SOCKET_PATH)
+
+        @staticmethod
+        def poll():
+            return 0
+
+        @staticmethod
+        def terminate():
+            return None
+
+        @staticmethod
+        def close():
+            return None
+
+    observed: dict[str, object] = {}
+    test_home = wl.dir / ".direct-test-provider-home"
+    test_tmp = test_home / "tmp"
+    test_tmp.mkdir(parents=True, exist_ok=True)
+    test_home.chmod(0o700)
+    test_tmp.chmod(0o700)
+
+    class _DirectProvider:
+        def __init__(self, command, environment):
+            # Keep this seam hermetic even when the test runner itself has a
+            # logged-in Codex subscription or a custom provider URL.
+            observed["environment"] = dict(environment)
+            self.process = subprocess.Popen(
+                command, cwd="/", env=environment, stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            )
+            self.pid = self.process.pid
+            self.stdout = getattr(self.process, "stdout", None) or io.BytesIO()
+
+        def send_prompt(self, prompt):
+            stream = getattr(self.process, "stdin", None)
+            if stream is not None:
+                stream.write(prompt.encode("utf-8"))
+                stream.close()
+
+        def poll(self):
+            return self.process.poll()
+
+        def wait(self, timeout=None):
+            return self.process.wait(timeout=timeout)
+
+        def terminate(self):
+            self.process.terminate()
+
+        def kill(self):
+            self.process.kill()
+
+        @staticmethod
+        def close():
+            return None
+
+    original_gateway = loop.security.start_host_gateway
+    original_provider = loop.systemd_scope.start_provider_scope
+    original_resolve = loop.codex.resolve_bin
+    original_validate = loop.security.resolve_worker_codex_bin
+
+    def start_gateway(*_args, **_kwargs):
+        return _Gateway()
+
+    def start_provider(*_args, provider_command, provider_environment, **_kwargs):
+        return _DirectProvider(provider_command, provider_environment)
+
+    loop.security.start_host_gateway = start_gateway
+    loop.systemd_scope.start_provider_scope = start_provider
+    loop.codex.resolve_bin = lambda: str(codex_bin)
+    loop.security.resolve_worker_codex_bin = lambda _selected: str(codex_bin)
+    original_provider_env = loop.security.worker_provider_env
+    loop.security.worker_provider_env = lambda _worker: {
+        "CODEX_HOME": str(test_home),
+        "HOME": str(test_home),
+        "TMPDIR": str(test_tmp),
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "LANG": "C.UTF-8",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONSAFEPATH": "1",
+    }
+    # ``codex.exec_cmd`` reads provider routing from the ambient process env;
+    # clear it so a fake executable can never accidentally contact a real
+    # endpoint or observe a real credential during these direct tests.
+    isolated_env = _env(
+        CODEX_HOME=None,
+        OPENAI_API_KEY=None,
+        DANUS_CODEX_API_KEY=None,
+        OPENAI_BASE_URL=None,
+        CODEX_API_BASE_URL=None,
+        OPENAI_CHATGPT_BASE_URL=None,
+        CODEX_CHATGPT_BASE_URL=None,
+        DANUS_CODEX_JS=None,
+        DANUS_NODE=None,
+        DANUS_RUNTIME=None,
+        SSL_CERT_FILE=None,
+        SSL_CERT_DIR=None,
+    )
+    isolated_env.__enter__()
+    try:
+        yield observed
+    finally:
+        isolated_env.__exit__(None, None, None)
+        loop.security.start_host_gateway = original_gateway
+        loop.systemd_scope.start_provider_scope = original_provider
+        loop.codex.resolve_bin = original_resolve
+        loop.security.resolve_worker_codex_bin = original_validate
+        loop.security.worker_provider_env = original_provider_env
+
+
 # --- run_round: chosen exit code ------------------------------------------- #
 
 def test_run_round_returns_codex_rc(tmp: Path):
     wl = _mk_worker(tmp)
     fake = _write_fake_codex(tmp, "import sys\nsys.stdout.write('hello from codex\\n')\nsys.exit(3)\n")
     log = wl.dir / "round.log"
-    with _env(DANUS_CODEX_BIN=str(fake)):
+    with _direct_round_boundary(wl, fake):
         rc = loop.run_round(wl, {"MODEL": "m", "REASONING_EFFORT": "high"},
                             "prompt", log, hard_timeout=30)
     assert rc == 3
@@ -96,10 +217,108 @@ def test_run_round_success_rc0(tmp: Path):
     wl = _mk_worker(tmp)
     fake = _write_fake_codex(tmp, "import sys\nsys.exit(0)\n")
     log = wl.dir / "round.log"
-    with _env(DANUS_CODEX_BIN=str(fake)):
+    with _direct_round_boundary(wl, fake):
         rc = loop.run_round(wl, {"MODEL": "m", "REASONING_EFFORT": "high"},
                             "prompt", log, hard_timeout=0)   # 0 => no timeout (wait forever)
     assert rc == 0
+
+
+def test_direct_round_seam_does_not_inherit_host_provider_credentials(tmp: Path):
+    """The direct fake seam must stay hermetic under a logged-in test runner."""
+
+    wl = _mk_worker(tmp)
+    fake = _write_fake_codex(tmp, "import sys\nsys.exit(0)\n")
+    log = wl.dir / "round.log"
+    with _env(
+        CODEX_HOME=tmp / "real-host-home",
+        OPENAI_API_KEY="host-api-secret-marker",
+        DANUS_CODEX_API_KEY="host-danus-secret-marker",
+        OPENAI_BASE_URL="https://real-provider.invalid/v1",
+        CODEX_CHATGPT_BASE_URL="https://real-chatgpt.invalid",
+    ):
+        with _direct_round_boundary(wl, fake) as observed:
+            assert loop.run_round(
+                wl, {"MODEL": "m", "REASONING_EFFORT": "high"},
+                "prompt", log, hard_timeout=30,
+            ) == 0
+    env = observed["environment"]
+    assert isinstance(env, dict)
+    assert not any(
+        marker in repr(env)
+        for marker in (
+            "host-api-secret-marker", "host-danus-secret-marker",
+            "real-provider.invalid", "real-chatgpt.invalid",
+        )
+    )
+    assert set(env) <= {
+        "CODEX_HOME", "HOME", "TMPDIR", "PATH", "LANG",
+        "PYTHONDONTWRITEBYTECODE", "PYTHONSAFEPATH",
+    }
+
+
+def test_provider_output_scrubs_cross_chunk_raw_base64_and_percent_variants():
+    api_key = "sk-provider-raw-secret"
+    subscription_token = "subscription-token-marker"
+    provider_url = "https://provider.invalid/private path"
+    hex_secret = "hex-provider-secret"
+    encoded_token = base64.b64encode(subscription_token.encode("utf-8"))
+    encoded_url = quote_from_bytes(provider_url.encode("utf-8"), safe="").encode("ascii")
+    encoded_hex = hex_secret.encode("utf-8").hex().upper().encode("ascii")
+
+    class _ChunkedOutput:
+        def __init__(self):
+            self.chunks = iter((
+                b"raw=" + api_key[:7].encode("utf-8"),
+                api_key[7:].encode("utf-8") + b"\nbase64=" + encoded_token[:9],
+                encoded_token[9:] + b"\npercent=" + encoded_url[:11],
+                encoded_url[11:] + b"\nhex=" + encoded_hex[:13],
+                encoded_hex[13:] + b"\ndone\n",
+            ))
+
+        def read(self, _size):
+            return next(self.chunks, b"")
+
+    destination = io.StringIO()
+    loop._drain_provider_output(
+        _ChunkedOutput(), destination,
+        loop._StreamingLogRedactor(
+            (api_key, subscription_token, provider_url, hex_secret),
+        ),
+    )
+    rendered = destination.getvalue()
+    assert api_key not in rendered
+    assert encoded_token.decode("ascii") not in rendered
+    assert encoded_url.decode("ascii") not in rendered
+    assert encoded_hex.decode("ascii") not in rendered
+    assert rendered.count("[REDACTED]") == 4
+    assert all(label in rendered for label in ("raw=", "base64=", "percent=", "hex="))
+
+
+def test_provider_log_secrets_include_subscription_auth_strings(tmp: Path):
+    home = tmp / "provider-home"
+    home.mkdir(mode=0o700)
+    auth = home / "auth.json"
+    auth.write_text(
+        json.dumps({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": "subscription-access-marker",
+                "refresh_token": "subscription-refresh-marker",
+            },
+        }),
+        encoding="utf-8",
+    )
+    auth.chmod(0o600)
+    secrets = loop._provider_log_secrets({
+        "CODEX_HOME": str(home),
+        "OPENAI_API_KEY": "api-key-marker",
+        "OPENAI_BASE_URL": "https://provider.invalid/v1",
+    })
+    assert "subscription-access-marker" in secrets
+    assert "subscription-refresh-marker" in secrets
+    assert "api-key-marker" in secrets
+    assert "https://provider.invalid/v1" in secrets
+    assert "chatgpt" not in secrets
 
 
 # --- run_round: hard timeout → terminate → 124 ----------------------------- #
@@ -109,7 +328,7 @@ def test_run_round_hard_timeout_terminates(tmp: Path):
     # sleeps far past the tiny hard_timeout; a plain terminate() ends it.
     fake = _write_fake_codex(tmp, "import time\ntime.sleep(60)\n")
     log = wl.dir / "round.log"
-    with _env(DANUS_CODEX_BIN=str(fake)):
+    with _direct_round_boundary(wl, fake):
         rc = loop.run_round(wl, {"MODEL": "m", "REASONING_EFFORT": "high"},
                             "prompt", log, hard_timeout=1)
     assert rc == 124
@@ -123,7 +342,7 @@ def test_run_round_missing_binary_returns_127(tmp: Path):
     wl = _mk_worker(tmp)
     missing = tmp / "does_not_exist_codex"
     log = wl.dir / "round.log"
-    with _env(DANUS_CODEX_BIN=str(missing)):
+    with _direct_round_boundary(wl, missing):
         rc = loop.run_round(wl, {"MODEL": "m", "REASONING_EFFORT": "high"},
                             "prompt", log, hard_timeout=30)
     assert rc == 127
@@ -140,6 +359,7 @@ def test_run_round_timeout_then_kill(tmp: Path):
 
     class _StubProc:
         def __init__(self):
+            self.pid = os.getpid()
             self.terminated = False
             self.killed = False
             self._waits = 0
@@ -147,7 +367,12 @@ def test_run_round_timeout_then_kill(tmp: Path):
         def wait(self, timeout=None):
             self._waits += 1
             # 1st wait = the hard-timeout expiry; 2nd wait = the 10s grace expiry.
-            raise subprocess.TimeoutExpired(cmd="codex", timeout=timeout)
+            if self._waits <= 2:
+                raise subprocess.TimeoutExpired(cmd="codex", timeout=timeout)
+            return -9
+
+        def poll(self):
+            return None if self._waits <= 2 else -9
 
         def terminate(self):
             self.terminated = True
@@ -156,10 +381,11 @@ def test_run_round_timeout_then_kill(tmp: Path):
             self.killed = True
 
     stub = _StubProc()
+    fake = _write_fake_codex(tmp, "import sys\nsys.exit(0)\n")
     orig_popen = subprocess.Popen
     subprocess.Popen = lambda *a, **k: stub
     try:
-        with _env(DANUS_CODEX_BIN=str(tmp / "anything")):
+        with _direct_round_boundary(wl, fake):
             rc = loop.run_round(wl, {"MODEL": "m", "REASONING_EFFORT": "high"},
                                 "prompt", log, hard_timeout=1)
     finally:
@@ -263,6 +489,34 @@ def test_main_consecutive_failure_cap(tmp: Path):
     assert st["state"] == "error" and "consecutive failed rounds" in st["error"]
     # last idle status carried the parsed fact id
     assert st.get("last_fact_id") == "0123456789abcdef" or st["last_rc"] == 5
+
+
+def test_main_round_exception_never_persists_exception_message(tmp: Path):
+    wl = _mk_worker(tmp)
+    secret = "exception-contained-provider-secret"
+    with _restore_sigterm(), _env(
+        DANUS_ROUND_BEAT="0", DANUS_MAX_CONSEC_FAILURES="1",
+    ):
+        _patch_run_round(
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError(f"failure: {secret}"))
+        )
+        try:
+            assert loop.main(str(wl.dir)) == 1
+        finally:
+            _unpatch_run_round()
+    persisted = wl.status.read_text(encoding="utf-8") + "".join(
+        path.read_text(encoding="utf-8") for path in wl.logs.iterdir()
+    )
+    assert secret not in persisted
+    assert "failure:" not in persisted
+    assert "RuntimeError" in persisted
+    assert "Codex round exited with code 126" in persisted
+
+
+def test_round_error_does_not_promote_arbitrary_provider_text(tmp: Path):
+    log = tmp / "round.log"
+    log.write_text("ERROR: provider-controlled secret detail\n", encoding="utf-8")
+    assert loop._round_error(log, 9) == "Codex round exited with code 9"
 
 
 def test_main_timeout_rc124_does_not_count_as_failure(tmp: Path):

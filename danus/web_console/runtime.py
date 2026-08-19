@@ -12,6 +12,7 @@ from typing import Any
 
 from danus.execution import layout as L
 from danus.execution import processes as P
+from danus.execution import systemd_scope as S
 from danus.execution.scaffold import atomic_write
 from danus.orchestration import cli
 
@@ -45,10 +46,16 @@ def validate_runtime_name(name: str) -> str:
 class DanusRuntimeAdapter:
     """Project-scoped runtime adapter; all process/filesystem authority stays in Danus."""
 
-    def __init__(self, agents_root: Path | None = None):
+    def __init__(
+        self, agents_root: Path | None = None, *,
+        _allow_legacy_process_test_seam: bool = False,
+    ):
         # The adapter is constructed once with a server-owned root.
         self.agents_root = Path(agents_root).resolve() if agents_root else L.agents_root()
         self._reclaim_tokens: dict[str, tuple[str, float]] = {}
+        # Private Python-only injection for legacy process unit tests. No env,
+        # config, HTTP, or CLI input can enable this in a deployed adapter.
+        self._allow_legacy_process_test_seam = bool(_allow_legacy_process_test_seam)
 
     def _project_dir(self, runtime_name: str) -> Path:
         validate_runtime_name(runtime_name)
@@ -61,6 +68,14 @@ class DanusRuntimeAdapter:
         if project.parent != self.agents_root or not project.is_dir():
             raise RuntimeNotFound(runtime_name)
         return project
+
+    def _boundary_status(self, worker_dir: Path) -> S.WorkerBoundaryStatus | None:
+        """Read the host-owned seam when a durable Worker ledger exists."""
+
+        wl = L.WorkerLayout(worker_dir)
+        if self._allow_legacy_process_test_seam and not S.ledger_path(wl).is_file():
+            return None
+        return S.inspect_worker_boundary(wl)
 
     def list_projects(self) -> list[dict[str, Any]]:
         return self._call(cli.do_list)
@@ -224,10 +239,72 @@ class DanusRuntimeAdapter:
         self, runtime_name: str, *, worker: str | None = None, term_timeout: float = 5.0,
     ) -> dict[str, Any]:
         targets = self._target_worker_dirs(runtime_name, worker)
+        managed_targets: list[tuple[Path, S.WorkerBoundaryStatus]] = []
+        unmanaged_targets: list[Path] = []
+        for worker_dir in targets:
+            try:
+                boundary = self._boundary_status(worker_dir)
+            except S.SystemdBoundaryError as exc:
+                raise RuntimeSafetyError(
+                    f"worker {worker_dir.name} boundary inspection failed: {exc}"
+                ) from exc
+            if boundary is not None:
+                if boundary.state == "active" or boundary.state == "orphaned":
+                    managed_targets.append((worker_dir, boundary))
+                elif boundary.state == "absent":
+                    if self._project_processes(worker_dir):
+                        raise RuntimeSafetyError(
+                            f"worker {worker_dir.name} has unmanaged project processes; reclaim required"
+                        )
+                    managed_targets.append((worker_dir, boundary))
+                else:
+                    raise RuntimeSafetyError(
+                        f"worker {worker_dir.name} boundary is {boundary.state}"
+                    )
+            else:
+                unmanaged_targets.append(worker_dir)
+
+        rows: list[dict[str, Any]] = []
+        # Validate and stop every managed boundary through the exact pinned
+        # slice. No PID, process group, or command-line signal path is involved.
+        for worker_dir, boundary in managed_targets:
+            if boundary.state == "absent":
+                rows.append({
+                    "worker": worker_dir.name, "outcome": "not-running",
+                    "signals_sent": [], "boundary": "absent",
+                })
+                continue
+            try:
+                outcome = S.stop_worker_boundary(
+                    L.WorkerLayout(worker_dir), timeout=term_timeout, force=True,
+                )
+            except S.SystemdBoundaryError as exc:
+                raise RuntimeSafetyError(
+                    f"worker {worker_dir.name} force stop failed closed: {exc}"
+                ) from exc
+            self._merge_worker_status(
+                worker_dir, state="terminated", control_outcome="emergency_force_stop",
+            )
+            rows.append({
+                "worker": worker_dir.name,
+                "verified_boundary": {
+                    "unit": boundary.unit, "slice": boundary.slice,
+                    "invocation_id": boundary.invocation_id,
+                    "reason": boundary.reason,
+                },
+                "signals_sent": ["systemd.slice.stop"],
+                "descendants_verified": True,
+                "outcome": "terminated" if outcome == "stopped" else outcome,
+            })
+
+        # Explicitly injected unmanaged/test seams retain the old identity gate.
+        if not unmanaged_targets:
+            return {"status": "force_stopped", "workers": rows}
+
         verified: list[tuple[Path, dict[str, Any]]] = []
         # Validate every target before the first destructive signal so a
         # multi-Worker request cannot partially execute and then fail safety.
-        for worker_dir in targets:
+        for worker_dir in unmanaged_targets:
             pid_path = worker_dir / L.PID_FILE
             try:
                 pid = int(pid_path.read_text(encoding="utf-8").strip())
@@ -249,7 +326,6 @@ class DanusRuntimeAdapter:
                 )
             verified.append((worker_dir, identity))
 
-        rows: list[dict[str, Any]] = []
         for worker_dir, identity in verified:
             if identity.get("status") == "dead":
                 rows.append({"worker": worker_dir.name, "outcome": "not-running", "signals_sent": []})
@@ -305,6 +381,103 @@ class DanusRuntimeAdapter:
         root = self._project_dir(runtime_name)
         worker_dirs = self._target_worker_dirs(runtime_name, worker)
         key = f"{runtime_name}:{worker or '*'}"
+
+        # Managed Workers are reconciled solely through the durable systemd
+        # boundary. A populated orphan is safe only after an explicit reclaim;
+        # an active invocation is never included in a stale reclaim plan.
+        managed_rows: list[tuple[Path, S.WorkerBoundaryStatus]] = []
+        unmanaged_dirs: list[Path] = []
+        for worker_dir in worker_dirs:
+            try:
+                boundary = self._boundary_status(worker_dir)
+            except S.SystemdBoundaryError as exc:
+                raise RuntimeSafetyError(
+                    f"worker {worker_dir.name} boundary inspection failed: {exc}"
+                ) from exc
+            if boundary is None:
+                unmanaged_dirs.append(worker_dir)
+            else:
+                managed_rows.append((worker_dir, boundary))
+        if managed_rows:
+            if unmanaged_dirs:
+                raise RuntimeSafetyError(
+                    "cannot mix managed and unmanaged Workers in one reclaim"
+                )
+            plans: list[dict[str, Any]] = []
+            safe = True
+            for worker_dir, boundary in managed_rows:
+                unmanaged_processes = (
+                    self._project_processes(worker_dir)
+                    if boundary.state == "absent" else []
+                )
+                worker_safe = (
+                    boundary.state in {"absent", "orphaned"}
+                    and not unmanaged_processes
+                )
+                safe = safe and worker_safe
+                plans.append({
+                    "worker": worker_dir.name,
+                    "process_identity": "orphaned" if boundary.state == "orphaned" else "dead" if boundary.state == "absent" else "matched",
+                    "boundary_state": boundary.state,
+                    "boundary_reason": boundary.reason,
+                    "pid": boundary.pid,
+                    "persisted_identity": None,
+                    "orphan_processes": unmanaged_processes,
+                    "stale_artifacts": [
+                        name for name in (L.PID_FILE, L.STOP_FILE, L.PAUSE_FILE)
+                        if (worker_dir / name).exists()
+                    ],
+                    "safe_to_execute": worker_safe,
+                })
+            if not execute:
+                token = secrets.token_urlsafe(24)
+                self._reclaim_tokens[key] = (token, time.monotonic() + 60.0)
+                return {
+                    "dry_run": True, "safe_to_execute": safe, "workers": plans,
+                    "confirmation_token": token,
+                }
+            expected = self._reclaim_tokens.pop(key, None)
+            if expected is None or expected[1] < time.monotonic() or not secrets.compare_digest(
+                expected[0], confirmation_token or ""
+            ):
+                raise RuntimeSafetyError("invalid or expired reclaim confirmation")
+            if not safe:
+                raise RuntimeSafetyError("reclaim plan contains live Worker boundaries")
+            for worker_dir, boundary in managed_rows:
+                if boundary.state == "orphaned":
+                    try:
+                        outcome = S.stop_worker_boundary(
+                            L.WorkerLayout(worker_dir), force=True,
+                        )
+                    except S.SystemdBoundaryError as exc:
+                        raise RuntimeSafetyError(
+                            f"orphan Worker reclaim failed closed: {exc}"
+                        ) from exc
+                    if outcome not in {"stopped", "not-managed"}:
+                        raise RuntimeSafetyError(
+                            f"orphan Worker reclaim did not stop cleanly: {outcome}"
+                        )
+                elif boundary.state != "absent":
+                    raise RuntimeSafetyError(
+                        f"Worker changed state during reclaim: {boundary.state}"
+                    )
+                for name in (L.PID_FILE, L.STOP_FILE, L.PAUSE_FILE, L.PROCESS_IDENTITY_FILE):
+                    (worker_dir / name).unlink(missing_ok=True)
+                self._merge_worker_status(
+                    worker_dir, state="reclaimed", control_outcome="stale_reclaim",
+                )
+            remaining = self._project_processes(root)
+            if worker is None and remaining:
+                raise RuntimeSafetyError(
+                    "project-wide reclaim could not prove zero Project processes"
+                )
+            cleared_locks = self._clear_provider_lock_artifacts(root) if not remaining else []
+            return {
+                "status": "reclaimed", "workers": plans,
+                "cleared_lock_artifacts": cleared_locks,
+                "remaining_project_processes": remaining,
+            }
+
         plans: list[dict[str, Any]] = []
         safe = True
         for worker_dir in worker_dirs:
@@ -403,19 +576,65 @@ class DanusRuntimeAdapter:
             worker["local_memory_count"] = memory_count
             worker["checkpoint"] = checkpoint
             worker_dir = self._worker_dir(root, name)
-            identity = self._process_identity(worker_dir, worker.get("pid"))
+            boundary: S.WorkerBoundaryStatus | None = None
+            boundary_error: str | None = None
+            if worker_dir is not None:
+                try:
+                    boundary = self._boundary_status(worker_dir)
+                except S.SystemdBoundaryError as exc:
+                    boundary_error = str(exc)
+            if boundary is not None:
+                identity = (
+                    "matched" if boundary.state == "active"
+                    else "orphaned" if boundary.state == "orphaned"
+                    else "dead"
+                )
+                worker["pid"] = boundary.pid
+                worker["alive"] = boundary.state == "active"
+                worker["identity_verified"] = boundary.state == "active"
+                worker["boundary_state"] = boundary.state
+                worker["boundary_reason"] = boundary.reason
+                if (
+                    boundary.state == "absent" and worker_dir is not None
+                    and self._project_processes(worker_dir)
+                ):
+                    identity = "unmanaged"
+                    worker["alive"] = False
+                    worker["identity_verified"] = False
+                    worker["boundary_state"] = "unmanaged"
+                    worker["boundary_reason"] = "processes-outside-managed-boundary"
+            elif boundary_error is not None:
+                # A present ledger with an inspection error is not an unmanaged
+                # process. Keep it visible and fail closed for destructive UI.
+                identity = "unknown"
+                worker["pid"] = None
+                worker["alive"] = False
+                worker["identity_verified"] = False
+                worker["boundary_state"] = "error"
+                worker["boundary_reason"] = boundary_error
+            else:
+                legacy_pid = (
+                    P.read_pid(L.WorkerLayout(worker_dir))
+                    if self._allow_legacy_process_test_seam and worker_dir is not None
+                    else worker.get("pid")
+                )
+                worker["pid"] = legacy_pid
+                identity = self._process_identity(worker_dir, legacy_pid)
+                worker["alive"] = identity == "matched"
             worker["process_identity"] = identity
             process_record = worker_dir / L.PROCESS_IDENTITY_FILE if worker_dir is not None else None
             worker["reclaim_candidate"] = bool(
-                identity in {"dead", "mismatch"}
-                and (
-                    worker.get("pid") is not None
-                    or (process_record is not None and process_record.is_file() and not process_record.is_symlink())
+                (boundary is not None and boundary.state == "orphaned")
+                or identity == "unmanaged"
+                or (
+                    boundary is None and boundary_error is None
+                    and identity in {"dead", "mismatch"}
+                    and (
+                        worker.get("pid") is not None
+                        or (process_record is not None and process_record.is_file() and not process_record.is_symlink())
+                    )
                 )
             )
-            # A numeric PID is not liveness. Only an identity-matched Worker is
-            # safe to report as alive or to target with an emergency signal.
-            worker["alive"] = identity == "matched"
             stop = worker_dir / L.STOP_FILE if worker_dir is not None else None
             worker["stop_requested"] = bool(
                 stop is not None and stop.exists() and not stop.is_symlink()
@@ -443,9 +662,20 @@ class DanusRuntimeAdapter:
 
     @staticmethod
     def _process_identity(worker_dir: Path | None, pid: Any) -> str:
-        """Return the conservative state from the single process inspector."""
+        """Return legacy identity only for an explicitly unmanaged Worker."""
         if worker_dir is None:
             return "unknown"
+        wl = L.WorkerLayout(worker_dir)
+        if S.ledger_path(wl).is_file():
+            try:
+                boundary = S.inspect_worker_boundary(wl)
+            except S.SystemdBoundaryError:
+                return "unknown"
+            return (
+                "matched" if boundary.state == "active"
+                else "orphaned" if boundary.state == "orphaned"
+                else "dead"
+            )
         return str(DanusRuntimeAdapter._inspect_worker_process(worker_dir, pid).get("status", "unknown"))
 
     def project_config(self, runtime_name: str) -> dict[str, Any]:

@@ -1,9 +1,11 @@
 """Offline tests for danus.orchestration — the ``danus`` CLI verbs.
 
-Filesystem verbs (new/assign/status/list) are deterministic. The loop tests are
-integration: they spawn the real ``python -m danus.execution`` loop subprocess but
-stub codex with a fake shell binary (``DANUS_CODEX_BIN``) so nothing real is
-invoked and no API is spent. All processes are force-cleaned in ``finally``.
+Filesystem verbs (new/assign/status/list) are deterministic.  The lifecycle
+tests spawn the real systemd-supervised ``python -m danus.execution`` outer loop
+with an intentionally untrusted provider selector.  That selector must fail
+closed before execution; direct provider-success/timeout behavior is exercised
+through the explicit Python seam in ``execution/tests/test_loop.py``.  No fake
+binary is admitted through production environment configuration.
 
 Runs standalone (``python -m danus.orchestration.tests.test_orchestration``) and
 under pytest.
@@ -131,7 +133,7 @@ def test_list(tmp: Path):
         assert rows["Q"]["workers"] == 1 and rows["Q"]["model"] == "gpt-x"
 
 
-# --- loop integration tests (stubbed codex) -------------------------------- #
+# --- supervised outer-loop lifecycle tests --------------------------------- #
 
 def test_loop_runs_rounds_then_exits(tmp: Path):
     fc = _fake_codex(tmp)
@@ -144,8 +146,12 @@ def test_loop_runs_rounds_then_exits(tmp: Path):
             assert _wait_until(lambda: not _st("P", "high")["alive"]), "loop should exit at backstop"
             s = _st("P", "high")
             assert s["state"] == "max_rounds" and s["round"] == 2
+            assert s["last_rc"] == 126
             wl = L.WorkerLayout(L.worker_dir("P", "high"))
             assert (wl.logs / "round_1.log").exists() and (wl.logs / "round_2.log").exists()
+            assert "security boundary unavailable" in (
+                wl.logs / "round_1.log"
+            ).read_text(encoding="utf-8").lower()
         finally:
             _kill_project("P")
 
@@ -169,14 +175,17 @@ def test_graceful_stop(tmp: Path):
 
 def test_force_stop(tmp: Path):
     fc = _fake_codex(tmp)
-    with _project_env(tmp, DANUS_CODEX_BIN=str(fc), DANUS_ROUND_BEAT="0",
+    with _project_env(tmp, DANUS_CODEX_BIN=str(fc), DANUS_ROUND_BEAT="30",
                       DANUS_MAX_ROUNDS="0", FAKE_CODEX_SLEEP="30"):
         cli.do_new("P", roles="high:1")
         try:
             cli.do_start("P/high")
-            assert _wait_until(lambda: _st("P", "high")["state"] == "running"), "round should run"
+            assert _wait_until(
+                lambda: _st("P", "high")["state"] == "retrying"
+                and _st("P", "high")["alive"],
+            ), "outer loop should remain supervised during retry backoff"
             r = cli.do_stop("P/high", force=True)
-            assert r[0]["result"] == "killed"
+            assert r[0]["result"] == "stopped"
             assert _wait_until(lambda: not _st("P", "high")["alive"], timeout=8), "force kills fast"
         finally:
             _kill_project("P")
@@ -184,7 +193,7 @@ def test_force_stop(tmp: Path):
 
 def test_idempotent_start(tmp: Path):
     fc = _fake_codex(tmp)
-    with _project_env(tmp, DANUS_CODEX_BIN=str(fc), DANUS_ROUND_BEAT="0",
+    with _project_env(tmp, DANUS_CODEX_BIN=str(fc), DANUS_ROUND_BEAT="30",
                       DANUS_MAX_ROUNDS="0", FAKE_CODEX_SLEEP="30"):
         cli.do_new("P", roles="high:1")
         try:
@@ -209,16 +218,18 @@ def test_project_wide_targets(tmp: Path):
             _kill_project("P")
 
 
-def test_missing_codex_returns_error_state(tmp: Path):
+def test_untrusted_codex_selector_returns_security_error_state(tmp: Path):
     with _project_env(tmp, DANUS_CODEX_BIN="/nonexistent/codex-bin",
                       DANUS_ROUND_BEAT="0", DANUS_MAX_ROUNDS="0"):
         cli.do_new("P", roles="high:1")
         try:
             cli.do_start("P/high")
-            # rc 127 => loop must not spin; it errors out immediately
-            assert _wait_until(lambda: not _st("P", "high")["alive"]), "loop should exit on missing codex"
+            # A production selector that is missing or non-official is a
+            # boundary error, not an executable lookup fallback.
+            assert _wait_until(lambda: not _st("P", "high")["alive"]), "loop should stop after bounded security failures"
             s = _st("P", "high")
-            assert s["state"] == "error"
+            assert s["state"] == "error" and s["last_rc"] == 126
+            assert s["consecutive_failures"] == 5
         finally:
             _kill_project("P")
 
@@ -229,7 +240,7 @@ def main() -> None:
     fs_tests = [test_assign_replace_and_rejects, test_status_before_start, test_list]
     loop_tests = [test_loop_runs_rounds_then_exits, test_graceful_stop, test_force_stop,
                   test_idempotent_start, test_project_wide_targets,
-                  test_missing_codex_returns_error_state]
+                  test_untrusted_codex_selector_returns_security_error_state]
     for t in fs_tests + loop_tests:
         with tempfile.TemporaryDirectory() as d:
             t(Path(d))

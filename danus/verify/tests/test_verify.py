@@ -2,8 +2,8 @@
 
 Prechecks are pure-function unit-tested; the full request path (pre-checks →
 subprocess spawn → verification.json readback → verdict propagation) is exercised
-by pointing DANUS_CODEX_BIN at ``fake_codex.py`` (a deterministic stub) and calling the
-``/verify`` endpoint function directly (avoids an httpx TestClient dependency).
+through the launcher's explicit private test-binary seam with ``fake_codex.py``
+(a deterministic stub), calling the ``/verify`` endpoint function directly.
 
 Runs standalone (``python -m danus.verify.tests.test_verify``) and under pytest.
 """
@@ -18,8 +18,9 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
-from danus.verify import prechecks
+from danus.verify import capability, launcher, prechecks, service
 from danus.verify.service import VerifyRequest, verify
+from danus.verify.tests.trusted_runner import DirectTrustedTestAdapter
 
 FAKE = Path(__file__).resolve().parent / "fake_codex.py"
 
@@ -50,9 +51,28 @@ def _ensure_fake_executable():
 
 
 def _call(statement, proof, tmp):
-    with _env(DANUS_CODEX_BIN=str(FAKE)), \
-            _env(VERIFIER_RESULTS_DIR=str(Path(tmp) / "runs"), VERIFY_AGENT_HOME=str(tmp)):
-        return verify(VerifyRequest(statement=statement, proof=proof))
+    with _env(VERIFIER_RESULTS_DIR=str(Path(tmp) / "runs"), VERIFY_AGENT_HOME=str(tmp),
+                 DANUS_VERIFY_CAPABILITY_SECRET_FILE=str(Path(tmp) / "verify.key"),
+                 DANUS_VERIFY_PROVIDER_HOME=str(Path(tmp) / "provider-home"),
+                 OPENAI_API_KEY="test-only-provider-key"):
+        project, worker = "Test-Project", "worker-1"
+        token = capability.mint_worker_capability(project, worker)
+        original = service.run_codex_verification
+        service.run_codex_verification = lambda run_id, statement, proof: (
+            launcher.run_codex_verification(
+                run_id, statement, proof, runner=DirectTrustedTestAdapter(),
+                _test_provider_bin=str(FAKE),
+            )
+        )
+        try:
+            return verify(
+                VerifyRequest(statement=statement, proof=proof),
+                authorization=f"Bearer {token}",
+                danus_project=project,
+                danus_worker=worker,
+            )
+        finally:
+            service.run_codex_verification = original
 
 
 def test_prechecks_units():
