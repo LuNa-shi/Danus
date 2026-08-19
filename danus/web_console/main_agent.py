@@ -20,7 +20,14 @@ from typing import Any, Callable
 from danus.strategy.config import resolve_transport
 
 from .observability import redact_text
-from .protocol import EventKind, normalize_provider_line, normalize_trace
+from .protocol import (
+    EventKind,
+    NormalizedEnvelope,
+    NormalizedEvent,
+    NormalizedTraceBuilder,
+    normalize_provider_envelope,
+    normalize_trace,
+)
 from .runtime import RuntimeErrorBase
 
 
@@ -330,16 +337,6 @@ class MainAgentAdapter:
                         return text
         return ""
 
-    @classmethod
-    def _message_text(cls, obj: Any) -> str:
-        if not isinstance(obj, dict):
-            return ""
-        for key in ("text", "message", "content", "output_text"):
-            text = cls._text_value(obj.get(key))
-            if text:
-                return text
-        return ""
-
     @staticmethod
     def _redact_display_text(value: str, limit: int = 1200) -> str:
         return redact_text(str(value or ""), limit=limit, replacement="<REDACTED>")
@@ -476,130 +473,79 @@ class MainAgentAdapter:
         return "参数已隐藏"
 
     @classmethod
-    def _codex_progress_events(cls, line: str) -> list[dict[str, Any]]:
-        from .protocol import parse_provider_line
-        raw_item = parse_provider_line(line)
-        if raw_item is None or str(raw_item.get("type") or "") not in {"thread.started", "turn.started", "session_meta", "response_item", "item.started", "item.completed", "event_msg"}:
-            return []
-        normalized = normalize_provider_line(line)
-        if normalized and any(event.kind in {EventKind.SESSION_STARTED, EventKind.TURN_STARTED} for event in normalized):
-            return [event.as_dict() for event in normalized]
-        try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
-            return []
-        kind = item.get("type")
-        payload = item.get("payload") or {}
-        events: list[dict[str, Any]] = []
+    def _render_codex_event(cls, event: NormalizedEvent) -> dict[str, Any] | None:
+        """Apply the Web display policy to one typed protocol event."""
 
-        def from_object(obj: Any, phase: str) -> None:
-            if not isinstance(obj, dict):
-                return
-            item_type = obj.get("type")
-            if item_type == "reasoning":
-                # Codex may emit an explicit operator-safe reasoning summary.
-                # Never expose encrypted/private reasoning content; only the
-                # plaintext summary field supplied by the runtime is observable.
-                summary = cls._text_value(obj.get("summary"))
-                if summary:
-                    events.append({
-                        "type": "agent.progress",
-                        "detail": cls._redact_display_text(summary, 4000),
-                    })
-                return
-            if item_type in {"agent_message", "message"}:
-                role = obj.get("role", "assistant")
-                text = cls._message_text(obj)
-                if role == "assistant" and text:
-                    events.append({"type": "agent.message", "detail": cls._redact_display_text(text, 4000)})
-                return
-            if item_type in {
+        rendered = event.as_dict()
+        obj = event.payload.get("object") if isinstance(event.payload, dict) else None
+        item_type = str(event.payload.get("item_type") or "") if isinstance(event.payload, dict) else ""
+        phase = str(event.payload.get("phase") or "") if isinstance(event.payload, dict) else ""
+
+        if event.kind == EventKind.AGENT_PROGRESS:
+            summary = cls._text_value(obj.get("summary")) if isinstance(obj, dict) else event.detail
+            if not summary:
+                return None
+            rendered["detail"] = cls._redact_display_text(summary, 4000)
+        elif event.kind == EventKind.AGENT_MESSAGE:
+            if not event.detail:
+                return None
+            rendered["detail"] = cls._redact_display_text(event.detail, 4000)
+        elif event.kind in {EventKind.TURN_COMPLETED, EventKind.TURN_FAILED}:
+            fallback = (
+                "Main Agent 已完成本次回复"
+                if event.kind == EventKind.TURN_COMPLETED else "Main Agent 执行失败"
+            )
+            rendered["detail"] = cls._redact_display_text(event.detail or fallback, 1200)
+        elif event.kind in {EventKind.TOOL_STARTED, EventKind.TOOL_COMPLETED}:
+            completed = event.kind == EventKind.TOOL_COMPLETED
+            if item_type == "file_change":
+                rendered["detail"] = "文件变更状态已更新（具体内容未展示）"
+            elif item_type == "command_execution" and isinstance(obj, dict):
+                exit_code = obj.get("exit_code")
+                rendered["detail"] = (
+                    f"exit_code={exit_code if exit_code is not None else 'unknown'}; "
+                    + cls._tool_result_detail(obj.get("aggregated_output") or obj.get("output") or "")
+                ) if phase == "completed" else cls._tool_call_detail(
+                    "exec_command", obj.get("command") or obj.get("cmd") or "",
+                )
+            elif item_type in {
+                "function_call_output", "custom_tool_call_output", "tool_search_output",
+            } and isinstance(obj, dict):
+                result = obj.get("output") or obj.get("result") or ""
+                rendered["detail"] = cls._tool_result_detail(result)
+            elif item_type in {
                 "function_call", "custom_tool_call", "tool_search_call", "web_search_call",
                 "mcp_tool_call", "tool_call",
-            }:
-                tool = obj.get("name") or obj.get("tool") or item_type
+            } and phase == "completed" and isinstance(obj, dict):
+                result = obj.get("error") or obj.get("result") or obj.get("output") or ""
+                rendered["detail"] = cls._tool_result_detail(result)
+            elif item_type and isinstance(obj, dict):
                 raw_detail = obj.get("arguments") or obj.get("input") or obj.get("query") or ""
-                events.append({
-                    "type": "tool.started", "tool": cls._redact_display_text(str(tool), 120),
-                    "detail": cls._tool_call_detail(str(tool), raw_detail),
-                    "call_id": cls._redact_display_text(str(obj.get("call_id") or obj.get("id") or ""), 200),
-                    "status": "started",
-                })
-                return
-            if item_type in {
-                "function_call_output", "custom_tool_call_output", "tool_search_output",
-            }:
-                events.append({
-                    "type": "tool.completed", "tool": "tool result",
-                    "detail": cls._tool_result_detail(obj.get("output") or obj.get("result") or ""),
-                    "call_id": cls._redact_display_text(str(obj.get("call_id") or obj.get("id") or ""), 200),
-                    "status": cls._tool_result_status(obj.get("output") or obj.get("result") or "", obj),
-                })
-                return
-            if item_type == "command_execution":
-                command = obj.get("command") or obj.get("cmd") or ""
-                completed = phase == "completed"
-                exit_code = obj.get("exit_code")
-                events.append({
-                    "type": "tool.completed" if completed else "tool.started",
-                    "tool": "exec_command",
-                    "detail": (
-                        f"exit_code={exit_code if exit_code is not None else 'unknown'}; "
-                        + cls._tool_result_detail(obj.get("aggregated_output") or obj.get("output") or "")
-                    ) if completed else cls._tool_call_detail("exec_command", command),
-                    "status": "failed" if completed and exit_code else "completed" if completed else "started",
-                    "call_id": cls._redact_display_text(str(obj.get("id") or obj.get("call_id") or ""), 200),
-                })
-                return
-            if item_type == "file_change":
-                events.append({
-                    "type": "tool.completed" if phase == "completed" else "tool.started",
-                    "tool": "file_change",
-                    "detail": "文件变更状态已更新（具体内容未展示）",
-                })
+                rendered["detail"] = cls._tool_call_detail(event.tool or item_type, raw_detail)
+            elif completed:
+                rendered["detail"] = cls._tool_result_detail(event.detail)
+            else:
+                rendered["detail"] = cls._tool_call_detail(event.tool or "MCP tool", event.detail)
+            if event.tool:
+                rendered["tool"] = cls._redact_display_text(event.tool, 120)
+            if event.call_id:
+                rendered["call_id"] = cls._redact_display_text(event.call_id, 200)
+        return rendered
 
-        if kind in {"thread.started", "turn.started"}:
-            events.append({
-                "type": "session.started", "detail": "Main Agent Session available",
-                "session_id": item.get("thread_id") or payload.get("session_id") or payload.get("id"),
-            })
-        elif kind == "turn.completed":
-            events.append({"type": "turn.completed", "detail": "Main Agent 已完成本次回复"})
-        elif kind == "turn.failed":
-            error = item.get("error") or payload.get("error") or {}
-            message = error.get("message") if isinstance(error, dict) else str(error or "")
-            events.append({"type": "turn.failed", "detail": cls._redact_display_text(message or "Main Agent 执行失败")})
-        elif kind == "response_item":
-            from_object(payload, "completed")
-        elif kind in {"item.started", "item.completed"}:
-            from_object(item.get("item") or {}, "completed" if kind == "item.completed" else "started")
-        elif kind == "response.completed":
-            response = item.get("response") or payload.get("response") or {}
-            for output in response.get("output", []) if isinstance(response, dict) else []:
-                from_object(output, "completed")
-        elif kind == "event_msg":
-            event_type = payload.get("type")
-            if event_type == "agent_message":
-                text = cls._message_text(payload)
-                if text:
-                    events.append({"type": "agent.message", "detail": cls._redact_display_text(text, 4000)})
-            elif event_type == "task_complete":
-                if payload.get("error") is not None:
-                    error = payload.get("error")
-                    message = error.get("message") if isinstance(error, dict) else str(error or "")
-                    events.append({"type": "turn.failed", "detail": cls._redact_display_text(message or "Main Agent 执行失败")})
-                else:
-                    events.append({"type": "turn.completed", "detail": "Main Agent 已完成本次回复"})
-            elif event_type and "tool_call" in str(event_type):
-                completed = str(event_type).endswith(("end", "completed"))
-                events.append({
-                    "type": "tool.completed" if completed else "tool.started",
-                    "tool": cls._redact_display_text(str(payload.get("tool") or payload.get("name") or "MCP tool"), 120),
-                    "detail": cls._tool_result_detail(payload.get("result") or payload.get("output") or payload.get("error") or "") if completed else cls._tool_call_detail(str(payload.get("tool") or payload.get("name") or "MCP tool"), payload.get("arguments") or payload.get("input") or {}),
-                    "status": "failed" if payload.get("error") else "completed" if completed else "started",
-                    "call_id": cls._redact_display_text(str(payload.get("call_id") or payload.get("id") or ""), 200),
-                })
-        return events
+    @classmethod
+    def _codex_progress_events(
+        cls, line_or_envelope: str | NormalizedEnvelope,
+    ) -> list[dict[str, Any]]:
+        normalized = (
+            normalize_provider_envelope(line_or_envelope)
+            if isinstance(line_or_envelope, str) else line_or_envelope
+        )
+        if normalized is None:
+            return []
+        return [
+            rendered for event in normalized.events
+            if (rendered := cls._render_codex_event(event)) is not None
+        ]
 
     @classmethod
     def _claude_progress_events(cls, line: str) -> list[dict[str, Any]]:
@@ -664,19 +610,6 @@ class MainAgentAdapter:
     def _parse_codex(cls, stdout: str) -> tuple[str | None, str]:
         trace = normalize_trace(stdout)
         return trace.session_id, trace.reply
-
-    @staticmethod
-    def _codex_terminal_state(stdout: str) -> str | None:
-        return normalize_trace(stdout).terminal_state
-
-    @classmethod
-    def _parse_codex_failure(cls, stdout: str) -> tuple[str | None, str] | None:
-        return normalize_trace(stdout).failure
-
-    @staticmethod
-    def _codex_activity(stdout: str) -> tuple[bool, bool]:
-        trace = normalize_trace(stdout)
-        return trace.tool_activity, trace.parse_uncertain
 
     @staticmethod
     def _codex_mcp_config(root: Path, env: dict[str, str]) -> str:
@@ -764,12 +697,17 @@ class MainAgentAdapter:
         active_prompt = prompt
         last_progress_signature: tuple[Any, ...] | None = None
         tool_started_at: dict[str, float] = {}
+        stream_builder: NormalizedTraceBuilder | None = None
 
         def emit_stdout_line(line: str) -> None:
             nonlocal last_progress_signature
-            if on_progress is None:
+            normalized = (
+                stream_builder.consume_line(line) if stream_builder is not None
+                else normalize_provider_envelope(line)
+            )
+            if on_progress is None or normalized is None:
                 return
-            for event in self._codex_progress_events(line):
+            for event in self._codex_progress_events(normalized):
                 call_id = str(event.get("call_id") or "")
                 if event.get("type") == "tool.started" and call_id:
                     tool_started_at[call_id] = self._clock()
@@ -789,8 +727,15 @@ class MainAgentAdapter:
                 on_progress(event)
 
         if on_progress is not None:
-            on_progress({"type": "process.started", "status": "active", "detail": "Main Agent Process activated"})
+            process_event = {
+                "type": "process.started", "status": "active",
+                "detail": "Main Agent Process activated",
+            }
+            if session_id:
+                process_event["session_id"] = session_id
+            on_progress(process_event)
         for attempt in range(1, self.max_attempts + 1):
+            stream_builder = NormalizedTraceBuilder(session_id=active_session_id)
             remaining = deadline - self._clock()
             if remaining <= 0:
                 raise MainAgentError(
@@ -806,9 +751,18 @@ class MainAgentAdapter:
                 partial = getattr(exc, "stdout", None) or getattr(exc, "output", None) or ""
                 if isinstance(partial, bytes):
                     partial = partial.decode("utf-8", errors="replace")
-                trace = normalize_trace(str(partial))
+                trace = (
+                    stream_builder.trace() if stream_builder.line_count
+                    else normalize_trace(str(partial), session_id=active_session_id)
+                )
                 actual_id = trace.session_id
                 observed_tool_activity = trace.tool_activity
+                if trace.identity_conflict:
+                    raise MainAgentError(
+                        "main agent provider returned a different session identity",
+                        code="session_identity_mismatch", session_id=actual_id or active_session_id,
+                        attempts=attempt, observed_tool_activity=observed_tool_activity,
+                    ) from exc
                 raise MainAgentError(
                     "main agent turn timed out: total timeout budget exhausted", code="turn_timeout_exhausted",
                     session_id=actual_id or active_session_id,
@@ -821,12 +775,25 @@ class MainAgentAdapter:
                 ) from exc
 
             stdout = getattr(result, "stdout", "") or ""
-            trace = normalize_trace(stdout)
+            # The default runner has already fed every provider line through the
+            # builder. Reuse that trace so streamed envelopes are not decoded a
+            # second time. Injectable non-streaming runners retain a batch
+            # fallback through the exact same normalizer.
+            trace = (
+                stream_builder.trace() if stream_builder.line_count
+                else normalize_trace(stdout, session_id=active_session_id)
+            )
             actual_id, reply = trace.session_id, trace.reply
             failure = trace.failure
             terminal_state = trace.terminal_state
             observed_tool_activity, parse_uncertain = trace.tool_activity, trace.parse_uncertain
             chosen_id = actual_id or active_session_id
+            if trace.identity_conflict:
+                raise MainAgentError(
+                    "main agent provider returned a different session identity",
+                    code="session_identity_mismatch", session_id=chosen_id,
+                    attempts=attempt, observed_tool_activity=observed_tool_activity,
+                )
             if self._clock() > deadline:
                 raise MainAgentError(
                     "main agent turn timed out: total timeout budget exhausted",
