@@ -48,6 +48,7 @@ _ALL = dict(
     DANUS_CODEX_MODEL=None, DANUS_CODEX_EFFORT=None,
     OPENAI_BASE_URL=None, OPENAI_API_KEY=None,
     CODEX_API_BASE_URL=None, DANUS_CODEX_API_KEY=None,
+    OPENAI_CHATGPT_BASE_URL=None, CODEX_CHATGPT_BASE_URL=None,
     DANUS_VERIFY_MODEL=None, DANUS_VERIFY_EFFORT=None,
     DANUS_WRITE_PAPER_MODEL=None, DANUS_WRITE_PAPER_EFFORT=None,
     DANUS_HUMAN_SUMMARY_MODEL=None, DANUS_HUMAN_SUMMARY_EFFORT=None,
@@ -201,6 +202,61 @@ def test_exec_cmd_supports_codex_base_url_and_danus_key_pair():
     assert not any("redacted-danus-secret" in value for value in cmd)
 
 
+def test_exec_cmd_builds_subscription_proxy_without_credential_in_argv():
+    with env(**{
+        **_ALL,
+        "OPENAI_BASE_URL": "http://router.internal/codex",
+        "OPENAI_CHATGPT_BASE_URL": "http://router.internal/backend-api",
+    }):
+        cmd = codex.exec_cmd("codex", "gpt-5.5", "high")
+
+    assert 'model_provider="danus_subscription"' in cmd
+    assert 'chatgpt_base_url="http://router.internal/backend-api"' in cmd
+    assert any(
+        value.startswith("model_providers.danus_subscription={")
+        and 'base_url="http://router.internal/codex"' in value
+        and "requires_openai_auth=true" in value
+        and "supports_websockets=false" in value
+        and "env_key" not in value
+        for value in cmd
+    )
+
+
+def test_exec_cmd_rejects_incomplete_subscription_proxy_config():
+    with env(**{
+        **_ALL,
+        "OPENAI_BASE_URL": "https://router.internal/codex",
+    }):
+        try:
+            codex.exec_cmd("codex", "gpt-5.5", "high")
+        except ValueError as exc:
+            assert "requires both" in str(exc)
+        else:
+            raise AssertionError("incomplete subscription config was accepted")
+
+
+def test_exec_cmd_rejects_secret_or_malformed_provider_urls_without_echoing_them():
+    secret = "do-not-reflect-this-secret"
+    for bad_url in (
+        f"https://user:{secret}@router.internal/codex",
+        f"https://router.internal/codex?token={secret}",
+        "file:///tmp/provider",
+    ):
+        with env(**{
+            **_ALL,
+            "OPENAI_BASE_URL": bad_url,
+            "OPENAI_API_KEY": "key-present-but-not-in-argv",
+        }):
+            try:
+                codex.exec_cmd("codex", "gpt-5.5", "high")
+            except ValueError as exc:
+                assert "OPENAI_BASE_URL" in str(exc)
+                assert secret not in str(exc)
+                assert bad_url not in str(exc)
+            else:
+                raise AssertionError("unsafe provider URL was accepted")
+
+
 def main() -> None:
     tests = [
         test_resolve_bin_prefers_danus_codex_bin_over_alias,
@@ -216,6 +272,9 @@ def main() -> None:
         test_exec_cmd_empty_tail,
         test_exec_cmd_builds_direct_provider_without_putting_key_in_argv,
         test_exec_cmd_supports_codex_base_url_and_danus_key_pair,
+        test_exec_cmd_builds_subscription_proxy_without_credential_in_argv,
+        test_exec_cmd_rejects_incomplete_subscription_proxy_config,
+        test_exec_cmd_rejects_secret_or_malformed_provider_urls_without_echoing_them,
     ]
     for t in tests:
         t()

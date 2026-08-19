@@ -14,14 +14,14 @@ which is also the codex working dir / LocalMemory root)::
       workers/<worker>/                # worker home (codex cwd, LocalMemory root)
         AGENTS.md -> agents/contracts/worker.md   # the static contract codex reads
         .agents/skills -> agents/skills/worker    # the worker skills
-        .codex/config.toml                        # MCP = danus gateway, role=worker
+        .codex/config.toml                        # generated; enforced MCP is per-round
         TASK.md                                   # per-round assignment (danus assign)
         local_memory/                             # worker-private (codex writes)
         .role .pid .process.json .pid.lock .pause .stop .status.json  logs/
 
 Key defaults:
-  - the MCP server is launched as the installed package ``python -m danus.gateway``
-    (a pinned interface) — never an absolute path to a server file;
+  - the enforced Worker MCP command is an absolute credential-free bridge to a
+    host-owned, per-round one-shot Unix socket;
   - ``agents_root`` defaults to ``runtime/projects`` under the cwd, overridable with
     ``DANUS_AGENTS_ROOT``;
   - the worker contract + skills are resolved at CALL time from env

@@ -1,6 +1,6 @@
 """Run one worker's outer loop: ``python -m danus.execution <worker_dir>``.
 
-This is how ``danus start`` launches each worker (detached, own process group).
+This is the absolute entry used by each managed transient Worker service.
 """
 
 from __future__ import annotations

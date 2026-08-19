@@ -53,3 +53,9 @@ include = ["danus*"]
     "static/vendor/cytoscape/3.34.0/*.js",
     "static/vendor/cytoscape/3.34.0/LICENSE",
 ]
+
+[tool.pytest.ini_options]
+# Deployment state can contain third-party plugin test files.  It is runtime
+# data, not part of the Danus source suite, and must never affect repository
+# verification.
+norecursedirs = [".git", ".venv", "runtime"]

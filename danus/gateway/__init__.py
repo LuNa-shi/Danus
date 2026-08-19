@@ -7,6 +7,15 @@ See ``server.build_app`` (constructs the stdio MCP app for a role) and ``roles``
 from __future__ import annotations
 
 from .roles import ALL_TOOLS, ROLE_TOOLS, tools_for
-from .server import build_app
+
+
+def __getattr__(name: str):
+    # Security launchers import the tiny fd_protocol submodule under a minimal
+    # interpreter.  Do not make that boundary import the MCP/FastAPI stack.
+    if name == "build_app":
+        from .server import build_app
+
+        return build_app
+    raise AttributeError(name)
 
 __all__ = ["build_app", "tools_for", "ROLE_TOOLS", "ALL_TOOLS"]

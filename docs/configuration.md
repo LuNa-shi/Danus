@@ -73,6 +73,7 @@ defaults apply everywhere; per-service overrides win.
 | `DANUS_CODEX_BIN` | `<repo>/bin/codex`, else `codex` on PATH | all codex calls |
 | `DANUS_CODEX_MODEL` | `gpt-5.5` | neutral default (all sites) |
 | `DANUS_CODEX_EFFORT` | `xhigh` | neutral default effort (all sites) |
+| `OPENAI_BASE_URL` / `OPENAI_CHATGPT_BASE_URL` | unset | optional managed-subscription proxy endpoints; both must be non-secret HTTP(S) URLs without userinfo/query/fragment |
 | `DANUS_VERIFY_MODEL` / `_EFFORT` | neutral | verifier — the correctness authority; keep effort at `xhigh` |
 | `DANUS_WRITE_PAPER_MODEL` / `_EFFORT` | neutral | paper renderer |
 | `DANUS_HUMAN_SUMMARY_MODEL` / `_EFFORT` | neutral | human-summary renderer |

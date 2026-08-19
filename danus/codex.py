@@ -28,6 +28,7 @@ import os
 import shutil
 from pathlib import Path
 from typing import Dict, List
+from urllib.parse import urlsplit
 
 # danus/codex.py → repo root is one parent up; the deployment's bin/codex wrapper
 # lives at <repo>/bin/codex.
@@ -35,6 +36,38 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 DEFAULT_MODEL = "gpt-5.5"
 DEFAULT_EFFORT = "xhigh"
+
+
+def _provider_url(name: str, value: str | None) -> str | None:
+    """Validate a provider endpoint without ever reflecting it in an error.
+
+    Provider routes are deployment configuration, not credentials.  Reject URL
+    forms that can smuggle credentials (userinfo/query/fragment) and anything
+    other than an absolute HTTP(S) endpoint before putting it in Codex argv.
+    """
+    if not value:
+        return None
+    try:
+        parsed = urlsplit(value)
+        valid = (
+            parsed.scheme in {"http", "https"}
+            and bool(parsed.hostname)
+            and parsed.username is None
+            and parsed.password is None
+            and not parsed.query
+            and not parsed.fragment
+            and not any(char.isspace() or ord(char) < 0x20 for char in value)
+        )
+        # Accessing ``port`` also rejects malformed/out-of-range port values.
+        parsed.port
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError(
+            f"{name} must be an absolute non-secret HTTP(S) URL without "
+            "userinfo, query parameters, or a fragment"
+        )
+    return value
 
 
 def resolve_bin() -> str:
@@ -114,7 +147,20 @@ def exec_cmd(codex_bin: str, model: str, effort: str, *tail: str) -> List[str]:
     MCP ``-c`` injection, output path, the ``-`` stdin sentinel, the prompt, …).
     """
     command = [codex_bin, "exec"]
-    provider_base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("CODEX_API_BASE_URL")
+    provider_base_name = (
+        "OPENAI_BASE_URL" if os.environ.get("OPENAI_BASE_URL")
+        else "CODEX_API_BASE_URL"
+    )
+    provider_base_url = _provider_url(
+        provider_base_name, os.environ.get(provider_base_name),
+    )
+    chatgpt_base_name = (
+        "OPENAI_CHATGPT_BASE_URL" if os.environ.get("OPENAI_CHATGPT_BASE_URL")
+        else "CODEX_CHATGPT_BASE_URL"
+    )
+    chatgpt_base_url = _provider_url(
+        chatgpt_base_name, os.environ.get(chatgpt_base_name),
+    )
     provider_key_env = (
         "OPENAI_API_KEY" if os.environ.get("OPENAI_API_KEY")
         else "DANUS_CODEX_API_KEY" if os.environ.get("DANUS_CODEX_API_KEY")
@@ -132,6 +178,31 @@ def exec_cmd(codex_bin: str, model: str, effort: str, *tail: str) -> List[str]:
             "--config", f'model_provider="{provider_name}"',
             "--config", provider_config,
         ])
+    elif provider_base_url and chatgpt_base_url:
+        # Subscription deployments can expose a fixed, non-secret ChatGPT
+        # routing endpoint while auth remains in CODEX_HOME/auth.json.  This is
+        # how the host's managed launcher invokes the official CLI; reproduce
+        # only the provider parameters so isolated services do not need the
+        # launcher's private control home.
+        provider_name = "danus_subscription"
+        provider_config = f"model_providers.{provider_name}={{" + ",".join([
+            f"name={json.dumps('Danus Subscription Proxy')}",
+            f"base_url={json.dumps(provider_base_url)}",
+            f"wire_api={json.dumps('responses')}",
+            "requires_openai_auth=true",
+            "supports_websockets=false",
+        ]) + "}"
+        command.extend([
+            "--config", 'cli_auth_credentials_store="file"',
+            "--config", f"chatgpt_base_url={json.dumps(chatgpt_base_url)}",
+            "--config", f'model_provider="{provider_name}"',
+            "--config", provider_config,
+        ])
+    elif provider_base_url or chatgpt_base_url:
+        raise ValueError(
+            "subscription provider configuration requires both an API base URL "
+            "and a ChatGPT base URL, or an API base URL plus an API key"
+        )
     command.extend([
         "--model", model,
         "--config", f'model_reasoning_effort="{effort}"',

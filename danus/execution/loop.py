@@ -1,6 +1,6 @@
 """The per-worker autonomous outer loop — the round driver.
 
-Launched detached by ``danus start`` (``python -m danus.execution <worker_dir>``).
+Launched by the validated transient Worker service created by ``danus start``.
 Self-contained. Each round runs ONE ``codex exec`` session
 whose internal control loop (worker.md + the worker skills) drives toward a full
 verified result — a round is *continue solving from persisted memory*, NOT one
@@ -10,8 +10,7 @@ that resumes from memory. Stops on the ``.stop`` flag (graceful, at a round
 boundary), the project deadline, or a round backstop.
 
 Config:
-  - codex binary resolved via the shared ``danus.codex`` launcher
-    (``DANUS_CODEX_BIN`` / ``CODEX_BIN`` alias / PATH);
+  - the selected codex binary must resolve to the provisioned official runtime;
   - all config read at CALL time from env (matches core/gateway/verify).
 
 Env (all optional; tests inject these):
@@ -25,6 +24,8 @@ Env (all optional; tests inject these):
 
 from __future__ import annotations
 
+import base64
+import codecs
 import fcntl
 import json
 import os
@@ -32,15 +33,31 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import BinaryIO, Iterable, Mapping, Optional, TextIO
+from urllib.parse import quote_from_bytes
 
 from . import layout as L
 from . import scaffold
+from . import security
+from . import systemd_scope
 from danus import codex
+from danus.host_isolation import protect_host_process_secrets
+from danus.secure_io import SecureIOError, read_private_bytes, secure_open_text
 
 _FACT_ID_RE = re.compile(r'"?fact_id"?\s*[:=]\s*"?([0-9a-f]{16})"?')
+_PROVIDER_LOG_SECRET_ENV = (
+    "OPENAI_API_KEY",
+    "DANUS_CODEX_API_KEY",
+    "OPENAI_BASE_URL",
+    "CODEX_API_BASE_URL",
+    "OPENAI_CHATGPT_BASE_URL",
+    "CODEX_CHATGPT_BASE_URL",
+)
+_AUTH_FILE_LIMIT = 1 << 20
+_REDACTION_MARKER = b"[REDACTED]"
 
 
 # --- the per-round prompt (continuation semantics; see worker.md) ----------- #
@@ -204,11 +221,156 @@ def _round_error(log_path: Path, rc: int) -> Optional[str]:
         return "Danus gateway unavailable"
     if "codex binary not found" in text or rc == 127:
         return "codex binary not found"
-    for line in reversed(text.splitlines()):
-        clean = line.strip()
-        if clean.startswith("ERROR:"):
-            return clean.removeprefix("ERROR:").strip()[:240]
     return f"Codex round exited with code {rc}"
+
+
+def _auth_string_values(value: object, *, token_context: bool = False) -> set[str]:
+    """Return credential-like strings from one bounded ``auth.json`` value.
+
+    Codex has changed the precise subscription-auth schema over time. Named
+    token/key/secret containers are authoritative, while long strings are
+    conservatively treated as credentials so a new token field cannot silently
+    become loggable.
+    """
+
+    values: set[str] = set()
+    if isinstance(value, str):
+        if value and (token_context or len(value) >= 16):
+            values.add(value)
+    elif isinstance(value, list):
+        for item in value:
+            values.update(_auth_string_values(item, token_context=token_context))
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            normalized = str(key).casefold()
+            sensitive = token_context or any(
+                part in normalized
+                for part in ("token", "secret", "credential", "password", "api_key")
+            )
+            values.update(_auth_string_values(item, token_context=sensitive))
+    return values
+
+
+def _provider_log_secrets(environment: Mapping[str, str]) -> set[str]:
+    """Collect every known provider credential/endpoint before it can log."""
+
+    values = {
+        environment[name]
+        for name in _PROVIDER_LOG_SECRET_ENV
+        if environment.get(name)
+    }
+    home = environment.get("CODEX_HOME")
+    if not home:
+        raise security.WorkerSecurityError("Worker provider CODEX_HOME is unavailable")
+    try:
+        raw_auth = read_private_bytes(
+            Path(home) / "auth.json", maximum=_AUTH_FILE_LIMIT,
+        )
+    except FileNotFoundError:
+        return values
+    except (OSError, SecureIOError) as exc:
+        raise security.WorkerSecurityError(
+            "Worker provider subscription auth is unavailable or unsafe"
+        ) from exc
+    try:
+        auth = json.loads(raw_auth)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise security.WorkerSecurityError(
+            "Worker provider subscription auth is malformed"
+        ) from exc
+    values.update(_auth_string_values(auth, token_context=not isinstance(auth, dict)))
+    return values
+
+
+def _lower_percent_escapes(value: bytes) -> bytes:
+    return re.sub(
+        rb"%[0-9A-F]{2}", lambda match: match.group(0).lower(), value,
+    )
+
+
+def _secret_variants(values: Iterable[str]) -> set[bytes]:
+    """Expand raw secrets to common representations emitted by clients."""
+
+    variants: set[bytes] = set()
+    for value in values:
+        raw = value.encode("utf-8")
+        if not raw:
+            continue
+        variants.add(raw)
+        for encoded in (base64.b64encode(raw), base64.urlsafe_b64encode(raw)):
+            variants.add(encoded)
+            variants.add(encoded.rstrip(b"="))
+        variants.add(raw.hex().encode("ascii"))
+        variants.add(raw.hex().upper().encode("ascii"))
+        percent = quote_from_bytes(raw, safe="").encode("ascii")
+        variants.add(percent)
+        variants.add(_lower_percent_escapes(percent))
+    return {variant for variant in variants if variant}
+
+
+class _StreamingLogRedactor:
+    """Bounded byte-stream redactor which preserves cross-chunk matches."""
+
+    def __init__(self, values: Iterable[str]):
+        patterns = sorted(_secret_variants(values), key=len, reverse=True)
+        self._matcher = (
+            re.compile(b"|".join(re.escape(pattern) for pattern in patterns))
+            if patterns else None
+        )
+        self._overlap = max((len(pattern) for pattern in patterns), default=1) - 1
+        self._buffer = b""
+        self._marker = (
+            b"" if any(pattern in _REDACTION_MARKER for pattern in patterns)
+            else _REDACTION_MARKER
+        )
+
+    def feed(self, chunk: bytes, *, final: bool = False) -> bytes:
+        self._buffer += chunk
+        cutoff = len(self._buffer) if final else max(0, len(self._buffer) - self._overlap)
+        if cutoff == 0:
+            return b""
+        if self._matcher is None:
+            output, self._buffer = self._buffer[:cutoff], self._buffer[cutoff:]
+            return output
+
+        pieces: list[bytes] = []
+        consumed = 0
+        for match in self._matcher.finditer(self._buffer):
+            if match.start() >= cutoff:
+                break
+            pieces.extend((self._buffer[consumed:match.start()], self._marker))
+            consumed = match.end()
+        if consumed < cutoff:
+            pieces.append(self._buffer[consumed:cutoff])
+            consumed = cutoff
+        self._buffer = self._buffer[consumed:]
+        return b"".join(pieces)
+
+
+def _drain_provider_output(
+    source: BinaryIO, destination: TextIO, redactor: _StreamingLogRedactor,
+) -> None:
+    """Copy provider output through the streaming secret boundary."""
+
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    while True:
+        try:
+            chunk = source.read(65536)
+        except (OSError, ValueError):
+            break
+        if not chunk:
+            break
+        rendered = decoder.decode(redactor.feed(chunk))
+        if rendered:
+            destination.write(rendered)
+            destination.flush()
+    try:
+        rendered = decoder.decode(redactor.feed(b"", final=True), final=True)
+        if rendered:
+            destination.write(rendered)
+            destination.flush()
+    except (OSError, ValueError):
+        pass
 
 
 # --- one round ------------------------------------------------------------- #
@@ -216,6 +378,49 @@ def _round_error(log_path: Path, rc: int) -> Optional[str]:
 class _Child:
     """Holds the running codex subprocess so the SIGTERM handler can kill it."""
     proc: "subprocess.Popen | None" = None
+    gateway: "subprocess.Popen | None" = None
+
+
+def _stop_round_children() -> None:
+    """Best-effort stop/reap for both sides of the Worker trust boundary."""
+    for attr in ("proc", "gateway"):
+        process = getattr(_Child, attr)
+        if process is None:
+            continue
+        try:
+            if hasattr(process, "_stop_scope"):
+                # ManagedProvider.wait() already proves its whole cgroup empty.
+                # Re-running the proof after the transient unit is collected can
+                # race cgroupfs teardown and turn a successful round into an
+                # unhandled Worker crash. Only an actually live provider needs
+                # the emergency stop path here.
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        process.process.kill()
+                        process.process.wait(timeout=3)
+            elif process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
+        except (
+            OSError, subprocess.SubprocessError,
+            security.WorkerSecurityError, systemd_scope.SystemdBoundaryError,
+        ):
+            pass
+        finally:
+            closer = getattr(process, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except (OSError, ValueError, systemd_scope.SystemdBoundaryError):
+                    pass
+            setattr(_Child, attr, None)
 
 
 def run_round(wl: L.WorkerLayout, role: dict, prompt: str, log_path: Path,
@@ -224,38 +429,73 @@ def run_round(wl: L.WorkerLayout, role: dict, prompt: str, log_path: Path,
     hard-timeout (terminate → wait 10s → kill), or 127 if the codex binary is
     missing."""
     wdir = wl.dir
-    codex_bin = codex.resolve_bin()
-    cmd = codex.exec_cmd(
-        codex_bin, role["MODEL"], role["REASONING_EFFORT"],
-        "-C", str(wdir),
-        # on an install without .git (tarball download), codex's
-        # trusted-directory check refuses to run the worker round
-        "--skip-git-repo-check",
-        "--dangerously-bypass-approvals-and-sandbox",
-        prompt,
-    )
-    with open(log_path, "w", encoding="utf-8") as logf:
+    try:
+        codex_bin = security.resolve_worker_codex_bin(codex.resolve_bin())
+    except security.WorkerSecurityError as exc:
+        log_path.write_text(f"[worker_loop] Worker security boundary unavailable: {exc}\n", encoding="utf-8")
+        return 126
+    gateway_log_path = log_path.with_name(log_path.stem + ".gateway.log")
+    try:
+        logf_context = secure_open_text(log_path)
+        gateway_context = secure_open_text(gateway_log_path)
+    except (OSError, SecureIOError):
+        return 126
+    with logf_context as logf, gateway_context as gateway_log:
         try:
-            _Child.proc = subprocess.Popen(
-                cmd, stdout=logf, stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL, cwd=str(wdir),
-                env=codex.subprocess_env(codex_bin),
+            _Child.gateway = security.start_host_gateway(wl, gateway_log)
+            # Regenerate host config each round, but the authoritative MCP
+            # binding is the high-precedence one-shot socket CLI override below.
+            scaffold.write_codex_config(wl)
+            provider_cmd = codex.exec_cmd(
+                codex_bin, role["MODEL"], role["REASONING_EFFORT"],
+                *security.codex_security_args(wl, _Child.gateway.provider_socket_path),
+                "-C", str(wdir), "--skip-git-repo-check", "-",
             )
+            provider_cmd[1:1] = security.codex_global_security_args()
+            provider_env = security.worker_provider_env(wl)
+            provider_log_redactor = _StreamingLogRedactor(
+                _provider_log_secrets(provider_env),
+            )
+            _Child.proc = systemd_scope.start_provider_scope(
+                wl, codex_bin=codex_bin, provider_command=provider_cmd,
+                provider_environment=provider_env, gateway=_Child.gateway,
+                runtime_limit=hard_timeout,
+            )
+            security.record_provider_pid(wl, _Child.proc.pid)
         except FileNotFoundError:
-            logf.write(f"[worker_loop] codex binary not found: {cmd[0]}\n")
+            logf.write("[worker_loop] codex binary not found\n")
+            _stop_round_children()
             return 127
+        except (security.WorkerSecurityError, systemd_scope.SystemdBoundaryError):
+            logf.write("[worker_loop] Worker security boundary unavailable\n")
+            _stop_round_children()
+            return 126
+        assert _Child.proc.stdout is not None
+        _Child.proc.send_prompt(prompt)
+
+        def _drain_provider() -> None:
+            if _Child.proc is not None:
+                _drain_provider_output(
+                    _Child.proc.stdout, logf, provider_log_redactor,
+                )
+
+        drain = threading.Thread(target=_drain_provider, daemon=True)
+        drain.start()
         try:
-            return _Child.proc.wait(timeout=hard_timeout if hard_timeout > 0 else None)
+            rc = _Child.proc.wait(timeout=hard_timeout if hard_timeout > 0 else None)
+            drain.join(timeout=3)
+            return rc
         except subprocess.TimeoutExpired:
             _Child.proc.terminate()
             try:
                 _Child.proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 _Child.proc.kill()
+            drain.join(timeout=3)
             logf.write(f"\n[worker_loop] round hard-timeout after {hard_timeout}s\n")
             return 124
         finally:
-            _Child.proc = None
+            _stop_round_children()
 
 
 # --- the loop -------------------------------------------------------------- #
@@ -297,6 +537,7 @@ def _wait_while_paused(wl: L.WorkerLayout) -> None:
 
 
 def main(worker_dir: str) -> int:
+    protect_host_process_secrets()
     wdir = Path(worker_dir).resolve()
     if not wdir.is_dir():
         print(f"worker dir not found: {wdir}", file=sys.stderr)
@@ -323,6 +564,8 @@ def main(worker_dir: str) -> int:
     def _on_term(signum, _frame):
         if _Child.proc is not None:
             _Child.proc.terminate()
+        if _Child.gateway is not None:
+            _Child.gateway.terminate()
         write_status(wl, state="terminated")
         _cleanup_pid(wl)
         sys.exit(0)
@@ -364,7 +607,22 @@ def main(worker_dir: str) -> int:
                 queue_reason=None, queued_at=None,
             )
             try:
-                rc = run_round(wl, role, prompt, log_path, hard_timeout)
+                try:
+                    rc = run_round(wl, role, prompt, log_path, hard_timeout)
+                except Exception as exc:
+                    # A round boundary failure must become observable Worker
+                    # state, never an unhandled outer-loop exit that leaves a
+                    # persisted "running" status. Keep the detail structural so
+                    # provider output/secrets cannot leak through status APIs.
+                    try:
+                        with secure_open_text(log_path, append=True) as logf:
+                            logf.write(
+                                "\n[worker_loop] round boundary exception: "
+                                f"{type(exc).__name__}\n"
+                            )
+                    except (OSError, SecureIOError):
+                        pass
+                    rc = 126
             finally:
                 _release_worker_slot(slot)
             last_error = _round_error(log_path, rc)

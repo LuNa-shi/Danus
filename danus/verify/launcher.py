@@ -1,11 +1,9 @@
 """Cold-start codex launcher for the verify service.
 
-Each /verify spawns a fresh ``codex exec`` session (the verify agent), driven by
-AGENT_HOME/AGENTS.md + the verify skills, which writes ``verification.json`` to
-the run dir. Stateless. The injected MCP server is ``python -m danus.gateway``
-(installed package, role=verifier); the codex binary + model/effort are resolved
-via the shared ``danus.codex`` launcher (config read at CALL time, so the service
-is testable/reconfigurable).
+Each /verify asks an injected trusted transient-service adapter to spawn one
+fresh ``codex exec`` session. Candidate text is framed stdin, never argv. The
+provider uses a high-priority permission profile and an absolute isolated-Python
+MCP entry; it writes ``verification.json`` into one private run directory.
 
 Config (env):
   DANUS_CODEX_BIN,
@@ -13,6 +11,7 @@ Config (env):
   DANUS_VERIFY_EFFORT (default xhigh),
   CODEX_TIMEOUT_SECONDS (0 = no timeout),
   VERIFY_AGENT_HOME (the codex `-C` dir: AGENTS.md + .agents/skills + .codex),
+  DANUS_VERIFY_PROVIDER_HOME (isolated provider CODEX_HOME),
   VERIFIER_RESULTS_DIR (run dirs; gitignored).
 """
 
@@ -21,8 +20,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shlex
-import subprocess
+import pwd
+import re
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -30,18 +30,288 @@ from typing import Any, Dict, List, Optional
 from fastapi import HTTPException
 
 from danus import codex
+from danus.execution import security as execution_security
+from danus.secure_io import (
+    SecureIOError,
+    atomic_write_bytes,
+    atomic_write_text,
+    ensure_private_dir,
+    read_private_bytes,
+    secure_unlink,
+)
+from .runner import (
+    TrustedVerifierRunner,
+    TrustedVerifierTimeout,
+    TrustedVerifierUnavailable,
+    VerifierRunRequest,
+    run_with_trusted_supervisor,
+    trusted_entry_argv,
+)
+from .trusted_python import TrustedPythonError, trusted_python_executable
 
 _HERE = Path(__file__).resolve().parent  # danus/verify/
 _REPO_ROOT = _HERE.parent.parent         # repo root (danus/verify -> danus -> root)
 VERIFICATION_FILENAMES = ("verification.json", "verificationt.json")
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_PROVIDER_ENV_ALLOWLIST = {
+    "OPENAI_API_KEY",
+    "DANUS_CODEX_API_KEY",
+    "OPENAI_BASE_URL",
+    "CODEX_API_BASE_URL",
+    "OPENAI_CHATGPT_BASE_URL",
+    "CODEX_CHATGPT_BASE_URL",
+}
+_CERTIFICATE_ROOTS = tuple(
+    path for path in (
+        Path("/etc/ssl"), Path("/etc/pki"),
+        Path("/usr/share/ca-certificates"),
+        Path("/usr/local/share/ca-certificates"),
+    ) if path.exists()
+)
+
+# The deployment filesystem is idmapped: host-root-owned system files appear
+# as uid 65534 inside this container.  Only paths constrained to the fixed
+# system CA roots use this compatibility set; project/provider payloads remain
+# restricted to root or the serving uid.
+_SYSTEM_OWNER_UIDS = frozenset({0, os.getuid(), 65534})
+
+
+class VerifierProviderConfigurationError(RuntimeError):
+    """Provider auth/runtime configuration is absent, unsafe, or inconsistent."""
 
 
 # --------------------------------------------------------------------------- #
 # config resolution (env read at call time)                                   #
 # --------------------------------------------------------------------------- #
 
+def _configured_directory(name: str, default: Path, label: str) -> Path:
+    """Resolve one dedicated verifier directory without accepting broad roots."""
+
+    raw = os.environ.get(name)
+    path = Path(raw).expanduser().absolute() if raw else default.absolute()
+    normalized = Path(os.path.abspath(path))
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+    broad = {
+        Path("/"), Path("/home"), Path("/root"), Path("/tmp"),
+        Path("/var"), Path("/var/tmp"), Path("/run"), Path("/opt"),
+        Path("/srv"), Path("/mnt"), Path("/media"), home,
+        _REPO_ROOT, _REPO_ROOT / "runtime", _HERE, _HERE.parent,
+        *_REPO_ROOT.parents,
+    }
+    sensitive = {
+        home / ".ssh", home / ".gnupg", home / ".aws",
+        home / ".config", home / ".local" / "share" / "keyrings",
+        home / ".codex", home / ".nurouter",
+    }
+    host_codex = os.environ.get("CODEX_HOME")
+    if host_codex:
+        sensitive.add(Path(host_codex).expanduser().absolute())
+    if (
+        path != normalized
+        or path in broad
+        or any(path == root or path.is_relative_to(root) for root in sensitive)
+    ):
+        raise VerifierProviderConfigurationError(f"{label} is unsafe")
+    return path
+
+
 def _agent_home() -> Path:
-    return Path(os.getenv("VERIFY_AGENT_HOME", str(_HERE / "agent"))).resolve()
+    return _configured_directory(
+        "VERIFY_AGENT_HOME", _HERE / "agent", "verifier agent home",
+    )
+
+
+def _provider_home_path() -> Path:
+    runtime = os.environ.get("DANUS_RUNTIME")
+    root = Path(runtime).expanduser().absolute() if runtime else _REPO_ROOT / "runtime"
+    return _configured_directory(
+        "DANUS_VERIFY_PROVIDER_HOME", root / "verifier-codex-state",
+        "verifier provider home",
+    )
+
+
+def _prepare_provider_home() -> Path:
+    """Provision a private verifier-only CODEX_HOME with no unrelated config."""
+    home = _provider_home_path()
+    try:
+        ensure_private_dir(home)
+        ensure_private_dir(home / "tmp")
+        destination = home / "auth.json"
+        if os.environ.get("OPENAI_API_KEY") or os.environ.get("DANUS_CODEX_API_KEY"):
+            secure_unlink(destination, missing_ok=True)
+            return home
+        host_home = os.environ.get("CODEX_HOME")
+        if not host_home:
+            raise VerifierProviderConfigurationError(
+                "verifier provider authentication is unavailable"
+            )
+        source = Path(host_home).expanduser().absolute() / "auth.json"
+        auth = read_private_bytes(source, minimum=2, maximum=1 << 20)
+        atomic_write_bytes(destination, auth, mode=0o600)
+        return home
+    except VerifierProviderConfigurationError:
+        raise
+    except (OSError, SecureIOError) as exc:
+        raise VerifierProviderConfigurationError(
+            "verifier provider authentication is unavailable or unsafe"
+        ) from exc
+
+
+def _validated_certificate_path(name: str, value: str) -> str:
+    """Resolve only system CA material; never turn a CA override into a host bind."""
+
+    path = Path(value).expanduser()
+    try:
+        if not path.is_absolute() or path != Path(os.path.abspath(path)):
+            raise VerifierProviderConfigurationError(
+                "verifier certificate configuration is unsafe"
+            )
+        resolved = path.resolve(strict=True)
+        info = resolved.stat()
+    except VerifierProviderConfigurationError:
+        raise
+    except OSError as exc:
+        raise VerifierProviderConfigurationError(
+            "verifier certificate configuration is unsafe"
+        ) from exc
+    expected_type = stat.S_ISREG if name == "SSL_CERT_FILE" else stat.S_ISDIR
+    if (
+        name not in {"SSL_CERT_FILE", "SSL_CERT_DIR"}
+        or not expected_type(info.st_mode)
+        or info.st_uid not in _SYSTEM_OWNER_UIDS
+        or info.st_mode & 0o002
+        or not any(
+            resolved == root or resolved.is_relative_to(root)
+            for root in _CERTIFICATE_ROOTS
+        )
+    ):
+        raise VerifierProviderConfigurationError(
+            "verifier certificate configuration is unsafe"
+        )
+    return str(resolved)
+
+
+def _safe_executable(path: Path, label: str) -> Path:
+    try:
+        resolved = path.resolve(strict=True)
+        info = resolved.stat()
+    except OSError as exc:
+        raise VerifierProviderConfigurationError(f"{label} is unavailable") from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid not in {0, os.getuid()}
+        or info.st_mode & 0o002
+    ):
+        raise VerifierProviderConfigurationError(f"{label} is unsafe")
+    return resolved
+
+
+def _safe_real_file(path: Path, label: str, *, executable: bool = False) -> Path:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise VerifierProviderConfigurationError(f"{label} is unavailable") from exc
+    if (
+        not path.is_absolute()
+        or stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_uid not in {0, os.getuid()}
+        or info.st_mode & 0o002
+        or (executable and not info.st_mode & 0o111)
+    ):
+        raise VerifierProviderConfigurationError(f"{label} is unsafe")
+    return path
+
+
+def _read_safe_json(path: Path, label: str) -> dict[str, object]:
+    _safe_real_file(path, label)
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > (1 << 20):
+                raise VerifierProviderConfigurationError(f"{label} is unsafe")
+            raw = os.read(fd, (1 << 20) + 1)
+        finally:
+            os.close(fd)
+        value = json.loads(raw)
+    except VerifierProviderConfigurationError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise VerifierProviderConfigurationError(f"{label} is unavailable") from exc
+    if not isinstance(value, dict):
+        raise VerifierProviderConfigurationError(f"{label} is unsafe")
+    return value
+
+
+def _official_codex_runtime() -> tuple[Path, Path, Path]:
+    """Return the bootstrap-pinned official native CLI, JS entry, and bwrap."""
+
+    try:
+        return execution_security.trusted_codex_runtime()
+    except execution_security.WorkerSecurityError as exc:
+        # Do not expose selector/package details to the verifier HTTP surface.
+        raise VerifierProviderConfigurationError(
+            "verifier upstream Codex runtime is unavailable or unsafe"
+        ) from exc
+
+
+def _sha256_real_file(path: Path, label: str) -> str:
+    _safe_real_file(path, label, executable=True)
+    digest = hashlib.sha256()
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+        try:
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise VerifierProviderConfigurationError(f"{label} is unavailable") from exc
+    return digest.hexdigest()
+
+
+def _validated_nurouter_launcher(candidate: Path) -> bool:
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    expected = home / ".local" / "bin" / "codex"
+    if candidate != expected:
+        return False
+    marker = candidate.parent / ".nurouter-codex-launcher.json"
+    value = _read_safe_json(marker, "host Codex launcher marker")
+    if (
+        value.get("schema_version") != 2
+        or value.get("kind") != "codex"
+        or value.get("nurouter_home") != str(home / ".nurouter")
+        or value.get("launcher_sha256")
+            != _sha256_real_file(candidate, "host Codex launcher")
+    ):
+        raise VerifierProviderConfigurationError("host Codex launcher is unsafe")
+    return True
+
+
+def _provider_codex_bin(test_binary: str | None = None) -> str:
+    """Select only the validated official native CLI in production.
+
+    Deterministic plumbing tests pass a binary through the explicit private
+    argument; no environment variable or launcher marker can select an arbitrary
+    production executable.
+    """
+
+    if test_binary is not None:
+        return str(_safe_executable(Path(test_binary), "test verifier provider"))
+    native, javascript, _bwrap = _official_codex_runtime()
+    raw = codex.resolve_bin()
+    try:
+        return execution_security.resolve_trusted_codex_bin(raw)
+    except execution_security.WorkerSecurityError as exc:
+        raise VerifierProviderConfigurationError(
+            "verifier Codex selector is unsafe"
+        ) from exc
 
 
 def _relink(link: Path, target: Path) -> None:
@@ -79,7 +349,9 @@ def ensure_agent_home() -> Path:
 
 
 def _results_root() -> Path:
-    return Path(os.getenv("VERIFIER_RESULTS_DIR", str(_HERE / "runs"))).resolve()
+    return _configured_directory(
+        "VERIFIER_RESULTS_DIR", _HERE / "runs", "verifier results storage",
+    )
 
 
 def _model() -> str:
@@ -95,10 +367,48 @@ def _timeout() -> Optional[int]:
 
 
 def _mcp_config_arg() -> str:
-    """Inject the danus gateway (role=verifier) into the codex agent via `-c`,
-    independent of CODEX_HOME. Runs the installed package (``python3 -m
-    danus.gateway``); the verifier role exposes only search_arxiv_theorems."""
-    return 'mcp_servers.danus={command="python3",args=["-m","danus.gateway"],env={DANUS_ROLE="verifier"}}'
+    """Inject the credential-scrubbing, read-only verifier MCP entry."""
+    python = trusted_python_executable()
+    entry = str((_HERE / "mcp_entry.py").resolve())
+    return (
+        "mcp_servers.danus={"
+        f"command={json.dumps(python)},"
+        f"args=[\"-I\",{json.dumps(entry)}],"
+        "env={PYTHONDONTWRITEBYTECODE=\"1\",PYTHONSAFEPATH=\"1\"}}"
+    )
+
+
+def _toml(value: str) -> str:
+    return json.dumps(value, ensure_ascii=True)
+
+
+def _permission_profile_arg(run_id: str) -> str:
+    """High-priority model-command policy for exactly one verifier run."""
+    run_dir = _results_dir(run_id)
+    filesystem = {
+        ":minimal": "read",
+        str(_agent_home()): "read",
+        str(_REPO_ROOT / "agents"): "read",
+        str(_REPO_ROOT / "danus"): "read",
+        str(run_dir): "write",
+        "/proc": "deny",
+    }
+    filesystem[str(_provider_home_path())] = "deny"
+    python = Path(trusted_python_executable())
+    filesystem[str(python.parent.parent)] = "read"
+    javascript = os.environ.get("DANUS_CODEX_JS")
+    if javascript:
+        filesystem[str(Path(javascript).resolve(strict=False).parent.parent)] = "read"
+    node = os.environ.get("DANUS_NODE")
+    if node:
+        filesystem[str(Path(node).resolve(strict=False).parent.parent)] = "read"
+    fs = ",".join(
+        f"{_toml(path)}={_toml(access)}" for path, access in filesystem.items()
+    )
+    return (
+        "{description=\"Danus isolated verifier\","
+        f"filesystem={{{fs}}},network={{enabled=false}}}}"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -117,12 +427,15 @@ def _allocate_run_id(statement: str) -> str:
     """Claim a unique run dir atomically (mkdir exist_ok=False, retry with a
     numeric suffix) so concurrent verifiers sharing RESULTS_ROOT never clobber."""
     root = _results_root()
-    root.mkdir(parents=True, exist_ok=True)
+    try:
+        ensure_private_dir(root)
+    except (OSError, SecureIOError) as exc:
+        raise RuntimeError("verifier results storage is unavailable") from exc
     base = generate_run_id(statement)
     run_id, suffix = base, 1
     for _ in range(10000):
         try:
-            (root / run_id).mkdir(parents=False, exist_ok=False)
+            (root / run_id).mkdir(parents=False, exist_ok=False, mode=0o700)
             return run_id
         except FileExistsError:
             suffix += 1
@@ -153,61 +466,208 @@ def build_prompt(run_id: str, statement: str, proof: str) -> str:
     )
 
 
-def build_codex_command(run_id: str, statement: str, proof: str) -> List[str]:
+def build_codex_command(
+    run_id: str, *, _test_provider_bin: str | None = None,
+) -> List[str]:
+    if not _RUN_ID_RE.fullmatch(run_id):
+        raise ValueError("invalid verifier run identity")
+    run_dir = _results_dir(run_id)
+    shell_env = (
+        "{PATH=\"/usr/local/bin:/usr/bin:/bin\",HOME="
+        + _toml(str(run_dir))
+        + ",LANG=\"C.UTF-8\",TMPDIR="
+        + _toml(str(run_dir / "tmp"))
+        + "}"
+    )
     return codex.exec_cmd(
-        codex.resolve_bin(), _model(), _effort(),
+        _provider_codex_bin(_test_provider_bin), _model(), _effort(),
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--strict-config",
+        "--config", 'approval_policy="never"',
+        "--config", "allow_login_shell=false",
+        "--config", 'default_permissions="danus_verifier"',
+        "--config", f"permissions.danus_verifier={_permission_profile_arg(run_id)}",
+        "--config", 'shell_environment_policy.inherit="none"',
+        "--config", "shell_environment_policy.ignore_default_excludes=false",
+        "--config", f"shell_environment_policy.set={shell_env}",
         "-C", str(_agent_home()),
         # on an install without .git (tarball download), codex's
         # trusted-directory check refuses to run (exit 1 → /verify HTTP 500)
         "--skip-git-repo-check",
         "-c", _mcp_config_arg(),
-        "--dangerously-bypass-approvals-and-sandbox",
-        build_prompt(run_id=run_id, statement=statement, proof=proof),
+        "-",
     )
 
 
-def run_codex_verification(run_id: str, statement: str, proof: str) -> Dict[str, Any]:
-    """Spawn the cold-start codex verifier; read back + return the verification
-    JSON. Raises HTTPException 504 (timeout) / 500 (nonzero exit, no output, or
-    bad/non-dict JSON) — the callers translate these into the fact_submit
-    verify-error path."""
-    results_dir = _results_dir(run_id)
-    results_dir.mkdir(parents=True, exist_ok=True)
-    log_path = results_dir / "log.md"
-    ensure_agent_home()  # provision the codex -C home on a fresh checkout (idempotent)
-    cmd = build_codex_command(run_id=run_id, statement=statement, proof=proof)
-    env = codex.subprocess_env(cmd[0])
+def _provider_environment(command: List[str]) -> Dict[str, str]:
+    """Build a complete minimal environment, never an inherited overlay."""
+    env = {
+        name: value
+        for name in _PROVIDER_ENV_ALLOWLIST
+        if (value := os.environ.get(name))
+    }
+    for name in ("SSL_CERT_FILE", "SSL_CERT_DIR"):
+        if value := os.environ.get(name):
+            env[name] = _validated_certificate_path(name, value)
+    home = str(_prepare_provider_home())
+    env["CODEX_HOME"] = home
+    env["HOME"] = home
+    env["TMPDIR"] = str(Path(home) / "tmp")
+    binary_dir = str(Path(command[0]).resolve(strict=False).parent)
+    node = os.environ.get("DANUS_NODE")
+    node_dir = str(Path(node).resolve(strict=False).parent) if node else ""
+    path_parts = [
+        part for part in (
+            binary_dir, node_dir, "/usr/local/bin", "/usr/bin", "/bin",
+        ) if part
+    ]
+    env.update({
+        "PATH": os.pathsep.join(dict.fromkeys(path_parts)),
+        "LANG": "C.UTF-8",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONSAFEPATH": "1",
+    })
+    return env
 
-    started_at = datetime.now(timezone.utc).isoformat()
+
+def _provider_isolation_paths(
+    command: List[str], environment: Dict[str, str], entry_argv: tuple[str, ...],
+    run_dir: Path,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Describe the complete filesystem contract required by the host adapter."""
+    lexical_python = Path(entry_argv[0]).absolute()
+    # Do not bind the host /proc back into a PrivatePIDs service.  systemd
+    # mounts a PID-namespace-specific procfs automatically; re-exposing the
+    # host tree would make `/proc/1` systemd and defeat the namespace proof.
+    read_only = [
+        Path("/usr"), Path("/etc"), Path("/sys"),
+        _REPO_ROOT / "danus", _REPO_ROOT / "agents", _agent_home(),
+        Path(command[0]).resolve(strict=False),
+        lexical_python.parent.parent,
+        lexical_python.resolve(strict=False).parent.parent,
+        Path(entry_argv[2]).resolve(strict=False),
+    ]
+    if lexical_python.is_symlink():
+        target = Path(os.readlink(lexical_python))
+        if not target.is_absolute():
+            target = lexical_python.parent / target
+        # With ProtectHome=tmpfs, binding only the lexical venv and final
+        # resolved UV installation is insufficient: the venv symlink may point
+        # through UV's unversioned installation alias.  Reopen that immediate
+        # target root as part of the exact contract as well.
+        read_only.append(Path(os.path.abspath(target)).parent.parent)
+    for name in ("DANUS_CODEX_JS", "DANUS_NODE", "SSL_CERT_FILE", "SSL_CERT_DIR"):
+        value = os.environ.get(name) if name.startswith("DANUS_") else environment.get(name)
+        if value:
+            path = Path(value).expanduser().resolve(strict=False)
+            read_only.append(path.parent.parent if name in {"DANUS_CODEX_JS", "DANUS_NODE"} else path)
+    resolver = Path("/etc/resolv.conf").resolve(strict=False)
+    if resolver != Path("/etc/resolv.conf"):
+        read_only.append(resolver)
+    read_write = [
+        run_dir,
+        Path(environment["CODEX_HOME"]),
+    ]
+
+    def unique(paths: List[Path]) -> tuple[str, ...]:
+        values: dict[str, None] = {}
+        for path in paths:
+            values[str(path.expanduser().absolute())] = None
+        return tuple(values)
+
+    return unique(read_only), unique(read_write)
+
+
+def run_codex_verification(
+    run_id: str,
+    statement: str,
+    proof: str,
+    *,
+    runner: TrustedVerifierRunner | None = None,
+    _test_provider_bin: str | None = None,
+) -> Dict[str, Any]:
+    """Run one cold verifier through the trusted-supervisor seam and validate output."""
+    if not _RUN_ID_RE.fullmatch(run_id):
+        raise HTTPException(status_code=500, detail="invalid verifier run identity")
+    results_dir = _results_dir(run_id)
     try:
-        with log_path.open("w", encoding="utf-8") as log_handle:
-            log_handle.write(f"started_at_utc: {started_at}\n")
-            log_handle.write(f"command: {shlex.join(cmd)}\n\n")
-            log_handle.flush()
-            completed = subprocess.run(
-                cmd, cwd=_agent_home(), env=env,
-                stdin=subprocess.DEVNULL, stdout=log_handle, stderr=subprocess.STDOUT,
-                text=True, timeout=_timeout(), check=False,
-            )
-    except subprocess.TimeoutExpired as exc:
-        raise HTTPException(status_code=504,
-                            detail=f"codex exec timed out after {exc.timeout}s. See log at {log_path}") from exc
+        ensure_private_dir(_results_root())
+        results_dir.mkdir(parents=False, exist_ok=True, mode=0o700)
+        results_dir.chmod(0o700)
+    except (OSError, SecureIOError) as exc:
+        raise HTTPException(status_code=503, detail="verifier storage unavailable") from exc
+    try:
+        ensure_private_dir(results_dir / "tmp")
+        ensure_agent_home()
+        cmd = build_codex_command(run_id, _test_provider_bin=_test_provider_bin)
+        prompt = build_prompt(run_id, statement, proof).encode("utf-8")
+        entry_argv = trusted_entry_argv()
+        provider_environment = _provider_environment(cmd)
+        read_only_paths, read_write_paths = _provider_isolation_paths(
+            cmd, provider_environment, entry_argv, results_dir,
+        )
+        timeout_seconds = _timeout()
+    except (
+        OSError,
+        SecureIOError,
+        TrustedPythonError,
+        TrustedVerifierUnavailable,
+        VerifierProviderConfigurationError,
+        ValueError,
+    ) as exc:
+        raise HTTPException(
+            status_code=503, detail="verifier provider configuration unavailable",
+        ) from exc
+    request = VerifierRunRequest(
+        run_id=run_id,
+        entry_argv=entry_argv,
+        provider_argv=tuple(cmd),
+        provider_environment=provider_environment,
+        prompt=prompt,
+        timeout_seconds=timeout_seconds,
+        read_only_paths=read_only_paths,
+        read_write_paths=read_write_paths,
+    )
+    try:
+        completed = run_with_trusted_supervisor(request, adapter=runner)
+    except TrustedVerifierTimeout as exc:
+        raise HTTPException(status_code=504, detail="verifier provider timed out") from exc
+    except TrustedVerifierUnavailable as exc:
+        raise HTTPException(status_code=503, detail="verifier security boundary unavailable") from exc
+
+    record = {
+        "duration_ms": round(float(completed.duration_seconds) * 1000, 3),
+        "input_sha256": hashlib.sha256(prompt).hexdigest(),
+        "rc": completed.returncode,
+        "run_id": run_id,
+        "schema": 1,
+        "stdout_bytes": completed.stdout_bytes,
+        "stdout_sha256": completed.stdout_sha256,
+    }
+    try:
+        atomic_write_text(
+            results_dir / "run.json",
+            json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n",
+            mode=0o600,
+        )
+    except (OSError, SecureIOError) as exc:
+        raise HTTPException(status_code=503, detail="verifier audit log unavailable") from exc
 
     if completed.returncode != 0:
-        raise HTTPException(status_code=500,
-                            detail=f"codex exec failed with exit code {completed.returncode}. See log at {log_path}")
+        raise HTTPException(status_code=500, detail="verifier provider exited unsuccessfully")
 
     verification_path = _verification_path(run_id)
     if verification_path is None:
-        expected = results_dir / VERIFICATION_FILENAMES[0]
-        raise HTTPException(status_code=500,
-                            detail=f"verification output was not found at {expected}. See log at {log_path}")
+        raise HTTPException(status_code=500, detail="verification output was not found")
     try:
-        payload = json.loads(verification_path.read_text(encoding="utf-8"))
+        payload = json.loads(
+            read_private_bytes(verification_path, minimum=2, maximum=4 << 20)
+        )
     except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=500,
-                            detail=f"verification output at {verification_path} is not valid JSON") from exc
+        raise HTTPException(status_code=500, detail="verification output is not valid JSON") from exc
+    except (OSError, SecureIOError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=500, detail="verification output is unavailable or unsafe") from exc
     if not isinstance(payload, dict):
-        raise HTTPException(status_code=500,
-                            detail=f"verification output at {verification_path} must be a JSON object")
+        raise HTTPException(status_code=500, detail="verification output must be a JSON object")
     return payload

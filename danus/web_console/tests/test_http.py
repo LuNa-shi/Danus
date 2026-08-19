@@ -694,7 +694,9 @@ def test_real_runtime_adapter_keeps_two_project_contexts_isolated(tmp_path: Path
     original_spawn = cli.spawn_loop
     cli.spawn_loop = lambda worker_dir: 999_999_999
     try:
-        adapter = DanusRuntimeAdapter(tmp_path / "agents")
+        adapter = DanusRuntimeAdapter(
+            tmp_path / "agents", _allow_legacy_process_test_seam=True,
+        )
         a = adapter.create_project("A", "alpha problem", "high:1", max_parallel_workers=1)
         b = adapter.create_project("B", "beta problem", "high:1", max_parallel_workers=1)
         assert (tmp_path / "agents" / "A" / "PROBLEM.md").read_text() == "alpha problem\n"
@@ -1242,6 +1244,10 @@ def test_config_project_capacity_and_assignment_gate_are_server_enforced(tmp_pat
         effort = "xhigh"
 
     monkeypatch.setenv("DANUS_CONSULT_TRANSPORT", "off")
+    # This test exercises the explicit Catalog/Main fixtures, not deployment
+    # credentials inherited by the pytest process.
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("CODEX_API_BASE_URL", raising=False)
     runtime = FakeRuntime(tmp_path / "projects")
     settings = AppSettings(
         database_path=tmp_path / "console.sqlite3",
