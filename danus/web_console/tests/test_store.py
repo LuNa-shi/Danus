@@ -34,13 +34,32 @@ print("ok")
 def test_projects_remain_visible_after_store_restart(tmp_path: Path):
     database = tmp_path / "console.sqlite3"
     first = ConsoleStore(database)
+    now = time.time()
     first.add_project({
         "id": "project-1", "name": "Persistent", "runtime_name": "Persistent",
         "problem": "keep this", "roles": "high:1", "worker_model": None,
-        "max_parallel_workers": 1, "created_at": time.time(),
+        "max_parallel_workers": 1, "created_at": now,
     })
+    first.add_message({
+        "id": "message-1", "project_id": "project-1", "role": "user",
+        "text": "persisted message", "status": "completed", "created_at": now,
+        "error": None,
+    })
+    first.add_main_agent_event(
+        project_id="project-1", message_id="message-1",
+        event_type="agent.message", payload={"detail": "persisted event"},
+        created_at=now,
+    )
+    first.add_run({
+        "id": "run-1", "project_id": "project-1", "duration_seconds": 3600,
+        "started_at": now, "deadline": now + 3600, "status": "running",
+    })
+
     restarted = ConsoleStore(database)
     projects = restarted.projects()
     assert [(project["id"], project["name"], project["problem"]) for project in projects] == [
         ("project-1", "Persistent", "keep this"),
     ]
+    assert restarted.messages("project-1")[0]["text"] == "persisted message"
+    assert restarted.main_agent_events("project-1")[0]["detail"] == "persisted event"
+    assert restarted.active_run("project-1")["id"] == "run-1"

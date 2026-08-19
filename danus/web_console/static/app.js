@@ -899,6 +899,12 @@ function renderProjectList(rows) {
   }).join("") || '<div class="project-list-empty">还没有项目<br><span>从中间的输入框开始</span></div>';
 }
 
+function renderProjectLoadFailure(error) {
+  $("project-count").textContent = "—";
+  $("project-list").innerHTML = '<div class="project-list-empty error">项目记录暂时无法读取<br><span>数据仍保留在服务器，请稍后重试</span></div>';
+  notify(error.message || "项目记录暂时无法读取", "error");
+}
+
 async function refreshProjects() {
   const rows = await api("/api/projects");
   renderProjectList(rows);
@@ -2453,7 +2459,11 @@ $("login-form").addEventListener("submit", async (event) => {
     state.csrf = result.csrf_token;
     showConsole();
     await loadConfiguration();
-    await refreshProjects();
+    try {
+      await refreshProjects();
+    } catch (error) {
+      renderProjectLoadFailure(error);
+    }
     bindEmptyState();
   } catch (error) {
     errorNode.textContent = error.message || "登录失败";
@@ -2488,8 +2498,7 @@ bindRailResizer("project-rail-resizer", "project");
     try {
       await refreshProjects();
     } catch (error) {
-      $("project-list").innerHTML = '<div class="project-list-empty error">项目记录暂时无法读取<br><span>数据仍保留在服务器，请稍后重试</span></div>';
-      notify(error.message || "项目记录暂时无法读取", "error");
+      renderProjectLoadFailure(error);
     }
     bindEmptyState();
   } catch {
