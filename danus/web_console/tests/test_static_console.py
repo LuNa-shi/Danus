@@ -837,3 +837,11 @@ console.log(JSON.stringify(elements));
     assert "已选择 6 小时" in elements["run-budget-preview"]["textContent"]
     assert "显示上次成功获取的 Run Budget 与 Deadline" in elements["run-budget-preview"]["textContent"]
     assert "stale" in elements["run-budget-preview"]["className"]
+
+
+def test_initial_project_storage_failure_is_not_rendered_as_an_empty_project_list():
+    app = _asset("app.js")
+    assert "项目记录暂时无法读取" in app
+    assert "数据仍保留在服务器，请稍后重试" in app
+    assert 'notify(error.message || "项目记录暂时无法读取", "error")' in app
+    assert app.count("renderProjectLoadFailure(error);") == 2
