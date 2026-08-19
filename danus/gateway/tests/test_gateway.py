@@ -202,8 +202,12 @@ def test_verify_http_roundtrip_and_errors():
     # exercise the REAL _verify (local HTTP, offline-safe on 127.0.0.1)
     import http.server
     import threading
+    from concurrent.futures import ThreadPoolExecutor
 
-    captured = {}
+    from danus.verify.capability import verify_worker_capability
+
+    captured = {"authorizations": []}
+    captured_lock = threading.Lock()
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *a):  # silence
@@ -213,33 +217,145 @@ def test_verify_http_roundtrip_and_errors():
             n = int(self.headers.get("Content-Length", 0))
             captured["body"] = self.rfile.read(n).decode("utf-8")
             captured["ctype"] = self.headers.get("Content-Type")
+            with captured_lock:
+                captured["authorizations"].append(self.headers.get("Authorization"))
+            captured["project"] = self.headers.get("X-Danus-Project")
+            captured["worker"] = self.headers.get("X-Danus-Worker")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(b'{"verdict": "correct", "verification_report": {"ok": true}}')
 
-    srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{srv.server_address[1]}/verify"
-    try:
-        # not set -> RuntimeError
-        with _env(DANUS_VERIFY_URL=None):
-            try:
-                server._verify("s", "p")
-                assert False, "should raise when DANUS_VERIFY_URL unset"
-            except RuntimeError as e:
-                assert "DANUS_VERIFY_URL" in str(e)
-        # a real POST round-trip; the body is the JSON we sent
-        with _env(DANUS_VERIFY_URL=url, DANUS_VERIFY_TIMEOUT="5"):
-            out = server._verify("S(n)=n^2", "induction")
-            assert out["verdict"] == "correct"
-        assert '"statement": "S(n)=n^2"' in captured["body"]
-        assert captured["ctype"] == "application/json"
-        # a garbage timeout falls back to the default (no crash)
-        with _env(DANUS_VERIFY_URL=url, DANUS_VERIFY_TIMEOUT="not-an-int"):
-            assert server._verify("s", "p")["verdict"] == "correct"
-    finally:
-        srv.shutdown()
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            project = Path(d).name
+            identity = {
+                "DANUS_PROJECT_DIR": d,
+                "DANUS_AUTHOR": "worker-1",
+                "DANUS_RUNTIME": d,
+                "DANUS_VERIFY_CAPABILITY_SECRET_FILE": str(Path(d) / "verify.key"),
+                "DANUS_VERIFY_PROJECT": project,
+                "DANUS_VERIFY_WORKER": "worker-1",
+            }
+            # not set -> RuntimeError
+            with _env(DANUS_VERIFY_URL=None, **identity):
+                try:
+                    server._verify("s", "p")
+                    assert False, "should raise when DANUS_VERIFY_URL unset"
+                except RuntimeError as e:
+                    assert "DANUS_VERIFY_URL" in str(e)
+            # a real POST round-trip; the body is the JSON we sent
+            with _env(DANUS_VERIFY_URL=url, DANUS_VERIFY_TIMEOUT="5", **identity):
+                out = server._verify("S(n)=n^2", "induction")
+                assert out["verdict"] == "correct"
+            assert '"statement": "S(n)=n^2"' in captured["body"]
+            assert captured["ctype"] == "application/json"
+            assert captured["project"] == project and captured["worker"] == "worker-1"
+            # a garbage timeout falls back to the default (no crash)
+            with _env(DANUS_VERIFY_URL=url, DANUS_VERIFY_TIMEOUT="not-an-int", **identity):
+                assert server._verify("s", "p")["verdict"] == "correct"
+            with _env(DANUS_VERIFY_URL=url, DANUS_VERIFY_TIMEOUT="5", **identity):
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    results = list(pool.map(lambda n: server._verify(f"s{n}", "p"), range(2)))
+                assert all(item["verdict"] == "correct" for item in results)
+            tokens = [value.removeprefix("Bearer ") for value in captured["authorizations"]]
+            assert len(tokens) == 4 and len(set(tokens)) == 4
+            with _env(**identity):
+                for token in tokens:
+                    assert verify_worker_capability(token, project, "worker-1") is True
+                    assert verify_worker_capability(token, project, "worker-1") is False
+        finally:
+            srv.shutdown()
+
+
+def test_verify_rejects_noncanonical_or_nonloopback_endpoint_before_minting():
+    marker = "attacker-endpoint-must-not-be-reflected"
+    bad_urls = (
+        f"https://127.0.0.1:8091/verify#{marker}",
+        f"http://localhost:8091/verify?{marker}",
+        f"http://127.0.0.2:8091/verify/{marker}",
+        f"http://user@127.0.0.1:8091/verify#{marker}",
+        f"http://127.0.0.1:8091/verify?next={marker}",
+        f"http://127.0.0.1:8091/verify#{marker}",
+        f"http://127.0.0.1:08091/verify#{marker}",
+        f"http://127.0.0.1:99999/verify#{marker}",
+        f"http://example.invalid/verify?{marker}",
+    )
+    with tempfile.TemporaryDirectory() as d:
+        project = Path(d).name
+        secret = Path(d) / "verify.key"
+        identity = {
+            "DANUS_PROJECT_DIR": d,
+            "DANUS_AUTHOR": "worker-1",
+            "DANUS_RUNTIME": d,
+            "DANUS_VERIFY_CAPABILITY_SECRET_FILE": str(secret),
+            "DANUS_VERIFY_PROJECT": project,
+            "DANUS_VERIFY_WORKER": "worker-1",
+        }
+        for url in bad_urls:
+            with _env(DANUS_VERIFY_URL=url, **identity):
+                try:
+                    server._verify("s", "p")
+                    assert False, "unsafe verifier endpoint must fail closed"
+                except RuntimeError as exc:
+                    assert str(exc) == "verifier endpoint configuration is unsafe"
+                    assert marker not in str(exc) and url not in str(exc)
+            assert not secret.exists(), "an unsafe endpoint must be rejected before bearer minting"
+        with _env(DANUS_VERIFY_URL="http://[::1]:8091/verify", **identity):
+            assert server._verify_endpoint() == "http://[::1]:8091/verify"
+
+
+def test_verify_does_not_follow_redirect_with_bearer():
+    import http.server
+    import threading
+
+    captured = {"redirect": "", "stolen": []}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            captured["redirect"] = self.headers.get("Authorization", "")
+            self.send_response(307)
+            self.send_header(
+                "Location",
+                f"http://127.0.0.1:{self.server.server_address[1]}/steal",
+            )
+            self.end_headers()
+
+        def do_GET(self):
+            captured["stolen"].append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.end_headers()
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    with tempfile.TemporaryDirectory() as d:
+        project = Path(d).name
+        identity = {
+            "DANUS_PROJECT_DIR": d,
+            "DANUS_AUTHOR": "worker-1",
+            "DANUS_RUNTIME": d,
+            "DANUS_VERIFY_CAPABILITY_SECRET_FILE": str(Path(d) / "verify.key"),
+            "DANUS_VERIFY_PROJECT": project,
+            "DANUS_VERIFY_WORKER": "worker-1",
+            "DANUS_VERIFY_URL": f"http://127.0.0.1:{srv.server_address[1]}/verify",
+        }
+        try:
+            with _env(**identity):
+                try:
+                    server._verify("s", "p")
+                    assert False, "verifier redirect must fail closed"
+                except RuntimeError as exc:
+                    assert str(exc) == "verify service request failed"
+            assert captured["redirect"].startswith("Bearer ")
+            assert captured["stolen"] == []
+        finally:
+            srv.shutdown()
 
 
 def test_fact_revoke_cascades():

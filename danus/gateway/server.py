@@ -23,6 +23,9 @@ is testable and reconfigurable:
   DANUS_ROLE          worker | main | verifier | all  (selects exposed tools;
                       unset falls back to the read-only verifier set — fail-closed)
   DANUS_VERIFY_URL    verify-service endpoint for fact_submit
+  DANUS_VERIFY_CAPABILITY_SECRET_FILE  host-only signing key locator; a fresh
+                      one-use bearer is minted for every verifier HTTP request
+  DANUS_VERIFY_PROJECT / DANUS_VERIFY_WORKER  exact bearer scope
   DANUS_PROBLEM_ID    problem id stamped on written facts (default: project name)
   DANUS_PROJECT_SCOPE  optional single-project name enforced for main-agent sessions
 """
@@ -32,6 +35,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -39,10 +44,26 @@ from typing import Any, Dict, List, Optional
 from danus._mcp import FastMCP
 from danus.core import FactGraph, GlobalMemory
 from danus.integrations import search as _arxiv_search
+from danus.verify.capability import mint_worker_capability
 
 from .roles import tools_for
 
 _PROJECT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+class _RejectVerifierRedirects(urllib.request.HTTPRedirectHandler):
+    """Keep a loopback verifier response from forwarding its bearer elsewhere."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+# Ignore ambient proxy configuration and reject every redirect.  The verifier
+# bearer may travel only over the direct loopback connection validated below.
+_VERIFY_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    _RejectVerifierRedirects(),
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -95,21 +116,74 @@ def _fg(project: Optional[str] = None) -> FactGraph:
     return FactGraph(_project(project))
 
 
+def _verify_endpoint() -> str:
+    """Return the one allowed local verifier endpoint or fail without reflection."""
+
+    raw = os.environ.get("DANUS_VERIFY_URL", "")
+    if not raw:
+        raise RuntimeError("DANUS_VERIFY_URL is not set (verify service not wired yet)")
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        port = parsed.port
+    except ValueError:
+        raise RuntimeError("verifier endpoint configuration is unsafe") from None
+    host = parsed.hostname
+    expected_netloc = "[::1]" if host == "::1" else host
+    if port is not None:
+        expected_netloc = f"{expected_netloc}:{port}"
+    if (
+        any(ord(char) <= 0x20 or ord(char) >= 0x7f for char in raw)
+        or not raw.startswith("http://")
+        or parsed.scheme != "http"
+        or host not in {"127.0.0.1", "::1"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or port == 0
+        or parsed.netloc != expected_netloc
+        or parsed.path != "/verify"
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeError("verifier endpoint configuration is unsafe")
+    return raw
+
+
 def _verify(statement: str, proof: str) -> Dict[str, Any]:
     """POST {statement, proof} to the verify service; return its JSON."""
-    verify_url = os.environ.get("DANUS_VERIFY_URL", "")
-    if not verify_url:
-        raise RuntimeError("DANUS_VERIFY_URL is not set (verify service not wired yet)")
+    verify_url = _verify_endpoint()
+    verify_project = os.environ.get("DANUS_VERIFY_PROJECT", "")
+    verify_worker = os.environ.get("DANUS_VERIFY_WORKER", "")
+    if not verify_project or not verify_worker:
+        raise RuntimeError("verifier capability is not configured")
+    # The gateway process is host-owned and pre-bound to one identity.  Refuse a
+    # confused-deputy configuration before any HTTP request leaves the process.
+    if verify_project != Path(_project()).name or verify_worker != _author():
+        raise RuntimeError("verifier capability scope does not match this gateway")
+    # Tokens are nonce-backed and consumed exactly once by the verifier.  Mint
+    # at request time so sequential and concurrent fact submissions never reuse
+    # a bearer.  The signing key remains in this nondumpable host process and is
+    # never sent over the provider bridge.
+    capability = mint_worker_capability(verify_project, verify_worker)
     try:
         timeout = int(os.environ.get("DANUS_VERIFY_TIMEOUT", "3600"))
     except ValueError:
         timeout = 3600
     data = json.dumps({"statement": statement, "proof": proof}).encode("utf-8")
     req = urllib.request.Request(
-        verify_url, data=data, headers={"Content-Type": "application/json"}
+        verify_url,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {capability}",
+            "Content-Type": "application/json",
+            "X-Danus-Project": verify_project,
+            "X-Danus-Worker": verify_worker,
+        },
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (trusted local URL)
-        return json.loads(resp.read().decode("utf-8"))
+    try:
+        with _VERIFY_OPENER.open(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError):
+        raise RuntimeError("verify service request failed") from None
 
 
 # --------------------------------------------------------------------------- #

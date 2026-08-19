@@ -1,12 +1,12 @@
 """danus.execution — the per-worker autonomous outer loop + on-disk layout.
 
-The self-driving round loop (``loop``), the project/worker scaffolding + detached
-launch (``scaffold``), and the canonical on-disk layout every other module reads
+The self-driving round loop (``loop``), project/Worker scaffolding plus systemd
+lifecycle handoff (``scaffold``), and the canonical on-disk layout every module reads
 (``layout``). ``danus.orchestration`` (the CLI verbs) is the thin UX shell over
 this library.
 
-Run one worker's loop directly with ``python -m danus.execution <worker_dir>``
-(this is how ``danus start`` launches it, detached).
+The transient Worker service enters the loop through
+``python -m danus.execution <worker_dir>``.
 """
 
 from __future__ import annotations

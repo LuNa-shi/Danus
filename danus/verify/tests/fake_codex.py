@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A stand-in for the `codex` CLI, for PLUMBING tests of the verify service.
 
-The real service cold-starts `codex exec ... <prompt>`; the codex agent reads
+The real service cold-starts `codex exec ... -` and writes the prompt to stdin; the codex agent reads
 AGENTS.md, judges the proof, and writes verification.json to the path named in
 the prompt. This stub does NOT judge any mathematics -- it only exercises the
 service's subprocess + file-readback + verdict-propagation plumbing
@@ -11,8 +11,8 @@ Verdict rule (deterministic, plumbing only):
   - prompt contains "[[FAKE:wrong]]"  -> verdict "wrong"
   - otherwise                         -> verdict "correct"
 
-Point the service at it with DANUS_CODEX_BIN=/abs/path/to/fake_codex.py . It accepts
-(and ignores) the real codex flags; the prompt is the final argv entry.
+Tests pass this file through the launcher's explicit private test-binary seam. It
+accepts (and ignores) the real codex flags; the prompt never appears in argv.
 """
 from __future__ import annotations
 
@@ -23,10 +23,10 @@ from pathlib import Path
 
 
 def main() -> int:
-    if len(sys.argv) < 2:
-        sys.stderr.write("fake_codex: no prompt argument\n")
+    if not sys.argv or sys.argv[-1] != "-":
+        sys.stderr.write("fake_codex: missing stdin sentinel\n")
         return 2
-    prompt = sys.argv[-1]
+    prompt = sys.stdin.read()
 
     m = re.search(r"this exact path:\s*(\S+)", prompt)
     if not m:

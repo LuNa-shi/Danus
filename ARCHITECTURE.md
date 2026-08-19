@@ -43,9 +43,9 @@ Danus/
 ├─ config/                      env templates (BYO key; only *.env.example committed)
 ├─ danus/                       THE ENGINE (installable Python package)
 │  ├─ core/                     ⑤ truth: schema · factgraph · global/local memory · bm25 · glossary
-│  ├─ gateway/                  ⑥ role-gated MCP: 6 tools · role table (roles.py)
-│  ├─ verify/                   ④ verification HTTP service · prechecks · cold-start codex launcher
-│  ├─ execution/                ③ worker swarm: round loop · project/worker lifecycle + layout
+│  ├─ gateway/                  ⑥ role-gated MCP · Worker one-shot UDS broker/bridge
+│  ├─ verify/                   ④ capability-gated HTTP service · isolated cold-start judge
+│  ├─ execution/                ③ systemd/cgroup Worker + provider boundaries · round loop · layout
 │  ├─ strategy/                 ② consult gateway (gpt_pro|claude_api|claude_code|off transport)
 │  ├─ orchestration/            ① the `danus` CLI verbs
 │  ├─ integrations/             arXiv theorem search (Matlas)
@@ -84,9 +84,10 @@ Danus/
    (problem_id + predecessors + glossary_introduces + statement + proof);
    `external_refs` is deliberately excluded so the paper pipeline can rewrite
    citations without breaking the DAG.
-5. Autonomy and resumability. Workers run detached; a "round" continues from
-   persisted memory rather than adding one increment, so no single crash loses
-   verified work.
+5. Autonomy and resumability. Each Worker is a validated transient systemd user
+   service in a dedicated slice; each Codex round runs in a separate provider
+   service inside that slice. A "round" continues from persisted memory rather
+   than adding one increment, so no single crash loses verified work.
 6. The strategy consult is the brain. Between rounds the main agent consults a
    top-tier reasoning model (gpt-5.5-pro over the `gpt_pro` transport, or
    claude-fable-5 over the `claude_api` / `claude_code` transports) to set direction;
@@ -121,8 +122,11 @@ Danus/
 | contract | pinned shape | ends |
 |---|---|---|
 | MCP tool set + role gating | 6 tools; `roles.py` `ROLE_TOOLS` (main has NO `fact_submit`; verifier read-only) | `danus.gateway` ↔ worker/main/verifier agents |
-| MCP launch | `python -m danus.gateway` + `DANUS_ROLE` env | `danus.verify` launcher · worker `.codex/config.toml` · `.mcp.json` (main) → `danus.gateway` |
-| verify HTTP | `POST /verify {statement,proof}` → `{verification_report,verdict,repair_hints}`; verdict ⟺ no critical_errors & no gaps | `danus.gateway.fact_submit` ↔ `danus.verify` |
+| Worker lifecycle authority | transient user `.service` + dedicated `.slice`; Project-external ledger binds canonical Worker path, invocation IDs, cgroup paths/properties, and pinned directory/`cgroup.events` inodes; stop succeeds only after the exact slice is empty | `danus.orchestration` ↔ `danus.execution.systemd_scope` |
+| Worker provider boundary | pinned official Codex runtime in a per-round transient service inside the Worker slice; framed minimal environment/private `CODEX_HOME`; no direct-process fallback | `danus.execution.loop` ↔ `danus.execution.security` ↔ `danus.execution.systemd_scope` |
+| Worker MCP launch | enforced absolute credential-free stdio bridge → one-shot random UDS → host-owned broker/gateway; broker authenticates bridge executable, argv, namespaces, ancestry, and pinned provider cgroup before accepting it | `danus.execution.security` ↔ `danus.gateway.bridge` / `broker` / `server` |
+| verifier capability | fresh `dv1` HMAC bearer per request, bound to `X-Danus-Project` + `X-Danus-Worker`, short-lived and atomically replay-consumed; signing key remains in the host gateway/verifier boundary | `danus.gateway.fact_submit` ↔ `danus.verify.capability` / `service` |
+| verify HTTP | authenticated `POST /verify {statement,proof}` → `{verification_report,verdict,repair_hints}`; verdict ⟺ no critical_errors & no gaps | `danus.gateway.fact_submit` ↔ `danus.verify` |
 | fact id inputs | `problem_id + sorted(predecessors) + sorted(glossary) + normalized(statement,proof)`; **external_refs EXCLUDED** | `danus.core` ↔ everyone (write-paper reads `external_refs`) |
 | global-memory kinds | the 11 `GLOBAL_KINDS` (incl. `master_guidance`/`elaboration`/`verification`) | `danus.core` ↔ agents · strategy · consult |
 | consult JSON envelope | `{transport,reply,usage,cost_usd,…}`; always one envelope — a consult that could not run is `status="failed"` + `error`, never a traceback | `danus.strategy` CLI ↔ consult skill |

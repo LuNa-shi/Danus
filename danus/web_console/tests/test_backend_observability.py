@@ -12,7 +12,19 @@ import pytest
 
 from danus.execution import layout as L
 from danus.execution import processes as P
-from danus.web_console.runtime import DanusRuntimeAdapter, RuntimeOperationError, RuntimeSafetyError
+from danus.web_console.runtime import (
+    DanusRuntimeAdapter as _ProductionRuntimeAdapter,
+    RuntimeOperationError,
+    RuntimeSafetyError,
+)
+
+
+def DanusRuntimeAdapter(agents_root: Path) -> _ProductionRuntimeAdapter:
+    """Construct the explicit legacy-process seam used only by these tests."""
+
+    return _ProductionRuntimeAdapter(
+        agents_root, _allow_legacy_process_test_seam=True,
+    )
 
 
 def test_runtime_worker_projection_exposes_stop_request_and_rejects_unrelated_live_pid(tmp_path: Path):

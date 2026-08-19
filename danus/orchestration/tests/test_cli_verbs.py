@@ -61,8 +61,13 @@ def _project_env(tmp: Path, **extra):
            "DANUS_WORKER_CONTRACT": str(contract),
            "DANUS_WORKER_SKILLS": str(skills)}
     env.update(extra)
-    with _env(**env):
-        yield
+    original_legacy_seam = cli._ALLOW_LEGACY_PROCESS_TEST_SEAM
+    cli._ALLOW_LEGACY_PROCESS_TEST_SEAM = True
+    try:
+        with _env(**env):
+            yield
+    finally:
+        cli._ALLOW_LEGACY_PROCESS_TEST_SEAM = original_legacy_seam
 
 
 class _FakeProcess:

@@ -435,7 +435,9 @@ def test_replace_status_proof_precedes_mutation_and_holds_project_lock(
 def test_runtime_exit_projection_blocks_orphan_descendant_after_leader_exit(
     tmp_path: Path,
 ) -> None:
-    adapter = DanusRuntimeAdapter(tmp_path / "agents")
+    adapter = DanusRuntimeAdapter(
+        tmp_path / "agents", _allow_legacy_process_test_seam=True,
+    )
     adapter.create_project("A", "alpha", "high:1", max_parallel_workers=1)
     child_pid_path = tmp_path / "orphan.pid"
     script = (
@@ -610,6 +612,154 @@ def test_runtime_accepts_started_worker_only_with_owned_empty_membership_proof(
     assert proof["status"] == "verified_dead"
     assert proof["reason"] is None
     assert proof["descendant_membership_verified"] is True
+
+
+def _supervisor_identity_fixture(
+    adapter: DanusRuntimeAdapter,
+) -> tuple[L.WorkerLayout, P.WorkerProcessIdentity, dict[str, Any], dict[str, Any]]:
+    worker_dir = adapter.agents_root / "A" / "workers" / "high"
+    wl = L.WorkerLayout(worker_dir)
+    unit = runtime_module.S.worker_unit(wl)
+    slice_name = runtime_module.S.worker_slice(wl)
+    invocation = "a" * 32
+    slice_invocation = "b" * 32
+    identity = P.WorkerProcessIdentity(
+        pid=4242, boot_id="fixture-boot", start_time="fixture-start",
+        cmdline=P.expected_worker_cmdline(wl),
+    )
+    ledger: dict[str, Any] = {
+        "schema": 2, "worker_dir": str(worker_dir.resolve()),
+        "unit": unit, "slice": slice_name,
+        "main_pid": identity.pid, "main_pid_start_time": identity.start_time,
+        "worker_argv": list(identity.cmdline), "boot_id": identity.boot_id,
+        "invocation_id": invocation, "slice_invocation_id": slice_invocation,
+        "unit_cgroup": f"/user.slice/{slice_name}/{unit}",
+        "slice_cgroup": f"/user.slice/{slice_name}",
+    }
+    proof = {
+        "schema": 2, "worker_dir": str(worker_dir.resolve()),
+        "unit": unit, "slice": slice_name,
+        "invocation_id": invocation, "slice_invocation_id": slice_invocation,
+        "boot_id": identity.boot_id, "reason": "cgroup-empty", "populated": False,
+        "main_pid": identity.pid, "main_pid_start_time": identity.start_time,
+        "worker_argv": list(identity.cmdline),
+    }
+    return wl, identity, ledger, proof
+
+
+@pytest.mark.parametrize("state", ["active", "orphaned", "error"])
+def test_supervisor_projection_rejects_live_or_failed_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str,
+) -> None:
+    adapter = DanusRuntimeAdapter(tmp_path / "agents")
+    adapter.create_project("A", "alpha", "high:1", max_parallel_workers=1)
+    wl, identity, ledger, proof = _supervisor_identity_fixture(adapter)
+    monkeypatch.setattr(runtime_module.S, "read_ledger", lambda _wl: ledger)
+    if state == "error":
+        def raise_boundary(_wl):
+            raise runtime_module.S.SystemdBoundaryError("reused boundary")
+        monkeypatch.setattr(runtime_module.S, "inspect_worker_boundary", raise_boundary)
+    else:
+        monkeypatch.setattr(
+            runtime_module.S, "inspect_worker_boundary",
+            lambda _wl: runtime_module.S.WorkerBoundaryStatus(
+                state, 4242, True, ledger["unit"], ledger["slice"],
+                ledger["invocation_id"], state,
+            ),
+        )
+    monkeypatch.setattr(runtime_module.S, "read_exit_proof", lambda _wl: proof)
+
+    result = adapter._descendant_membership_projection("A", "high", identity)
+
+    assert result["status"] != "empty"
+    assert result["inspection_complete"] is False
+    assert result["source"] == "systemd_scope"
+
+
+def test_supervisor_projection_rejects_stale_ledger_and_identity_reuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = DanusRuntimeAdapter(tmp_path / "agents")
+    adapter.create_project("A", "alpha", "high:1", max_parallel_workers=1)
+    _wl, identity, ledger, _proof = _supervisor_identity_fixture(adapter)
+    monkeypatch.setattr(runtime_module.S, "read_ledger", lambda _wl: ledger)
+
+    def reused(_wl):
+        raise runtime_module.S.SystemdBoundaryError("recorded Worker service unit was reused")
+
+    monkeypatch.setattr(runtime_module.S, "inspect_worker_boundary", reused)
+    result = adapter._descendant_membership_projection("A", "high", identity)
+    assert result["status"] == "unavailable"
+    assert result["reason"] == "boundary_error"
+
+    monkeypatch.setattr(
+        runtime_module.S, "inspect_worker_boundary",
+        lambda _wl: runtime_module.S.WorkerBoundaryStatus(
+            "absent", None, False, ledger["unit"], ledger["slice"],
+            ledger["invocation_id"], "cgroup-empty",
+        ),
+    )
+    monkeypatch.setattr(runtime_module.S, "read_exit_proof", lambda _wl: {
+        **_proof, "main_pid": 4343,
+    })
+    result = adapter._descendant_membership_projection("A", "high", identity)
+    assert result["status"] == "unavailable"
+    assert result["reason"] == "identity_mismatch"
+
+
+def test_supervisor_projection_accepts_only_absent_exact_exit_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = DanusRuntimeAdapter(tmp_path / "agents")
+    adapter.create_project("A", "alpha", "high:1", max_parallel_workers=1)
+    _wl, identity, ledger, proof = _supervisor_identity_fixture(adapter)
+    monkeypatch.setattr(runtime_module.S, "read_ledger", lambda _wl: ledger)
+    monkeypatch.setattr(
+        runtime_module.S, "inspect_worker_boundary",
+        lambda _wl: runtime_module.S.WorkerBoundaryStatus(
+            "absent", None, False, ledger["unit"], ledger["slice"],
+            ledger["invocation_id"], "cgroup-empty",
+        ),
+    )
+    monkeypatch.setattr(runtime_module.S, "read_exit_proof", lambda _wl: proof)
+
+    result = adapter._descendant_membership_projection("A", "high", identity)
+
+    assert result == {
+        "status": "empty", "inspection_complete": True,
+        "source": "systemd_scope", "reason": None,
+        "boundary_state": "absent", "populated": False,
+    }
+
+
+def test_worker_exit_projection_uses_exact_proof_when_journal_was_not_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = DanusRuntimeAdapter(tmp_path / "agents")
+    adapter.create_project("A", "alpha", "high:1", max_parallel_workers=1)
+    worker_dir = _set_persisted_terminal_group(adapter, "A", 4242)
+    # Keep the model/status PID as a consistency check, but remove the legacy
+    # host journal so this exercises the supervisor exit-proof fallback.
+    journal = adapter.agents_root / ".danus-web-process-groups/A/high.json"
+    journal.unlink()
+    wl, identity, ledger, proof = _supervisor_identity_fixture(adapter)
+    assert worker_dir == wl.dir
+    monkeypatch.setattr(runtime_module.S, "read_ledger", lambda _wl: None)
+    monkeypatch.setattr(runtime_module.S, "read_exit_proof", lambda _wl: proof)
+    monkeypatch.setattr(
+        runtime_module.S, "inspect_worker_boundary",
+        lambda _wl: runtime_module.S.WorkerBoundaryStatus(
+            "absent", None, False, ledger["unit"], ledger["slice"],
+            ledger["invocation_id"], "cgroup-empty",
+        ),
+    )
+    monkeypatch.setattr(adapter, "_project_process_projection", lambda _root, _groups: [])
+
+    worker = adapter.worker_exit_projection("A")["workers"][0]
+
+    assert worker["process_exit_proof"]["status"] == "verified_dead"
+    assert worker["process_exit_proof"]["source"] == "systemd_exit_proof"
+    assert worker["process_exit_proof"]["descendant_membership_verified"] is True
 
 
 def test_runtime_rejects_tampered_status_group_and_duplicate_host_groups(
@@ -833,7 +983,9 @@ def test_create_serializes_stale_cleanup_with_concurrent_journal_writer(
 def test_production_adapter_replace_and_delete_use_full_exit_projection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runtime = DanusRuntimeAdapter(tmp_path / "agents")
+    runtime = DanusRuntimeAdapter(
+        tmp_path / "agents", _allow_legacy_process_test_seam=True,
+    )
     settings = AppSettings(
         database_path=tmp_path / "console.sqlite3",
         password_hash=hash_password(_PASSWORD),

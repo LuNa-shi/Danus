@@ -110,9 +110,16 @@ def test_codex_default_falls_back_to_installed_cli_when_repo_wrapper_unprovision
     from danus import codex
 
     wrapper = Path(__file__).resolve().parents[3] / "bin" / "codex"
+    runtime_env = wrapper.parent.parent / "runtime" / "runtime.env"
+    real_is_file = Path.is_file
     monkeypatch.delenv("DANUS_CODEX_BIN", raising=False)
     monkeypatch.setattr(codex, "resolve_bin", lambda: str(wrapper))
     monkeypatch.setattr(shutil, "which", lambda name: "/system/bin/codex" if name == "codex" else None)
+    monkeypatch.setattr(
+        Path,
+        "is_file",
+        lambda path: False if path == runtime_env else real_is_file(path),
+    )
 
     assert MainAgentAdapter._resolve_codex() == "/system/bin/codex"
 
