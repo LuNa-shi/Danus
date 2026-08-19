@@ -1589,10 +1589,94 @@ def _write_exit_proof(wl: L.WorkerLayout, record: dict[str, object], *, reason: 
         "populated": False,
         "observed_at": time.time(),
     }
+    # Keep enough of the pinned launch identity in the durable terminal proof
+    # for a later Web/CLI process to bind it to the exact Worker invocation
+    # after inspect_worker_boundary has retired the live ledger. Older cleanup
+    # paths may provide only a partial record, so optional fields are published
+    # only when they were attested at launch.
+    for key in (
+        "main_pid", "main_pid_start_time", "worker_argv",
+        "unit_cgroup", "slice_cgroup",
+        "unit_cgroup_dev", "unit_cgroup_ino",
+        "unit_events_dev", "unit_events_ino",
+        "slice_cgroup_dev", "slice_cgroup_ino",
+        "slice_events_dev", "slice_events_ino",
+    ):
+        if key in record:
+            proof[key] = record[key]
     atomic_write_text(
         exit_proof_path(wl), json.dumps(proof, sort_keys=True, separators=(",", ":")),
         mode=0o600,
     )
+
+
+def read_exit_proof(wl: L.WorkerLayout) -> dict[str, object] | None:
+    """Read and validate one durable proof that this exact Worker slice emptied.
+
+    The proof is host-owned control state, not a model-writable status file. It
+    is intentionally a terminal claim only: callers must still bind its
+    invocation and launch identity to their own exact Project/Worker record.
+    """
+
+    path = exit_proof_path(wl)
+    try:
+        raw = read_private_bytes(path, minimum=2, maximum=16384)
+    except FileNotFoundError:
+        return None
+    except (OSError, SecureIOError) as exc:
+        raise SystemdBoundaryError("Worker exit proof is unavailable or unsafe") from exc
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SystemdBoundaryError("Worker exit proof is malformed") from exc
+    if not isinstance(value, dict) or value.get("schema") != _SCHEMA:
+        raise SystemdBoundaryError("Worker exit proof has an unsupported schema")
+    if (
+        value.get("worker_dir") != str(wl.dir.resolve())
+        or value.get("unit") != worker_unit(wl)
+        or value.get("slice") != worker_slice(wl)
+        or value.get("populated") is not False
+        or not isinstance(value.get("reason"), str)
+        or not value.get("reason")
+        or not _INVOCATION_RE.fullmatch(str(value.get("invocation_id", "")))
+        or not _INVOCATION_RE.fullmatch(str(value.get("slice_invocation_id", "")))
+        or not isinstance(value.get("boot_id"), str)
+        or not value.get("boot_id")
+    ):
+        raise SystemdBoundaryError("Worker exit proof identity is invalid")
+    if "main_pid" in value:
+        try:
+            if int(value["main_pid"]) <= 1:
+                raise ValueError
+        except (TypeError, ValueError) as exc:
+            raise SystemdBoundaryError("Worker exit proof process identity is invalid") from exc
+    if "main_pid_start_time" in value and (
+        not isinstance(value["main_pid_start_time"], str)
+        or not value["main_pid_start_time"]
+    ):
+        raise SystemdBoundaryError("Worker exit proof process identity is invalid")
+    if "worker_argv" in value and (
+        not isinstance(value["worker_argv"], list)
+        or not value["worker_argv"]
+        or any(not isinstance(item, str) or not item for item in value["worker_argv"])
+    ):
+        raise SystemdBoundaryError("Worker exit proof process argv is invalid")
+    for prefix in ("unit", "slice"):
+        cgroup = value.get(f"{prefix}_cgroup")
+        if cgroup is not None:
+            path_value = Path(str(cgroup))
+            if not str(cgroup).startswith("/") or ".." in path_value.parts:
+                raise SystemdBoundaryError("Worker exit proof cgroup path is invalid")
+        fields = [value.get(f"{prefix}_{suffix}") for suffix in (
+            "cgroup_dev", "cgroup_ino", "events_dev", "events_ino",
+        )]
+        if any(field is not None for field in fields):
+            try:
+                if any(int(field) <= 0 for field in fields):
+                    raise ValueError
+            except (TypeError, ValueError) as exc:
+                raise SystemdBoundaryError("Worker exit proof cgroup identity is invalid") from exc
+    return value
 
 
 def _clear_reconciled_worker(wl: L.WorkerLayout, record: dict[str, object], *, reason: str) -> WorkerBoundaryStatus:
@@ -1861,7 +1945,7 @@ def boundary_populated(wl: L.WorkerLayout) -> bool:
 __all__ = [
     "ManagedWorker", "SystemdBoundaryError", "WorkerBoundaryStatus",
     "boundary_populated", "inspect_worker_boundary",
-    "environment_path", "exit_proof_path", "expected_worker_argv",
+    "environment_path", "exit_proof_path", "read_exit_proof", "expected_worker_argv",
     "ledger_path", "read_ledger", "start_worker", "stop_worker_boundary",
     "validate_user_manager", "worker_environment", "worker_slice", "worker_unit",
 ]

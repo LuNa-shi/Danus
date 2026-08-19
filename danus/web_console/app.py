@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import ipaddress
 import json
+import os
 import re
+import shlex
 import sqlite3
 import secrets
+import stat as stat_module
 import threading
 import time
 import uuid
@@ -25,9 +29,25 @@ from danus.execution import layout as L
 from .config import ProviderModelCatalog, main_agent_metadata, strategy_metadata
 from .beats import OrchestrationBeatCoordinator, orchestration_observation
 from .runtime import DanusRuntimeAdapter, RuntimeErrorBase, RuntimeSafetyError, validate_runtime_name
-from .files import FileValidationError, file_type, material_root, metadata, normalize_filename, promote_pending, remove_blob, stream_to_pending, validate_bytes
+from .files import (
+    FileValidationError,
+    control_staging_root,
+    decode_upload_filename,
+    file_type,
+    fsync_directory,
+    material_root,
+    metadata,
+    normalize_filename,
+    promote_pending,
+    staged_file_matches,
+    staging_blob,
+    stream_to_pending,
+    validate_bytes,
+)
 from .main_agent import MainAgentError, MainAgentAdapter
+from .observability import redact_text
 from .security import (
+    artifact_confirmation_capability,
     digest_token,
     new_token,
     project_lifecycle_capability,
@@ -56,6 +76,7 @@ class AppSettings:
     orchestration_poll_seconds: float = 30.0
     orchestration_consult_interval_seconds: float = 2 * 3600
     human_summary_interval_seconds: float = 3600.0
+    artifact_confirmation_ttl_seconds: float = 20 * 60
 
 
 def _error(status: int, detail: str) -> JSONResponse:
@@ -82,6 +103,26 @@ def _public_main_agent_error(exc: MainAgentError) -> str:
     return "Main Agent 未能完成本次回复；请稍后重试或联系管理员。"
 
 
+def _redact_exact_value(value: Any, exact_secrets: tuple[str, ...]) -> Any:
+    """Recursively redact exact per-turn capabilities at the HTTP boundary."""
+    if isinstance(value, str):
+        return redact_text(
+            value, limit=max(16_384, len(value) + 1),
+            exact_secrets=exact_secrets,
+        )
+    if isinstance(value, dict):
+        return {
+            _redact_exact_value(key, exact_secrets) if isinstance(key, str) else key:
+            _redact_exact_value(item, exact_secrets)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_exact_value(item, exact_secrets) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_exact_value(item, exact_secrets) for item in value)
+    return value
+
+
 def _runtime_name(name: str) -> str:
     # Keep runtime names path-safe and stable; DB ids are opaque to clients.
     validate_runtime_name(name)
@@ -97,6 +138,118 @@ def _loopback_host(host: str | None) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+_PAPER_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+_FACT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}")
+_CONTENT_ADDRESS_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _artifact_payload(action: str, payload: Any) -> dict[str, Any]:
+    """Validate and canonicalize the operator/broker artifact contract."""
+    if not isinstance(payload, dict):
+        raise ValueError("artifact payload must be an object")
+    fields = {
+        "finalize-suggest": {"action", "fact_ids"},
+        "finalize": {"action", "fact_ids", "paper_id", "confirm", "confirmation_token"},
+        "human-summary": {"action", "language", "confirm", "confirmation_token"},
+        "write-paper": {
+            "action", "paper_id", "fact_ids", "instructions", "stop_workers",
+            "confirm", "confirmation_token",
+        },
+    }.get(action)
+    if fields is None:
+        raise ValueError("unsupported artifact action")
+    if any(key not in fields for key in payload):
+        raise ValueError("artifact payload contains unsupported fields")
+
+    def has_control(value: str) -> bool:
+        return any(ord(character) < 32 or ord(character) == 127 for character in value)
+
+    def paper_id() -> str | None:
+        value = payload.get("paper_id")
+        if value is not None and (not isinstance(value, str) or not _PAPER_ID_RE.fullmatch(value)):
+            raise ValueError("invalid paper_id")
+        return value
+
+    def fact_ids(*, required: bool) -> list[str]:
+        value = payload.get("fact_ids")
+        if value is None and not required:
+            return []
+        if (not isinstance(value, list) or isinstance(value, (str, bytes))
+                or (required and not value) or len(value) > 128
+                or any(not isinstance(fid, str) or not _FACT_ID_RE.fullmatch(fid) for fid in value)):
+            qualifier = "non-empty " if required else ""
+            raise ValueError(f"fact_ids must be a bounded {qualifier}list of strings")
+        return list(value)
+
+    if action == "finalize-suggest":
+        if payload.get("fact_ids") not in (None, []):
+            raise ValueError("finalize suggestion does not accept fact_ids")
+        return {}
+    if action == "finalize":
+        return {"fact_ids": fact_ids(required=True), "paper_id": paper_id()}
+    if action == "human-summary":
+        language = payload.get("language")
+        if language is not None and (
+            not isinstance(language, str) or not language or len(language) > 80
+            or has_control(language)
+        ):
+            raise ValueError("language must be non-empty text of at most 80 characters")
+        return {"language": language}
+    if action == "write-paper":
+        stop_workers = payload.get("stop_workers")
+        if not isinstance(stop_workers, bool):
+            raise ValueError("stop_workers must be an explicit boolean")
+        instructions = payload.get("instructions")
+        if instructions is not None and (
+            not isinstance(instructions, str) or not instructions.strip()
+            or len(instructions) > 12000 or has_control(instructions)
+        ):
+            raise ValueError("instructions must be non-empty text of at most 12000 characters")
+        return {
+            "paper_id": paper_id(), "fact_ids": fact_ids(required=False),
+            "instructions": instructions, "stop_workers": stop_workers,
+        }
+    raise ValueError("unsupported artifact action")
+
+
+def _artifact_payload_digest(action: str, payload: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        {"action": action, "payload": payload}, ensure_ascii=False,
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _artifact_instruction(action: str, payload: dict[str, Any]) -> str:
+    executable = "$DANUS_WEB_AGENT_BIN"
+    if action == "finalize":
+        parts = [executable, "finalize", "target"]
+        for fact_id in payload["fact_ids"]:
+            parts += ["--fact-id", shlex.quote(fact_id)]
+        if payload["paper_id"] is not None:
+            parts += ["--paper-id", shlex.quote(payload["paper_id"])]
+    elif action == "human-summary":
+        parts = [executable, "human-summary"]
+        if payload["language"] is not None:
+            parts += ["--language", shlex.quote(payload["language"])]
+    elif action == "write-paper":
+        parts = [executable, "write-paper"]
+        if payload["paper_id"] is not None:
+            parts += ["--paper-id", shlex.quote(payload["paper_id"])]
+        for fact_id in payload["fact_ids"]:
+            parts += ["--fact-id", shlex.quote(fact_id)]
+        if payload["instructions"] is not None:
+            parts += ["--instructions", shlex.quote(payload["instructions"])]
+        parts.append("--stop-workers" if payload["stop_workers"] else "--keep-workers")
+    else:
+        raise ValueError("unsupported artifact action")
+    command = " ".join(parts)
+    return (
+        "The operator explicitly confirmed this project-scoped artifact operation. "
+        f"Run exactly `{command}` through the authenticated broker now, then report its result."
+    )
 
 
 def create_app(
@@ -115,6 +268,7 @@ def create_app(
 
     @contextlib.asynccontextmanager
     async def lifespan(application: FastAPI):
+        await asyncio.to_thread(reconcile_external_materials)
         task = asyncio.create_task(deadline_supervisor_loop())
         beat_task = asyncio.create_task(orchestration_beat_loop())
         application.state.deadline_supervisor_task = task
@@ -162,12 +316,542 @@ def create_app(
     app.state.runtime_adapter = runtime
     main_agent_backend = getattr(main_agent, "backend", "codex")
     project_locks: dict[str, asyncio.Lock] = {}
+    broker_windows: dict[str, dict[str, Any]] = {}
     locks_guard = threading.Lock()
     failed: dict[str, tuple[int, float]] = {}
 
     def lock_for(project_id: str) -> asyncio.Lock:
         with locks_guard:
             return project_locks.setdefault(project_id, asyncio.Lock())
+
+    @contextlib.asynccontextmanager
+    async def main_agent_broker_window(project_id: str):
+        """Allow broker callbacks to share the outer serialized Agent turn."""
+        with locks_guard:
+            if project_id in broker_windows:
+                raise RuntimeError("Project broker window is already active")
+            window = {"active": 0, "closing": False}
+            broker_windows[project_id] = window
+        try:
+            yield
+        finally:
+            with locks_guard:
+                window["closing"] = True
+            while True:
+                with locks_guard:
+                    if int(window["active"]) == 0:
+                        broker_windows.pop(project_id, None)
+                        break
+                await asyncio.sleep(0)
+
+    @contextlib.asynccontextmanager
+    async def internal_broker_scope(project_id: str):
+        """Serialize broker activity, with bounded re-entry from an Agent turn."""
+        bypass = False
+        with locks_guard:
+            window = broker_windows.get(project_id)
+            if window is not None and not bool(window["closing"]):
+                window["active"] = int(window["active"]) + 1
+                bypass = True
+        if not bypass:
+            async with lock_for(project_id):
+                yield
+            return
+        try:
+            yield
+        finally:
+            with locks_guard:
+                window["active"] = max(0, int(window["active"]) - 1)
+
+    @app.middleware("http")
+    async def serialize_main_agent_turn(request: Request, call_next):
+        """Hold the Project lock before a body or lifecycle mutation is consumed."""
+        message_match = re.fullmatch(
+            r"/api/projects/([0-9a-f]{32})/messages", request.url.path,
+        )
+        broker_match = re.fullmatch(
+            r"/internal/api/projects/([0-9a-f]{32})/lifecycle", request.url.path,
+        )
+        if request.method != "POST" or (message_match is None and broker_match is None):
+            return await call_next(request)
+        project_id = (message_match or broker_match).group(1)
+        # Avoid allocating unbounded locks for arbitrary unauthenticated IDs.
+        if store.project(project_id) is None:
+            return await call_next(request)
+        if broker_match is not None:
+            async with internal_broker_scope(project_id):
+                request.state.project_broker_lock = project_id
+                return await call_next(request)
+        async with lock_for(project_id):
+            request.state.project_turn_lock = project_id
+            return await call_next(request)
+
+    @contextlib.asynccontextmanager
+    async def project_turn_scope(project_id: str, request: Request):
+        if getattr(request.state, "project_turn_lock", None) == project_id:
+            yield
+            return
+        async with lock_for(project_id):
+            yield
+
+    def material_blob(materials: Path, storage_name: str, *, require_regular: bool = True) -> Path:
+        if not isinstance(storage_name, str) or not storage_name:
+            raise FileValidationError("invalid stored material path")
+        candidate = materials / storage_name
+        if candidate.parent.resolve() != materials.resolve() or candidate.name != storage_name:
+            raise FileValidationError("invalid stored material path")
+        if require_regular:
+            try:
+                info = candidate.lstat()
+            except FileNotFoundError as exc:
+                raise FileValidationError("stored material is unavailable") from exc
+            if candidate.is_symlink() or not stat_module.S_ISREG(info.st_mode):
+                raise FileValidationError("stored material is not a regular file")
+        return candidate
+
+    def project_staging(project: dict[str, Any]) -> tuple[Path, Path]:
+        context = Path(runtime.project_context_dir(project["runtime_name"]))
+        materials = material_root(context)
+        return materials, control_staging_root(context, materials)
+
+    def promote_staged_conflict(
+        incoming: dict[str, Any], materials: Path, staging: Path,
+    ) -> tuple[Path, Path]:
+        source = staging_blob(staging, incoming.get("staging_name"))
+        if not staged_file_matches(
+            source, str(incoming["sha256"]), int(incoming["size"]),
+            require_private=True,
+        ):
+            raise FileValidationError("staged material integrity check failed")
+        destination = material_blob(
+            materials, str(incoming["storage_name"]), require_regular=False,
+        )
+        if destination.exists() or destination.is_symlink():
+            if not staged_file_matches(
+                destination, str(incoming["sha256"]), int(incoming["size"]),
+            ):
+                raise FileValidationError(
+                    "existing material destination failed integrity verification",
+                )
+        os.replace(source, destination)
+        os.chmod(destination, 0o600, follow_symlinks=False)
+        fsync_directory(materials)
+        fsync_directory(staging)
+        return source, destination
+
+    def rollback_staged_promotion(source: Path, destination: Path) -> bool:
+        try:
+            if source.exists() or source.is_symlink():
+                return False
+            if not destination.exists() or destination.is_symlink():
+                return False
+            os.replace(destination, source)
+            os.chmod(source, 0o600, follow_symlinks=False)
+            fsync_directory(source.parent)
+            fsync_directory(destination.parent)
+            return True
+        except OSError:
+            return False
+
+    def erase_project_staging(project: dict[str, Any]) -> None:
+        _materials, staging = project_staging(project)
+        changed = False
+        for candidate in staging.iterdir():
+            info = candidate.lstat()
+            if candidate.is_symlink() or stat_module.S_ISREG(info.st_mode):
+                candidate.unlink()
+                changed = True
+                continue
+            raise FileValidationError("Project staging contains an unsafe entry")
+        if changed:
+            fsync_directory(staging)
+        staging.rmdir()
+        fsync_directory(staging.parent)
+
+    def purge_cleanup_job(job: dict[str, Any], project: dict[str, Any]) -> bool:
+        try:
+            materials = material_root(Path(runtime.project_context_dir(project["runtime_name"])))
+            quarantine = material_blob(materials, str(job["quarantine_name"]), require_regular=False)
+            original = material_blob(materials, str(job["original_storage_name"]), require_regular=False)
+            quarantine_present = quarantine.exists() or quarantine.is_symlink()
+            original_present = original.exists() or original.is_symlink()
+            if quarantine_present and quarantine.is_symlink():
+                quarantine.unlink()
+                fsync_directory(materials)
+                quarantine_present = False
+            if original_present and original.is_symlink():
+                original.unlink()
+                fsync_directory(materials)
+                original_present = False
+            if quarantine_present and original_present:
+                raise FileValidationError("cleanup has both original and quarantine blobs")
+            if not quarantine_present and original_present:
+                original_info = original.lstat()
+                if not stat_module.S_ISREG(original_info.st_mode):
+                    raise FileValidationError("cleanup source is not a regular file")
+                os.replace(original, quarantine)
+                quarantine_present = True
+            if quarantine_present:
+                info = quarantine.lstat()
+                if not stat_module.S_ISREG(info.st_mode):
+                    raise FileValidationError("cleanup target is not a regular file")
+                quarantine.unlink()
+            directory_fd = os.open(
+                materials, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            store.complete_file_cleanup(str(job["id"]), completed_at=time.time())
+            return True
+        except (FileValidationError, OSError, RuntimeErrorBase) as exc:
+            store.fail_file_cleanup(str(job["id"]), type(exc).__name__)
+            return False
+
+    def allocate_staging_placeholder(staging: Path) -> Path:
+        flags = (
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        )
+        for _attempt in range(128):
+            candidate = staging_blob(
+                staging, f".staged-{secrets.token_hex(32)}",
+                require_regular=False,
+            )
+            try:
+                descriptor = os.open(candidate, flags, 0o600)
+            except FileExistsError:
+                continue
+            try:
+                os.fchmod(descriptor, 0o600)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            fsync_directory(staging)
+            return candidate
+        raise FileValidationError("could not allocate staged recovery locator")
+
+    def unlink_regular_or_symlink(path: Path, *, label: str) -> bool:
+        if not path.exists() and not path.is_symlink():
+            return False
+        info = path.lstat()
+        if not (path.is_symlink() or stat_module.S_ISREG(info.st_mode)):
+            raise FileValidationError(f"{label} is not a removable file")
+        path.unlink()
+        return True
+
+    def reconcile_pending_staging(
+        row: dict[str, Any], project: dict[str, Any],
+    ) -> str:
+        """Keep one pending conflict private across migration/crash windows."""
+        materials, staging = project_staging(project)
+        material = material_blob(
+            materials, str(row["storage_name"]), require_regular=False,
+        )
+        staging_name = row.get("staging_name")
+        try:
+            staged = staging_blob(staging, staging_name, require_regular=False)
+        except FileValidationError:
+            staged = allocate_staging_placeholder(staging)
+            if not store.set_pending_staging_name(
+                str(row["id"]), str(row["project_id"]), staged.name,
+            ):
+                staged.unlink(missing_ok=True)
+                fsync_directory(staging)
+                raise sqlite3.IntegrityError("pending staging migration lost its DB row")
+            staging_name = staged.name
+
+        staged_present = staged.exists() or staged.is_symlink()
+        material_present = material.exists() or material.is_symlink()
+        staged_valid = (
+            staged_present and not staged.is_symlink()
+            and staged_file_matches(
+                staged, str(row["sha256"]), int(row["size"]),
+                require_private=True,
+            )
+        )
+        material_valid = (
+            material_present and not material.is_symlink()
+            and staged_file_matches(material, str(row["sha256"]), int(row["size"]))
+        )
+
+        if material_valid and not staged_valid:
+            # Covers legacy pending-in-materials and a crash after promotion but
+            # before the DB transition. A preallocated empty placeholder may be
+            # atomically overwritten here.
+            if staged_present:
+                info = staged.lstat()
+                if staged.is_symlink() or not stat_module.S_ISREG(info.st_mode):
+                    raise FileValidationError("staged recovery target is unsafe")
+            os.replace(material, staged)
+            os.chmod(staged, 0o600, follow_symlinks=False)
+            fsync_directory(materials)
+            fsync_directory(staging)
+            return "recovered"
+
+        if staged_valid:
+            if material_present:
+                unlink_regular_or_symlink(
+                    material, label="public duplicate pending material",
+                )
+                fsync_directory(materials)
+            return "private"
+
+        # Neither location contains the authenticated pending bytes. Remove any
+        # attacker-controlled/safe file entries before lifting maintenance.
+        changed_staging = unlink_regular_or_symlink(
+            staged, label="broken staged material",
+        )
+        changed_materials = unlink_regular_or_symlink(
+            material, label="broken public pending material",
+        )
+        if changed_staging:
+            fsync_directory(staging)
+        if changed_materials:
+            fsync_directory(materials)
+        store.purge_broken_pending_conflict(
+            str(row["conflict_id"]), str(row["project_id"]),
+        )
+        store.audit(
+            "pending_file_reconcile", "purged_broken", str(row["project_id"]),
+            details=json.dumps({
+                "conflict_id": row["conflict_id"], "file_id": row["id"],
+                "filename": row["logical_name"], "sha256": row["sha256"],
+                "size": row["size"],
+            }, sort_keys=True),
+        )
+        return "purged_broken"
+
+    def reconcile_external_materials(project_id: str | None = None) -> dict[str, int]:
+        """Idempotently hide legacy conflicts and finish destructive cleanups."""
+        normalized = store.normalize_pending_conflict_files()
+        projects = {
+            str(project["id"]): project for project in store.projects()
+            if project_id is None or str(project["id"]) == project_id
+        }
+        completed = failed_cleanup = tombstones = orphan_pending = 0
+        orphan_materials = 0
+        pending_private = pending_recovered = pending_broken = 0
+        for row in store.pending_conflict_files(project_id):
+            project = projects.get(str(row["project_id"]))
+            if project is None:
+                continue
+            try:
+                outcome = reconcile_pending_staging(row, project)
+                if outcome == "private":
+                    pending_private += 1
+                elif outcome == "recovered":
+                    pending_recovered += 1
+                else:
+                    pending_broken += 1
+            except (FileValidationError, OSError, RuntimeErrorBase, sqlite3.Error) as exc:
+                failed_cleanup += 1
+                store.audit(
+                    "pending_file_reconcile", "failure", str(row["project_id"]),
+                    details=json.dumps({
+                        "conflict_id": row["conflict_id"], "file_id": row["id"],
+                        "error_code": type(exc).__name__,
+                    }, sort_keys=True),
+                )
+        for job in store.file_cleanup_jobs(project_id):
+            project = projects.get(str(job["project_id"]))
+            if project is None:
+                continue
+            if purge_cleanup_job(job, project):
+                completed += 1
+            else:
+                failed_cleanup += 1
+        for row in store.legacy_file_tombstones():
+            if project_id is not None and str(row["project_id"]) != project_id:
+                continue
+            project = projects.get(str(row["project_id"]))
+            if project is None:
+                continue
+            try:
+                materials = material_root(Path(runtime.project_context_dir(project["runtime_name"])))
+                blob = material_blob(materials, str(row["storage_name"]), require_regular=False)
+                if blob.exists() or blob.is_symlink():
+                    if blob.is_symlink():
+                        blob.unlink()
+                        fsync_directory(materials)
+                    else:
+                        info = blob.lstat()
+                        if not stat_module.S_ISREG(info.st_mode):
+                            raise FileValidationError("legacy cleanup target is not a regular file")
+                        blob.unlink()
+                        fsync_directory(materials)
+                message_ids = store.file_message_ids(str(row["id"]), str(row["project_id"]))
+                store.purge_legacy_file_tombstone(str(row["id"]), str(row["project_id"]))
+                store.audit("legacy_file_cleanup", "success", str(row["project_id"]), details=json.dumps({
+                    "file_id": row["id"], "filename": row["logical_name"],
+                    "version": row["version"], "sha256": row["sha256"],
+                    "detached_message_ids": message_ids,
+                }, sort_keys=True))
+                tombstones += 1
+            except (FileValidationError, OSError, RuntimeErrorBase, sqlite3.Error) as exc:
+                failed_cleanup += 1
+                store.audit("legacy_file_cleanup", "failure", str(row["project_id"]), details=json.dumps({
+                    "file_id": row["id"], "error_code": type(exc).__name__,
+                }, sort_keys=True))
+        for row in store.orphan_pending_files():
+            if project_id is not None and str(row["project_id"]) != project_id:
+                continue
+            project = projects.get(str(row["project_id"]))
+            if project is None:
+                continue
+            try:
+                materials, staging = project_staging(project)
+                staging_name = row.get("staging_name")
+                if staging_name:
+                    staged = staging_blob(
+                        staging, staging_name, require_regular=False,
+                    )
+                    if unlink_regular_or_symlink(
+                        staged, label="orphan staged material",
+                    ):
+                        fsync_directory(staging)
+                blob = material_blob(materials, str(row["storage_name"]), require_regular=False)
+                if unlink_regular_or_symlink(
+                    blob, label="orphan pending material",
+                ):
+                    fsync_directory(materials)
+                store.purge_orphan_pending_file(str(row["id"]), str(row["project_id"]))
+                store.audit("legacy_file_cleanup", "orphan_pending", str(row["project_id"]), details=json.dumps({
+                    "file_id": row["id"], "filename": row["logical_name"],
+                    "version": row["version"], "sha256": row["sha256"],
+                }, sort_keys=True))
+                orphan_pending += 1
+            except (FileValidationError, OSError, RuntimeErrorBase, sqlite3.Error) as exc:
+                store.audit("legacy_file_cleanup", "failure", str(row["project_id"]), details=json.dumps({
+                    "file_id": row["id"], "error_code": type(exc).__name__,
+                }, sort_keys=True))
+        # A crash can occur after rename but before the cleanup queue commit.
+        # Such dotfiles are never addressable inputs; remove them on startup.
+        for project in projects.values():
+            try:
+                materials = material_root(Path(runtime.project_context_dir(project["runtime_name"])))
+                queued = {str(job["quarantine_name"]) for job in store.file_cleanup_jobs(str(project["id"]))}
+                for candidate in materials.glob(".delete-*"):
+                    if candidate.name in queued:
+                        continue
+                    info = candidate.lstat()
+                    if candidate.is_symlink():
+                        candidate.unlink()
+                        fsync_directory(materials)
+                        continue
+                    if not stat_module.S_ISREG(info.st_mode):
+                        continue
+                    candidate.unlink()
+                    fsync_directory(materials)
+            except (FileValidationError, OSError, RuntimeErrorBase):
+                failed_cleanup += 1
+
+        # An ordinary first upload promotes bytes before inserting its DB row.
+        # A crash in that narrow window leaves an unreferenced content-addressed
+        # blob. Only strict 64-hex regular material names are eligible here;
+        # reports/artifacts and unsafe entries are never inferred as upload
+        # leftovers.
+        for project in projects.values():
+            try:
+                project_id_value = str(project["id"])
+                materials = material_root(Path(runtime.project_context_dir(project["runtime_name"])))
+                referenced_names = store.file_storage_names(project_id_value)
+                changed = False
+                for candidate in materials.iterdir():
+                    if (
+                        _CONTENT_ADDRESS_RE.fullmatch(candidate.name) is None
+                        or candidate.name in referenced_names
+                    ):
+                        continue
+                    info = candidate.lstat()
+                    if candidate.is_symlink() or not stat_module.S_ISREG(info.st_mode):
+                        continue
+                    candidate.unlink()
+                    changed = True
+                    orphan_materials += 1
+                if changed:
+                    fsync_directory(materials)
+            except (FileValidationError, OSError, RuntimeErrorBase):
+                failed_cleanup += 1
+
+        # Private staging is a durable cache only for live pending-conflict DB
+        # rows. Remove any unreferenced random files, plus project directories
+        # whose DB Project disappeared before cleanup completed.
+        referenced: dict[str, set[str]] = {}
+        for row in store.pending_conflict_files(project_id):
+            if isinstance(row.get("staging_name"), str):
+                referenced.setdefault(str(row["project_id"]), set()).add(
+                    str(row["staging_name"]),
+                )
+        known_staging: set[Path] = set()
+        shared_roots: set[Path] = set()
+        for project in projects.values():
+            try:
+                _materials, staging = project_staging(project)
+                known_staging.add(staging)
+                shared_roots.add(staging.parent)
+                changed = False
+                for candidate in staging.iterdir():
+                    if candidate.name in referenced.get(str(project["id"]), set()):
+                        continue
+                    if unlink_regular_or_symlink(
+                        candidate, label="orphan private staged material",
+                    ):
+                        changed = True
+                if changed:
+                    fsync_directory(staging)
+            except (FileValidationError, OSError, RuntimeErrorBase):
+                failed_cleanup += 1
+
+        if project_id is None:
+            adapter_root = (
+                getattr(runtime, "agents_root", None)
+                or getattr(runtime, "root", None)
+            )
+            if adapter_root is not None:
+                shared_roots.add(
+                    Path(adapter_root).resolve() / ".danus-web-control-staging",
+                )
+            for shared in shared_roots:
+                try:
+                    if not shared.exists():
+                        continue
+                    info = shared.lstat()
+                    if shared.is_symlink() or not stat_module.S_ISDIR(info.st_mode):
+                        raise FileValidationError("control staging parent is unsafe")
+                    shared_changed = False
+                    for directory in shared.iterdir():
+                        if directory in known_staging:
+                            continue
+                        if directory.is_symlink():
+                            directory.unlink()
+                            shared_changed = True
+                            continue
+                        directory_info = directory.lstat()
+                        if not stat_module.S_ISDIR(directory_info.st_mode):
+                            raise FileValidationError("orphan staging entry is unsafe")
+                        for candidate in directory.iterdir():
+                            unlink_regular_or_symlink(
+                                candidate, label="orphan Project staged material",
+                            )
+                        fsync_directory(directory)
+                        directory.rmdir()
+                        shared_changed = True
+                    if shared_changed:
+                        fsync_directory(shared)
+                except (FileValidationError, OSError):
+                    failed_cleanup += 1
+        return {
+            "normalized_pending": normalized, "completed": completed,
+            "cleanup_pending": failed_cleanup, "legacy_tombstones": tombstones,
+            "orphan_pending": orphan_pending,
+            "orphan_materials": orphan_materials,
+            "pending_private": pending_private,
+            "pending_recovered": pending_recovered,
+            "pending_broken": pending_broken,
+        }
 
     def session(request: Request) -> dict[str, Any] | None:
         token = request.cookies.get(settings.cookie_name)
@@ -285,6 +969,193 @@ def create_app(
         # Injectable adapters used by deployments/tests predating #8 retain a
         # compatibility fallback. Production never trusts a raw numeric PID.
         return bool(worker.get("alive"))
+
+    def replace_worker_roster_proof(
+        project: dict[str, Any], projection: Any,
+    ) -> tuple[str | None, list[dict[str, str]]]:
+        """Validate the runtime-owned, full-process-group Worker exit proof.
+
+        Destructive material mutation needs a terminal Worker state *and* a
+        complete host projection. A dead leader alone is insufficient: an
+        orphan descendant can still hold or traverse Project material.
+        """
+        if not isinstance(projection, dict):
+            return "invalid_status_projection", []
+        config = projection.get("config")
+        workers = projection.get("workers")
+        if not isinstance(config, dict) or not isinstance(workers, list):
+            return "invalid_status_projection", []
+        try:
+            expected = [
+                name for name, _role
+                in L.parse_roles(project_config(project)["roles"])
+            ]
+        except (TypeError, ValueError):
+            return "invalid_configured_roster", []
+        if not expected or len(expected) != len(set(expected)):
+            return "invalid_configured_roster", []
+
+        configured = config.get("workers")
+        if configured is not None:
+            if not isinstance(configured, list):
+                return "invalid_status_projection", []
+            configured_names: list[str] = []
+            for item in configured:
+                name = item.get("worker") if isinstance(item, dict) else item
+                if not isinstance(name, str) or not name or name in configured_names:
+                    return "invalid_status_projection", []
+                configured_names.append(name)
+            if set(configured_names) != set(expected):
+                return "roster_mismatch", []
+
+        roster: dict[str, dict[str, Any]] = {}
+        for worker in workers:
+            if not isinstance(worker, dict):
+                return "invalid_status_projection", []
+            name = worker.get("worker")
+            if not isinstance(name, str) or not name or name in roster:
+                return "invalid_status_projection", []
+            roster[name] = worker
+        if set(roster) != set(expected):
+            return "roster_mismatch", []
+
+        blocked: list[dict[str, str]] = []
+        terminal_states = {
+            "created", "deadline", "error", "max_rounds", "reclaimed",
+            "stopped", "terminated",
+        }
+        proof_reason = {
+            "leader_pid_reused": "worker_process_identity_reused",
+            "process_group_live_or_reused": "worker_process_group_live_or_reused",
+            "project_process_reference": "worker_project_process_live",
+            "process_inspection_failed": "worker_process_inspection_failed",
+            "descendant_membership_unavailable": "worker_descendant_membership_unverified",
+            "duplicate_host_process_group": "worker_process_identity_reused",
+        }
+        for name in expected:
+            worker = roster[name]
+            identity = worker.get("process_identity")
+            if identity != "dead":
+                reason = (
+                    "worker_live" if identity == "matched"
+                    else "worker_identity_mismatch" if identity == "mismatch"
+                    else "worker_identity_unknown"
+                )
+                blocked.append({"worker": name, "reason": reason})
+                continue
+            if worker.get("alive") is not False or worker.get("raw_alive") is not False:
+                blocked.append({"worker": name, "reason": "worker_status_inconsistent"})
+                continue
+
+            state = str(worker.get("state") or "").lower()
+            if state not in terminal_states:
+                blocked.append({"worker": name, "reason": "worker_state_unverified"})
+                continue
+
+            proof = worker.get("process_exit_proof")
+            if not isinstance(proof, dict):
+                blocked.append({"worker": name, "reason": "worker_process_group_unverified"})
+                continue
+            source = proof.get("source")
+            pgid = proof.get("pgid")
+            live_count = proof.get("live_process_count")
+            reference_count = proof.get("project_reference_count")
+            counts_valid = (
+                isinstance(live_count, int) and not isinstance(live_count, bool)
+                and live_count == 0
+                and isinstance(reference_count, int) and not isinstance(reference_count, bool)
+                and reference_count == 0
+            )
+            source_valid = (
+                source == "never_started" and pgid is None and state == "created"
+            ) or (
+                source == "host_process_group"
+                and isinstance(pgid, int) and not isinstance(pgid, bool) and pgid > 0
+                and proof.get("descendant_membership_verified") is True
+            )
+            if (
+                proof.get("status") == "verified_dead"
+                and proof.get("inspection_complete") is True
+                and counts_valid and source_valid
+                and proof.get("reason") is None
+            ):
+                continue
+            reason = proof_reason.get(
+                str(proof.get("reason") or ""), "worker_process_group_unverified",
+            )
+            blocked.append({"worker": name, "reason": reason})
+        return ("workers_not_stopped", blocked) if blocked else (None, [])
+
+    async def project_worker_exit_proof(
+        project: dict[str, Any], *, reconcile: bool = False,
+    ) -> tuple[str | None, list[dict[str, str]], str | None]:
+        try:
+            projection_method = getattr(runtime, "worker_exit_projection", None)
+            if not callable(projection_method):
+                raise RuntimeSafetyError("runtime has no full Worker exit projection")
+            projection = await asyncio.to_thread(
+                projection_method, project["runtime_name"],
+            )
+        except Exception as exc:
+            return "status_unavailable", [], type(exc).__name__
+        if reconcile:
+            reconcile_run(str(project["id"]), project, projection)
+        reason, blocked = replace_worker_roster_proof(project, projection)
+        return reason, blocked, None
+
+    def project_maintenance_rejection(
+        project_id: str, action: str,
+    ) -> JSONResponse | None:
+        reason = store.project_maintenance_reason(project_id)
+        if reason is None:
+            return None
+        pending = reason in {"pending_file_conflict", "pending_file_reservation"}
+        error_code = "pending_file_conflict" if pending else "file_cleanup_pending"
+        store.audit(
+            "file_conflict_gate", "rejected", project_id,
+            details=json.dumps({
+                "action": action, "error_code": error_code,
+                "maintenance_reason": reason,
+            }, sort_keys=True),
+        )
+        return JSONResponse({
+            "detail": (
+                "resolve or cancel the pending file conflict before continuing"
+                if pending else
+                "finish the pending file cleanup before continuing"
+            ),
+            "error_code": error_code,
+            "status": "maintenance_required",
+        }, status_code=409)
+
+    def graceful_stop_request_failure(
+        project: dict[str, Any], result: Any,
+    ) -> str | None:
+        """Require an explicit accepted stop result for every configured Worker."""
+        if not isinstance(result, dict) or not isinstance(result.get("workers"), list):
+            return "invalid_stop_response"
+        try:
+            expected = [
+                name for name, _role in L.parse_roles(project_config(project)["roles"])
+            ]
+        except (TypeError, ValueError):
+            return "invalid_configured_roster"
+        if not expected or len(expected) != len(set(expected)):
+            return "invalid_configured_roster"
+        rows: dict[str, dict[str, Any]] = {}
+        for row in result["workers"]:
+            if not isinstance(row, dict):
+                return "invalid_stop_response"
+            worker = row.get("worker")
+            if not isinstance(worker, str) or not worker or worker in rows:
+                return "invalid_stop_response"
+            rows[worker] = row
+        if set(rows) != set(expected):
+            return "stop_roster_mismatch"
+        allowed = {"stopping (graceful)", "not-running"}
+        if any(str(rows[name].get("result") or "") not in allowed for name in expected):
+            return "worker_stop_refused"
+        return None
 
     def worker_progress(workers: list[dict[str, Any]]) -> dict[str, int]:
         live = [worker for worker in workers if worker_is_live(worker)]
@@ -453,6 +1324,81 @@ def create_app(
             lifecycle_hmac_secret, project["id"], project["runtime_name"],
         )
 
+    def artifact_confirmation_token(intent: dict[str, Any]) -> str:
+        return artifact_confirmation_capability(
+            lifecycle_hmac_secret, str(intent["id"]), str(intent["project_id"]),
+            str(intent["action"]), str(intent["payload_digest"]),
+        )
+
+    async def execute_artifact_action(
+        project: dict[str, Any], action: str, normalized: dict[str, Any],
+        *, actor: str,
+    ) -> dict[str, Any] | JSONResponse:
+        project_id = str(project["id"])
+        audit_details = json.dumps({
+            "action": action, "actor": actor,
+            "payload_digest": _artifact_payload_digest(action, normalized),
+            "paper_id": normalized.get("paper_id"),
+            "fact_count": len(normalized.get("fact_ids") or []),
+            "stop_workers": normalized.get("stop_workers"),
+        }, sort_keys=True)
+        try:
+            if action == "finalize-suggest":
+                raw = await asyncio.to_thread(runtime.finalize_suggestions, project["runtime_name"])
+            elif action == "finalize":
+                raw = await asyncio.to_thread(
+                    runtime.finalize_target, project["runtime_name"],
+                    normalized["fact_ids"], normalized["paper_id"],
+                )
+            elif action == "human-summary":
+                raw = await asyncio.to_thread(
+                    runtime.write_human_summary, project["runtime_name"], normalized["language"],
+                )
+            elif action == "write-paper":
+                raw = await asyncio.to_thread(
+                    runtime.write_paper_artifact, project["runtime_name"],
+                    paper_id=normalized["paper_id"],
+                    stop_workers=normalized["stop_workers"],
+                    fact_ids=normalized["fact_ids"],
+                    instructions=normalized["instructions"],
+                )
+            else:
+                return _error(400, "unsupported artifact action")
+            if not isinstance(raw, dict):
+                raise RuntimeError("artifact runtime returned an invalid response")
+            result = {"status": "ok", "action": action, **raw}
+            if result.get("status") != "ok":
+                store.audit("artifact_action", "failure", project_id, details=audit_details)
+                status_code = 409 if result.get("status") == "needs_target" else 502
+                return JSONResponse(result, status_code=status_code)
+            if action == "write-paper" and normalized["stop_workers"]:
+                graceful_stop = await asyncio.to_thread(
+                    runtime.stop_project, project["runtime_name"],
+                )
+                stop_failure = graceful_stop_request_failure(project, graceful_stop)
+                if stop_failure is not None:
+                    store.audit(
+                        "artifact_action", "stop_incomplete", project_id,
+                        details=json.dumps({
+                            **json.loads(audit_details),
+                            "error_code": stop_failure,
+                        }, sort_keys=True),
+                    )
+                    return JSONResponse({
+                        "status": "failed", "action": action,
+                        "error_code": stop_failure,
+                        "detail": "one or more Worker stops were not accepted",
+                    }, status_code=502)
+                result["graceful_stop"] = graceful_stop
+            store.audit("artifact_action", "success", project_id, details=audit_details)
+            return result
+        except (RuntimeErrorBase, OSError, ValueError, RuntimeError) as exc:
+            store.audit("artifact_action", "failure", project_id, details=json.dumps({
+                **json.loads(audit_details), "error_code": type(exc).__name__,
+            }, sort_keys=True))
+            status_code = 409 if action in {"finalize", "finalize-suggest"} else 502
+            return _error(status_code, "artifact operation failed")
+
     @app.post("/internal/api/projects/{project_id}/lifecycle")
     async def internal_project_lifecycle(project_id: str, request: Request):
         client_host = request.client.host if request.client is not None else None
@@ -485,29 +1431,77 @@ def create_app(
                 return _error(400, "invalid worker")
             worker = str(worker)
 
-        if action in {"finalize", "human-summary", "write-paper"} and payload.get("operator_confirmed") is not True:
-            return _error(409, "explicit operator confirmation required")
-        if action == "finalize-suggest":
-            try: return runtime.finalize_suggestions(project["runtime_name"])
-            except RuntimeErrorBase as exc: return _error(409, str(exc)[:200])
-        if action == "finalize":
-            try: return runtime.finalize_target(project["runtime_name"], [str(fid) for fid in payload.get("fact_ids") or []], payload.get("paper_id"))
-            except RuntimeErrorBase as exc: return _error(409, str(exc)[:200])
-        if action == "human-summary":
-            try: return runtime.write_human_summary(project["runtime_name"], payload.get("language"))
-            except RuntimeErrorBase: return _error(502, "human summary failed")
-        if action == "write-paper":
+        if action in {"finalize-suggest", "finalize", "human-summary", "write-paper"}:
             try:
-                stop_workers = bool(payload.get("stop_workers"))
-                result = runtime.write_paper_artifact(project["runtime_name"], paper_id=payload.get("paper_id"), stop_workers=stop_workers, fact_ids=payload.get("fact_ids"), instructions=payload.get("instructions"))
-                if stop_workers and result.get("status") == "ok": result["graceful_stop"] = runtime.stop_project(project["runtime_name"])
-                return result
-            except RuntimeErrorBase: return _error(502, "paper generation failed")
+                normalized = _artifact_payload(action, payload)
+            except ValueError as exc:
+                return _error(400, str(exc))
+            if action == "finalize-suggest":
+                return await execute_artifact_action(
+                    project, action, normalized, actor="main_agent_broker",
+                )
+            else:
+                supplied_confirmation = payload.get("confirmation_token")
+                try:
+                    confirmation_digest = (
+                        digest_token(supplied_confirmation)
+                        if isinstance(supplied_confirmation, str)
+                        and 0 < len(supplied_confirmation) <= 512 else ""
+                    )
+                except (UnicodeEncodeError, ValueError):
+                    confirmation_digest = ""
+                confirmation_status = "invalid"
+                if confirmation_digest:
+                    confirmation_status = store.consume_artifact_confirmation(
+                        confirmation_digest, project_id, action,
+                        _artifact_payload_digest(action, normalized), now=time.time(),
+                    )
+                if confirmation_status != "consumed":
+                    store.audit("artifact_confirmation", "rejected", project_id, details=json.dumps({
+                        "action": action, "error_code": confirmation_status,
+                        "payload_digest": _artifact_payload_digest(action, normalized),
+                    }, sort_keys=True))
+                    return JSONResponse({
+                        "status": "rejected", "action": action,
+                        "error_code": confirmation_status,
+                        "detail": "artifact confirmation was rejected",
+                    }, status_code=410 if confirmation_status == "expired" else 409)
+                store.audit("artifact_confirmation", "consumed", project_id, details=json.dumps({
+                    "action": action, "payload_digest": _artifact_payload_digest(action, normalized),
+                }, sort_keys=True))
+            artifact_result = await execute_artifact_action(
+                project, action, normalized, actor="main_agent_broker",
+            )
+            succeeded = isinstance(artifact_result, dict) and artifact_result.get("status") == "ok"
+            outcome_code = "ok" if succeeded else "runtime_failed"
+            if not store.complete_artifact_confirmation(
+                confirmation_digest, succeeded=succeeded, outcome_code=outcome_code,
+                completed_at=time.time(),
+            ):
+                store.audit("artifact_confirmation", "outcome_persist_failed", project_id, details=json.dumps({
+                    "action": action, "payload_digest": _artifact_payload_digest(action, normalized),
+                }, sort_keys=True))
+                return JSONResponse({
+                    "status": "failed", "action": action,
+                    "error_code": "outcome_not_persisted",
+                    "detail": "artifact outcome could not be persisted",
+                }, status_code=500)
+            store.audit("artifact_confirmation", "succeeded" if succeeded else "failed", project_id, details=json.dumps({
+                "action": action, "outcome_code": outcome_code,
+                "payload_digest": _artifact_payload_digest(action, normalized),
+            }, sort_keys=True))
+            return artifact_result
         if action == "status":
             try:
                 return runtime.status_project(project["runtime_name"])
             except (RuntimeErrorBase, OSError):
                 return _error(502, "project status unavailable")
+        if action in {"start", "resume"}:
+            maintenance = project_maintenance_rejection(
+                project_id, f"lifecycle_{action}",
+            )
+            if maintenance is not None:
+                return maintenance
         if action in {"assign", "start"} and project.get("initial_direction_confirmed_at") is None:
             return _error(409, "initial direction confirmation required before assignment or start")
         if action == "assign":
@@ -838,17 +1832,27 @@ def create_app(
             return _error(400, "destructive confirmation does not match project name")
         async with lock_for(project_id):
             try:
-                projection = runtime.status_project(project["runtime_name"])
-                reconcile_run(project_id, project, projection)
-                if store.active_run(project_id) is not None or any(
-                    worker.get("alive") for worker in projection.get("workers", [])
-                ):
+                rejection_reason, blocked_workers, _status_error = (
+                    await project_worker_exit_proof(project, reconcile=True)
+                )
+                if store.active_run(project_id) is not None or rejection_reason is not None:
+                    store.audit(
+                        "project_delete", "rejected_workers_not_stopped", project_id,
+                        details=json.dumps({
+                            "reason": rejection_reason or "active_run",
+                            "blocked_workers": blocked_workers,
+                        }, sort_keys=True),
+                    )
                     return _error(409, "project must be stopped before deletion")
+                # Staging is outside runtime.delete_project's Project tree. It
+                # must be durably empty before the DB maintenance gate is
+                # removed or the runtime directory disappears.
+                erase_project_staging(project)
                 result = runtime.delete_project(project["runtime_name"])
                 store.delete_project(project_id)
                 store.audit("project_delete", "success", project_id)
                 return JSONResponse({"deleted": True, **result}, status_code=200)
-            except RuntimeErrorBase:
+            except (FileValidationError, OSError, RuntimeErrorBase):
                 store.audit("project_delete", "failure", project_id)
                 return _error(502, "project deletion failed")
 
@@ -883,6 +1887,9 @@ def create_app(
         if duration <= 0 or duration > 7 * 24 * 3600:
             return _error(400, "duration_seconds must be between 1 and 604800")
         async with lock_for(project_id):
+            maintenance = project_maintenance_rejection(project_id, "run_start")
+            if maintenance is not None:
+                return maintenance
             try:
                 status_projection = runtime.status_project(project["runtime_name"])
                 reconcile_run(project_id, project, status_projection)
@@ -1070,6 +2077,9 @@ def create_app(
             return context
         project, payload = context
         async with lock_for(project_id):
+            maintenance = project_maintenance_rejection(project_id, "run_resume")
+            if maintenance is not None:
+                return maintenance
             active = store.active_run(project_id)
             if active is None or active["status"] != "running" or time.time() >= active["deadline"]:
                 return _error(409, "project run is not resumable")
@@ -1169,6 +2179,51 @@ def create_app(
             return project
         return [metadata(row) for row in store.files(project_id)]
 
+    @app.get("/api/projects/{project_id}/file-cleanups")
+    async def file_cleanup_projection(project_id: str, request: Request):
+        if isinstance((auth := auth_required(request)), JSONResponse):
+            return auth
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse):
+            return project
+        jobs = store.file_cleanup_jobs(project_id)
+        maintenance_reason = store.project_maintenance_reason(project_id)
+        return {
+            "status": "cleanup_pending" if maintenance_reason is not None else "ok",
+            "maintenance_reason": maintenance_reason,
+            "jobs": [{
+                "id": row["id"], "reason": row["reason"],
+                "created_at": row["created_at"], "last_error": row["last_error"],
+            } for row in jobs],
+        }
+
+    @app.post("/api/projects/{project_id}/file-cleanups/retry")
+    async def retry_file_cleanups(project_id: str, request: Request):
+        current = auth_required(request)
+        if isinstance(current, JSONResponse):
+            return current
+        if not csrf_ok(request, current):
+            return _error(403, "csrf validation failed")
+        project = project_or_404(project_id)
+        if isinstance(project, JSONResponse):
+            return project
+        async with lock_for(project_id):
+            result = await asyncio.to_thread(reconcile_external_materials, project_id)
+        pending_count = len(store.file_cleanup_jobs(project_id))
+        maintenance_reason = store.project_maintenance_reason(project_id)
+        cleanup_pending = maintenance_reason is not None
+        store.audit("file_cleanup_retry", "pending" if cleanup_pending else "success", project_id, details=json.dumps({
+            "pending_count": pending_count,
+            "maintenance_reason": maintenance_reason,
+            **result,
+        }, sort_keys=True))
+        return JSONResponse({
+            "status": "cleanup_pending" if cleanup_pending else "ok",
+            "committed": True, "cleanup_pending": cleanup_pending,
+            "pending_count": pending_count,
+            "maintenance_reason": maintenance_reason,
+        }, status_code=202 if cleanup_pending else 200)
+
     @app.post("/api/projects/{project_id}/files")
     async def upload_file(project_id: str, request: Request):
         current = auth_required(request)
@@ -1180,66 +2235,186 @@ def create_app(
         if isinstance(project, JSONResponse):
             return project
         try:
-            form = await request.form()
-        except Exception:
-            return _error(400, "invalid multipart upload")
-        upload = form.get("file")
-        if upload is None or not hasattr(upload, "filename") or not hasattr(upload, "file"):
-            return _error(400, "file is required")
+            declared_name = decode_upload_filename(
+                request.headers.get("x-danus-upload-filename", ""),
+            )
+            content_type, kind = file_type(declared_name)
+        except FileValidationError as exc:
+            return _error(400, str(exc))
         async with lock_for(project_id):
-          pending = None
-          try:
-              logical_name = normalize_filename(upload.filename)
-              content_type, kind = file_type(logical_name)
-              materials = material_root(Path(runtime.project_context_dir(project["runtime_name"])))
-              pending, sha256, size = stream_to_pending(upload, materials, settings.max_file_bytes)
-              data = pending.read_bytes()
-              validate_bytes(kind, data)
-              storage_name, stored = promote_pending(pending, materials, sha256)
-              existing_hash = store.file_by_hash(project_id, sha256)
-              if existing_hash is None:
-                  tombstone = store.file_tombstone_by_hash(project_id, sha256)
-                  if tombstone is not None:
-                      store.purge_file_tombstone(tombstone["id"], project_id)
-                      tombstone = store.file_tombstone_by_hash(project_id, sha256)
-                      if tombstone is not None:
-                          # An attachment keeps the historical row and blob;
-                          # restore it as a usable deduplicated file instead of
-                          # violating UNIQUE(project_id, sha256).
-                          store.update_file_status(tombstone["id"], processing_status="available")
-                          existing_hash = store.file(tombstone["id"], project_id)
-              if existing_hash is not None:
-                  if stored:
-                      remove_blob(materials, storage_name)
-                  store.audit("file_upload", "reuse", project_id)
-                  return JSONResponse(metadata(existing_hash), status_code=200)
-              existing = store.current_file(project_id, logical_name)
-              file_id = uuid.uuid4().hex
-              version = store.next_version(project_id, logical_name)
-              row = {"id": file_id, "project_id": project_id, "logical_name": logical_name, "content_type": content_type, "kind": kind, "size": size, "sha256": sha256, "storage_name": storage_name, "version": version, "is_current": 0 if existing else 1, "processing_status": "available", "read_status": "not_read", "uploaded_at": time.time()}
-              store.add_file(row)
-              if existing:
-                  conflict_id = uuid.uuid4().hex
-                  store.add_conflict({"id": conflict_id, "project_id": project_id, "logical_name": logical_name, "incoming_file_id": file_id, "current_file_id": existing["id"], "created_at": time.time(), "status": "pending"})
-                  store.audit("file_upload", "conflict", project_id)
-                  return JSONResponse({"conflict_id": conflict_id, "current": metadata(existing), "incoming": metadata(row), "choices": ["replace", "new_version", "cancel"]}, status_code=409)
-              store.audit("file_upload", "success", project_id)
-              return JSONResponse(metadata(row), status_code=201)
-          except FileValidationError as exc:
-              if pending is not None:
-                  pending.unlink(missing_ok=True)
-              return _error(400, str(exc))
-          except (OSError, sqlite3.IntegrityError) as exc:
-              # Best-effort cleanup for failures after blob promotion. A blob may
-              # be shared by an existing content-addressed row, so only remove it
-              # when this request created it and no row references it.
-              try:
-                  if "stored" in locals() and stored and "storage_name" in locals() and store.file_by_hash(project_id, sha256) is None:
-                      remove_blob(materials, storage_name)
-              except (OSError, FileValidationError):
-                  pass
-              store.audit("file_upload", "failure", project_id, json.dumps({"error": str(exc)[:200]}))
-              return _error(500, "file could not be persisted")
+            pending: Path | None = None
+            materials: Path | None = None
+            staging: Path | None = None
+            storage_name: str | None = None
+            sha256 = ""
+            ordinary_reserved = False
+            try:
+                unresolved = store.pending_conflict(project_id, declared_name)
+                if unresolved is not None:
+                    return JSONResponse({
+                        "status": "conflict_pending", "conflict_id": unresolved["id"],
+                        "detail": "resolve the existing file conflict first",
+                    }, status_code=409)
+                existing = store.current_file(project_id, declared_name)
+                rejection_reason, blocked_workers, status_error = (
+                    await project_worker_exit_proof(project)
+                )
+                if rejection_reason is not None:
+                    is_conflict = existing is not None
+                    error_code = (
+                        "file_conflict_workers_not_stopped" if is_conflict
+                        else "file_upload_workers_not_stopped"
+                    )
+                    details: dict[str, Any] = {
+                        "filename": declared_name, "error_code": error_code,
+                        "reason": rejection_reason,
+                        "blocked_workers": blocked_workers,
+                    }
+                    if status_error is not None:
+                        details["status_error"] = status_error
+                    store.audit(
+                        "file_upload",
+                        (
+                            "conflict_rejected_workers_not_stopped" if is_conflict
+                            else "rejected_workers_not_stopped"
+                        ),
+                        project_id, details=json.dumps(details, sort_keys=True),
+                    )
+                    return JSONResponse({
+                        "detail": (
+                            "Uploading Project material requires every Worker to be "
+                            "terminal and its complete process group exit verified"
+                        ),
+                        "error_code": error_code,
+                        "status": (
+                            "conflict_upload_blocked" if is_conflict
+                            else "upload_blocked"
+                        ),
+                    }, status_code=409)
+
+                # Parse/read the multipart body only after the same-name Worker
+                # exit proof. The declared name is then bound to the multipart
+                # filename so a caller cannot preflight one name and upload
+                # another.
+                try:
+                    form = await request.form()
+                except Exception:
+                    return _error(400, "invalid multipart upload")
+                upload = form.get("file")
+                if (
+                    upload is None or not hasattr(upload, "filename")
+                    or not hasattr(upload, "file")
+                ):
+                    return _error(400, "file is required")
+                logical_name = normalize_filename(upload.filename)
+                if logical_name != declared_name:
+                    return _error(400, "declared filename does not match multipart upload")
+
+                materials, staging = project_staging(project)
+
+                pending, sha256, size = stream_to_pending(
+                    upload, staging, settings.max_file_bytes,
+                )
+                fsync_directory(staging)
+                validate_bytes(kind, pending.read_bytes())
+                existing_hash = store.file_by_hash(project_id, sha256)
+                if existing_hash is None:
+                    tombstone = store.file_tombstone_by_hash(project_id, sha256)
+                    if tombstone is not None:
+                        reconcile_external_materials(project_id)
+                        tombstone = store.file_tombstone_by_hash(project_id, sha256)
+                        if tombstone is not None:
+                            pending.unlink(missing_ok=True)
+                            fsync_directory(staging)
+                            pending = None
+                            return JSONResponse({
+                                "status": "cleanup_pending",
+                                "detail": "superseded file cleanup must finish before re-upload",
+                            }, status_code=409)
+                if existing_hash is not None:
+                    pending.unlink(missing_ok=True)
+                    fsync_directory(staging)
+                    pending = None
+                    if existing_hash.get("processing_status") != "available":
+                        return JSONResponse({
+                            "status": "conflict_pending",
+                            "detail": "matching upload is awaiting conflict resolution",
+                        }, status_code=409)
+                    store.audit("file_upload", "reuse", project_id)
+                    return JSONResponse(metadata(existing_hash), status_code=200)
+
+                storage_name = sha256
+                file_id = uuid.uuid4().hex
+                version = store.next_version(project_id, logical_name)
+                row = {
+                    "id": file_id, "project_id": project_id,
+                    "logical_name": logical_name, "content_type": content_type,
+                    "kind": kind, "size": size, "sha256": sha256,
+                    "storage_name": storage_name,
+                    "staging_name": pending.name,
+                    "version": version, "is_current": 0,
+                    "processing_status": "pending",
+                    "read_status": "not_read", "uploaded_at": time.time(),
+                }
+                if existing is not None:
+                    conflict_id = uuid.uuid4().hex
+                    conflict = {
+                        "id": conflict_id, "project_id": project_id,
+                        "logical_name": logical_name, "incoming_file_id": file_id,
+                        "current_file_id": existing["id"], "created_at": time.time(),
+                        "status": "pending",
+                    }
+                    store.add_file_conflict(row, conflict)
+                    pending = None  # the DB now owns this private staged blob
+                    store.audit("file_upload", "conflict", project_id)
+                    return JSONResponse({
+                        "conflict_id": conflict_id, "current": metadata(existing),
+                        "incoming": metadata(row),
+                        "choices": ["replace", "new_version", "cancel"],
+                    }, status_code=409)
+
+                reserved_path = pending
+                reserved_name = pending.name
+                store.add_file(row)
+                ordinary_reserved = True
+                pending = None  # the DB reservation now owns either location
+                storage_name, _stored = promote_pending(
+                    reserved_path, materials, sha256, size,
+                )
+                row["storage_name"] = storage_name
+                row = store.finalize_ordinary_file(
+                    file_id, project_id, staging_name=reserved_name,
+                )
+                ordinary_reserved = False
+                return JSONResponse(metadata(row), status_code=201)
+            except FileValidationError as exc:
+                if pending is not None:
+                    pending.unlink(missing_ok=True)
+                    if staging is not None:
+                        with contextlib.suppress(OSError):
+                            fsync_directory(staging)
+                if ordinary_reserved:
+                    with contextlib.suppress(Exception):
+                        reconcile_external_materials(project_id)
+                return _error(400, str(exc))
+            except (OSError, sqlite3.IntegrityError) as exc:
+                if pending is not None:
+                    with contextlib.suppress(OSError):
+                        pending.unlink(missing_ok=True)
+                        if staging is not None:
+                            fsync_directory(staging)
+                # The durable pending row precedes promotion. Reconcile both
+                # possible byte locations immediately; if that cleanup itself
+                # fails, the reservation remains in the unified maintenance
+                # predicate and startup/retry will finish it.
+                if ordinary_reserved:
+                    with contextlib.suppress(Exception):
+                        reconcile_external_materials(project_id)
+                store.audit(
+                    "file_upload", "failure", project_id,
+                    json.dumps({"error_code": type(exc).__name__}),
+                )
+                return _error(500, "file could not be persisted")
 
     @app.post("/api/projects/{project_id}/file-conflicts/{conflict_id}")
     async def resolve_file_conflict(project_id: str, conflict_id: str, request: Request):
@@ -1251,8 +2426,15 @@ def create_app(
         project = project_or_404(project_id)
         if isinstance(project, JSONResponse):
             return project
-        payload = await request.json()
+        try:
+            payload = await request.json()
+        except Exception:
+            return _error(400, "invalid file conflict resolution request")
         choice = payload.get("choice") if isinstance(payload, dict) else None
+        if not isinstance(choice, str) or choice not in (
+            "replace", "new_version", "cancel",
+        ):
+            return _error(400, "choice must be replace, new_version, or cancel")
         async with lock_for(project_id):
             conflict = store.conflict(conflict_id, project_id)
             if conflict is None or conflict["status"] != "pending":
@@ -1262,36 +2444,167 @@ def create_app(
             if incoming is None or existing is None:
                 return _error(409, "file conflict is no longer available")
             try:
-                materials = material_root(Path(runtime.project_context_dir(project["runtime_name"])))
-                incoming_blob = materials / incoming["storage_name"]
-                if not incoming_blob.is_file():
-                    return _error(409, "incoming file blob is unavailable")
-                if choice == "cancel":
-                    # Keep an attachment's historical file row; only discard
-                    # the pending conflict blob and mark the incoming row.
-                    remove_blob(materials, incoming["storage_name"])
-                    store.update_conflict(conflict_id, "cancelled")
-                    store.update_file_status(incoming["id"], processing_status="cancelled")
-                    store.audit("file_conflict", "cancel", project_id)
-                    return JSONResponse({"status": "cancelled"}, status_code=200)
-                if choice == "new_version":
-                    store.set_current(project_id, conflict["logical_name"], incoming["id"])
-                    store.update_conflict(conflict_id, "new_version")
-                    store.audit("file_conflict", "new_version", project_id)
-                    return JSONResponse(metadata(store.file(incoming["id"], project_id)), status_code=200)
                 if choice == "replace":
-                    store.set_current(project_id, conflict["logical_name"], incoming["id"])
-                    store.update_conflict(conflict_id, "replaced")
-                    store.update_file_status(existing["id"], is_current=0, processing_status="replaced")
-                    # Remove an unreferenced superseded blob only after the
-                    # durable state transition. Attachments retain history.
-                    if not store.messages(project_id) or not any(existing["id"] in m.get("attachment_ids", []) for m in store.messages(project_id)):
-                        remove_blob(materials, existing["storage_name"])
-                    store.audit("file_conflict", "replace", project_id)
-                    return JSONResponse(metadata(store.file(incoming["id"], project_id)), status_code=200)
-                return _error(400, "choice must be replace, new_version, or cancel")
+                    # The orchestration beat holds this same Project lock. Keep
+                    # the read-only exit proof and destructive transition in one
+                    # critical section so no Worker activity can interleave.
+                    rejection_reason, blocked_workers, status_error = (
+                        await project_worker_exit_proof(project)
+                    )
+                    if rejection_reason is not None:
+                        error_code = "replace_workers_not_stopped"
+                        details: dict[str, Any] = {
+                            "choice": "replace", "conflict_id": conflict_id,
+                            "error_code": error_code, "reason": rejection_reason,
+                            "blocked_workers": blocked_workers,
+                        }
+                        if status_error is not None:
+                            details["status_error"] = status_error
+                        store.audit(
+                            "file_conflict", "replace_rejected_workers_not_stopped",
+                            project_id, details=json.dumps(details, sort_keys=True),
+                        )
+                        return JSONResponse({
+                            "detail": (
+                                "Replace requires every Worker to be terminal and its "
+                                "complete process group exit to be verified"
+                            ),
+                            "error_code": error_code,
+                            "status": "replace_blocked",
+                        }, status_code=409)
+                materials, staging = project_staging(project)
+                staging_name = incoming.get("staging_name")
+                if choice == "cancel":
+                    staged = staging_blob(
+                        staging, staging_name, require_regular=False,
+                    )
+                    if staged.exists() or staged.is_symlink():
+                        info = staged.lstat()
+                        if not (
+                            staged.is_symlink() or stat_module.S_ISREG(info.st_mode)
+                        ):
+                            raise FileValidationError(
+                                "staged cancellation target is unsafe",
+                            )
+                        staged.unlink()
+                        fsync_directory(staging)
+                    # Byte erasure precedes the DB transition. If the DB commit
+                    # fails, the pending maintenance gate remains in force and
+                    # retry treats the already-missing staged file idempotently.
+                    cancelled_at = time.time()
+                    store.cancel_staged_conflict(
+                        conflict_id, project_id, staging_name=str(staging_name),
+                        cancelled_at=cancelled_at,
+                    )
+                    store.audit("file_conflict", "cancel", project_id, details=json.dumps({
+                        "choice": "cancel", "file_id": incoming["id"],
+                        "filename": incoming["logical_name"], "version": incoming["version"],
+                        "sha256": incoming["sha256"], "size": incoming["size"],
+                        "cleanup_pending": False,
+                    }, sort_keys=True))
+                    return JSONResponse({
+                        "status": "cancelled", "committed": True,
+                        "cleanup_pending": False,
+                    }, status_code=200)
+                if choice == "new_version":
+                    source, destination = promote_staged_conflict(
+                        incoming, materials, staging,
+                    )
+                    try:
+                        resolved = store.resolve_new_version(
+                            conflict_id, project_id,
+                            staging_name=str(staging_name),
+                        )
+                    except Exception:
+                        if not rollback_staged_promotion(source, destination):
+                            store.audit(
+                                "file_conflict", "promotion_rollback_failed", project_id,
+                                details=json.dumps({
+                                    "choice": "new_version", "conflict_id": conflict_id,
+                                    "file_id": incoming["id"],
+                                }, sort_keys=True),
+                            )
+                        raise
+                    return JSONResponse(metadata(resolved), status_code=200)
+                if choice == "replace":
+                    material_blob(materials, str(existing["storage_name"]))
+                    source, destination = promote_staged_conflict(
+                        incoming, materials, staging,
+                    )
+                    cleanup = {
+                        "id": uuid.uuid4().hex,
+                        "quarantine_name": f".delete-{uuid.uuid4().hex}",
+                        "original_storage_name": existing["storage_name"],
+                        "created_at": time.time(),
+                    }
+                    try:
+                        resolved = store.resolve_destructive_conflict(
+                            conflict_id, project_id, choice="replace", cleanup=cleanup,
+                            staging_name=str(staging_name),
+                        )
+                    except Exception:
+                        if not rollback_staged_promotion(source, destination):
+                            store.audit(
+                                "file_conflict", "promotion_rollback_failed", project_id,
+                                details=json.dumps({
+                                    "choice": "replace", "conflict_id": conflict_id,
+                                    "file_id": incoming["id"],
+                                }, sort_keys=True),
+                            )
+                        raise
+                    assert resolved is not None
+                    replaced_file = resolved.pop("replaced_file")
+                    detached_message_ids = resolved.pop("detached_message_ids")
+                    conversation_reset = bool(resolved.pop("conversation_reset"))
+                    purged_message_ids = resolved.pop("purged_message_ids")
+                    invalidated_intent_ids = resolved.pop(
+                        "invalidated_artifact_intent_ids",
+                    )
+                    job = next(job for job in store.file_cleanup_jobs(project_id) if job["id"] == cleanup["id"])
+                    cleaned = purge_cleanup_job(job, project)
+                    outcome = "replace" if cleaned else "cleanup_pending"
+                    store.audit("file_conflict", outcome, project_id, details=json.dumps({
+                        "choice": "replace", "file_id": replaced_file["id"],
+                        "filename": replaced_file["logical_name"],
+                        "version": replaced_file["version"],
+                        "sha256": replaced_file["sha256"], "size": replaced_file["size"],
+                        "detached_message_ids": detached_message_ids,
+                        "conversation_reset": conversation_reset,
+                        "purged_message_ids": purged_message_ids,
+                        "invalidated_artifact_intent_ids": invalidated_intent_ids,
+                        "replacement_file_id": resolved["id"],
+                        "cleanup_id": cleanup["id"], "cleanup_pending": not cleaned,
+                    }, sort_keys=True))
+                    return JSONResponse({
+                        **metadata(resolved), "status": "replaced", "committed": True,
+                        "cleanup_pending": not cleaned, "cleanup_id": cleanup["id"],
+                        "conversation_reset": conversation_reset,
+                        "purged_message_count": len(purged_message_ids),
+                        "invalidated_artifact_intent_count": len(invalidated_intent_ids),
+                    }, status_code=200 if cleaned else 202)
             except (FileValidationError, RuntimeErrorBase, OSError, sqlite3.IntegrityError) as exc:
-                return _error(409 if isinstance(exc, sqlite3.IntegrityError) else 502, "file conflict could not be resolved")
+                if isinstance(exc, sqlite3.IntegrityError):
+                    error_code = "file_conflict_state_changed"
+                    status_code = 409
+                elif isinstance(exc, FileValidationError):
+                    error_code = "file_conflict_integrity_failed"
+                    status_code = 409
+                else:
+                    error_code = "file_conflict_storage_failed"
+                    status_code = 502
+                store.audit(
+                    "file_conflict", "resolution_failure", project_id,
+                    details=json.dumps({
+                        "choice": choice, "conflict_id": conflict_id,
+                        "error_code": error_code,
+                        "exception_class": type(exc).__name__,
+                    }, sort_keys=True),
+                )
+                return JSONResponse({
+                    "detail": "file conflict could not be resolved",
+                    "error_code": error_code,
+                    "status": "resolution_failed",
+                }, status_code=status_code)
 
     @app.get("/api/projects/{project_id}/workers")
     async def worker_projection(project_id: str, request: Request):
@@ -1365,22 +2678,7 @@ def create_app(
         if not csrf_ok(request, current): return _error(403, "csrf validation failed")
         project = project_or_404(project_id)
         if isinstance(project, JSONResponse): return project
-        payload = await request.json()
-        if not isinstance(payload, dict) or payload.get("confirm") != project["name"]:
-            return _error(409, "project-name confirmation required")
-        fact_ids = payload.get("fact_ids")
-        if not isinstance(fact_ids, list) or not fact_ids or len(fact_ids) > 128 or any(not isinstance(fid, str) or len(fid) > 200 for fid in fact_ids):
-            return _error(400, "fact_ids must be a bounded list of strings")
-        paper_id = payload.get("paper_id")
-        if paper_id is not None and (not isinstance(paper_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", paper_id)):
-            return _error(400, "invalid paper_id")
-        try:
-            result = runtime.finalize_target(project["runtime_name"], fact_ids, paper_id)
-            store.audit("finalize", "success", project_id, details=json.dumps(result))
-            return result
-        except (RuntimeErrorBase, OSError, ValueError) as exc:
-            store.audit("finalize", "failure", project_id, details=str(exc)[:200])
-            return _error(409, str(exc)[:200])
+        return _error(410, "use the operator artifact action flow")
 
     @app.post("/api/projects/{project_id}/human-summary")
     async def human_summary_action(project_id: str, request: Request):
@@ -1389,14 +2687,7 @@ def create_app(
         if not csrf_ok(request, current): return _error(403, "csrf validation failed")
         project = project_or_404(project_id)
         if isinstance(project, JSONResponse): return project
-        payload = await request.json()
-        if not isinstance(payload, dict) or payload.get("confirm") != project["name"]: return _error(409, "project-name confirmation required")
-        try:
-            result = await asyncio.to_thread(runtime.write_human_summary, project["runtime_name"], payload.get("language"))
-            if result.get("status") != "ok":
-                store.audit("human_summary", "failure", project_id, details=json.dumps(result)[:2000]); return JSONResponse(result, status_code=502)
-            store.audit("human_summary", "success", project_id, details=json.dumps(result)[:2000]); return result
-        except (RuntimeErrorBase, OSError) as exc: store.audit("human_summary", "failure", project_id, details=str(exc)[:200]); return _error(502, "human summary failed")
+        return _error(410, "use the operator artifact action flow")
 
     @app.post("/api/projects/{project_id}/write-paper")
     async def write_paper_action(project_id: str, request: Request):
@@ -1405,26 +2696,7 @@ def create_app(
         if not csrf_ok(request, current): return _error(403, "csrf validation failed")
         project = project_or_404(project_id)
         if isinstance(project, JSONResponse): return project
-        payload = await request.json()
-        if not isinstance(payload, dict) or payload.get("confirm") != project["name"]: return _error(409, "project-name confirmation required")
-        stop_workers = payload.get("stop_workers")
-        paper_id = payload.get("paper_id")
-        fact_ids = payload.get("fact_ids")
-        instructions = payload.get("instructions")
-        language = payload.get("language")
-        if not isinstance(stop_workers, bool): return _error(400, "stop_workers fork is required")
-        if paper_id is not None and (not isinstance(paper_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", paper_id)): return _error(400, "invalid paper_id")
-        if fact_ids is not None and (not isinstance(fact_ids, list) or len(fact_ids) > 128 or any(not isinstance(fid, str) or len(fid) > 200 for fid in fact_ids)): return _error(400, "fact_ids must be a bounded list of strings")
-        if instructions is not None and (not isinstance(instructions, str) or len(instructions) > 12000): return _error(400, "instructions must be at most 12000 characters")
-        if language is not None and (not isinstance(language, str) or len(language) > 80): return _error(400, "language must be at most 80 characters")
-        try:
-            result = await asyncio.to_thread(runtime.write_paper_artifact, project["runtime_name"], paper_id=paper_id, stop_workers=stop_workers, fact_ids=fact_ids, instructions=instructions)
-            if result.get("status") != "ok":
-                store.audit("write_paper", "failure", project_id, details=json.dumps(result)[:2000]); return JSONResponse(result, status_code=409 if result.get("status") == "needs_target" else 502)
-            if stop_workers:
-                result["graceful_stop"] = await asyncio.to_thread(runtime.stop_project, project["runtime_name"])
-            store.audit("write_paper", "success", project_id, details=json.dumps({"paper_id": paper_id, "stop_workers": stop_workers})[:2000]); return result
-        except (RuntimeErrorBase, OSError, ValueError) as exc: store.audit("write_paper", "failure", project_id, details=str(exc)[:200]); return _error(502, "paper generation failed")
+        return _error(410, "use the operator artifact action flow")
 
     @app.post("/api/projects/{project_id}/artifacts-actions")
     async def artifact_action_intent(project_id: str, request: Request):
@@ -1435,12 +2707,42 @@ def create_app(
         if isinstance(project, JSONResponse): return project
         payload = await request.json()
         action = payload.get("action") if isinstance(payload, dict) else None
-        if action not in {"human-summary", "write-paper"}:
+        if action not in {"finalize", "human-summary", "write-paper"}:
             return _error(400, "unsupported artifact action")
-        if action == "write-paper" and payload.get("stop_workers") not in {True, False}:
-            return _error(400, "stop_workers confirmation is required")
-        store.audit("artifact_action_intent", "recorded", project_id, details=json.dumps({"action": action, "stop_workers": payload.get("stop_workers")}))
-        return {"status": "intent_recorded", "action": action, "message": "已记录操作意图；请在 Main Agent 会话中确认并执行"}
+        if payload.get("confirm") != project["name"]:
+            return _error(409, "project-name confirmation required")
+        try:
+            normalized = _artifact_payload(action, payload)
+        except ValueError as exc:
+            return _error(400, str(exc))
+        now = time.time()
+        expires_at = min(
+            float(current["expires_at"]),
+            now + max(60.0, min(3600.0, float(settings.artifact_confirmation_ttl_seconds))),
+        )
+        if expires_at <= now:
+            return _error(401, "operator session expired")
+        intent_id = uuid.uuid4().hex
+        payload_digest = _artifact_payload_digest(action, normalized)
+        token = artifact_confirmation_capability(
+            lifecycle_hmac_secret, intent_id, project_id, action, payload_digest,
+        )
+        store.add_artifact_confirmation_intent({
+            "id": intent_id, "token_digest": digest_token(token),
+            "project_id": project_id, "action": action,
+            "payload_json": json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            "payload_digest": payload_digest, "actor_session_id": current["id"],
+            "created_at": now, "expires_at": expires_at,
+        })
+        store.audit("artifact_action_intent", "recorded", project_id, details=json.dumps({
+            "intent_id": intent_id, "action": action, "payload_digest": payload_digest,
+            "expires_at": expires_at,
+        }, sort_keys=True))
+        return {
+            "status": "intent_recorded", "action": action,
+            "intent_id": intent_id, "expires_at": expires_at,
+            "instruction": _artifact_instruction(action, normalized),
+        }
 
     @app.get("/api/projects/{project_id}/artifacts")
     async def artifacts_projection(project_id: str, request: Request):
@@ -1617,8 +2919,22 @@ def create_app(
         payload = await request.json()
         text = payload.get("text") if isinstance(payload, dict) else None
         attachment_ids = payload.get("attachment_ids", []) if isinstance(payload, dict) else []
-        if not isinstance(text, str) or not text.strip() or not isinstance(attachment_ids, list):
+        artifact_intent_id = payload.get("artifact_intent_id") if isinstance(payload, dict) else None
+        if (not isinstance(text, str) or not text.strip() or not isinstance(attachment_ids, list)
+                or len(attachment_ids) > 32
+                or any(not isinstance(file_id, str) for file_id in attachment_ids)
+                or len(set(attachment_ids)) != len(attachment_ids)):
             return _error(400, "text and attachment_ids are required")
+        if artifact_intent_id is not None and (
+            not isinstance(artifact_intent_id, str)
+            or not re.fullmatch(r"[0-9a-f]{32}", artifact_intent_id)
+        ):
+            return _error(400, "invalid artifact_intent_id")
+        maintenance = project_maintenance_rejection(
+            project_id, "main_agent_message",
+        )
+        if maintenance is not None:
+            return maintenance
         active_run = store.active_run(project_id)
         if active_run is not None and time.time() >= active_run["deadline"]:
             try:
@@ -1632,15 +2948,67 @@ def create_app(
         attachments = []
         attachment_rows = []
         for file_id in attachment_ids:
-            row = store.file(str(file_id), project_id)
+            row = store.selectable_file(str(file_id), project_id)
             if row is None:
                 return _error(404, "attachment not found")
+            try:
+                materials = material_root(Path(runtime.project_context_dir(project["runtime_name"])))
+                blob_path = material_blob(materials, str(row["storage_name"]))
+            except (FileValidationError, RuntimeErrorBase, OSError):
+                return _error(409, "attachment blob is unavailable")
             attachment_rows.append(row)
-            attachments.append(metadata(row) | {"path": str(material_root(Path(runtime.project_context_dir(project["runtime_name"]))) / row["storage_name"])})
+            attachments.append(metadata(row) | {"path": str(blob_path)})
+        # Validate every attachment before consuming the one-shot artifact
+        # intent. A bad attachment must leave the confirmation pending so the
+        # operator can correct the request without minting a second intent.
+        turn_artifact_confirmation: str | None = None
+        if artifact_intent_id is not None:
+            intent_candidate = store.artifact_confirmation_intent(artifact_intent_id)
+            try:
+                if (
+                    intent_candidate is None
+                    or intent_candidate.get("project_id") != project_id
+                    or intent_candidate.get("actor_session_id") != str(current["id"])
+                    or intent_candidate.get("execution_status") != "pending"
+                    or intent_candidate.get("dispatched_at") is not None
+                ):
+                    raise ValueError("artifact intent is not dispatchable")
+                normalized_intent_payload = json.loads(str(intent_candidate["payload_json"]))
+                normalized_intent_payload = _artifact_payload(
+                    str(intent_candidate["action"]), normalized_intent_payload,
+                )
+                if _artifact_payload_digest(
+                    str(intent_candidate["action"]), normalized_intent_payload,
+                ) != intent_candidate["payload_digest"]:
+                    raise ValueError("artifact intent payload digest mismatch")
+                turn_artifact_confirmation = artifact_confirmation_token(intent_candidate)
+                if digest_token(turn_artifact_confirmation) != intent_candidate["token_digest"]:
+                    raise ValueError("artifact confirmation capability mismatch")
+            except (ValueError, TypeError, json.JSONDecodeError, UnicodeError):
+                store.audit("artifact_action_intent", "dispatch_failure", project_id, details=json.dumps({
+                    "intent_id": artifact_intent_id,
+                }, sort_keys=True))
+                return _error(409, "artifact intent is invalid")
+            intent = store.dispatch_artifact_confirmation_intent(
+                artifact_intent_id, project_id, str(current["id"]), now=time.time(),
+            )
+            if intent is None:
+                return _error(409, "artifact intent is invalid, expired, or already dispatched")
+            # Never trust browser text to carry the confirmed parameters.
+            text = _artifact_instruction(str(intent["action"]), normalized_intent_payload)
+            store.audit("artifact_action_intent", "dispatched", project_id, details=json.dumps({
+                "intent_id": artifact_intent_id, "action": intent["action"],
+            }, sort_keys=True))
         message_id = uuid.uuid4().hex
         now = time.time()
         store.add_message({"id": message_id, "project_id": project_id, "role": "user", "text": text, "status": "submitted", "created_at": now, "error": None}, [row["id"] for row in attachment_rows])
         manifest = [metadata(row) for row in store.files(project_id)]
+        turn_lifecycle_token = lifecycle_token(project)
+        exact_turn_secrets = tuple(
+            secret for secret in (
+                turn_lifecycle_token, turn_artifact_confirmation,
+            ) if secret
+        )
 
         def record_main_agent_progress(event: dict[str, Any]) -> None:
             event_type = str(event.get("type") or "")
@@ -1653,15 +3021,18 @@ def create_app(
                 for key in ("tool", "detail", "status", "call_id", "error_code", "session_id", "process_id", "turn_id"):
                     value = event.get(key)
                     if value is not None:
-                        safe_payload[key] = str(value)[:4000 if key == "detail" else 200]
+                        safe_payload[key] = str(_redact_exact_value(
+                            str(value), exact_turn_secrets,
+                        ))[:4000 if key == "detail" else 200]
                 for key in ("attempt", "max_attempts", "delay_seconds", "duration_seconds"):
                     value = event.get(key)
                     if isinstance(value, (int, float)):
                         safe_payload[key] = value
                 active_event_run = store.active_run(project_id)
-                safe_payload["main_agent_session_id"] = str(
-                    event.get("session_id") or session_id or ""
-                )[:200]
+                safe_payload["main_agent_session_id"] = str(_redact_exact_value(
+                    str(event.get("session_id") or session_id or ""),
+                    exact_turn_secrets,
+                ))[:200]
                 safe_payload["run_id"] = str(active_event_run.get("id") if active_event_run else "")[:200]
                 store.add_main_agent_event(
                     project_id=project_id, message_id=message_id,
@@ -1681,11 +3052,13 @@ def create_app(
             progress_session_id = event.get("session_id")
             if progress_session_id:
                 store.upsert_agent_session(
-                    project_id, str(progress_session_id), "active", time.time(),
+                    project_id, str(_redact_exact_value(
+                        str(progress_session_id), exact_turn_secrets,
+                    )), "active", time.time(),
                     backend=main_agent_backend,
                 )
 
-        async with lock_for(project_id):
+        async with project_turn_scope(project_id, request):
             session = store.agent_session(project_id) or {}
             session_id = session.get("session_id") if session.get("backend") == main_agent_backend else None
             store.upsert_agent_session(
@@ -1693,7 +3066,7 @@ def create_app(
             )
 
             def invoke_main_agent():
-                return main_agent.send(
+                kwargs = dict(
                     context_dir=runtime.project_context_dir(project["runtime_name"]),
                     session_id=session_id,
                     message=text,
@@ -1702,11 +3075,54 @@ def create_app(
                     attachments=attachments,
                     on_progress=record_main_agent_progress,
                     lifecycle_url=lifecycle_url(project_id),
-                    lifecycle_token=lifecycle_token(project),
+                    lifecycle_token=turn_lifecycle_token,
                 )
+                if turn_artifact_confirmation is not None:
+                    kwargs["artifact_confirmation_token"] = turn_artifact_confirmation
+                return main_agent.send(**kwargs)
 
             try:
-                result = await asyncio.to_thread(invoke_main_agent)
+                async with main_agent_broker_window(project_id):
+                    raw_result = await asyncio.to_thread(invoke_main_agent)
+                result = _redact_exact_value(raw_result, exact_turn_secrets)
+                if not isinstance(result, dict):
+                    raise RuntimeError("Main Agent returned an invalid response")
+                artifact_outcome = None
+                if artifact_intent_id is not None:
+                    artifact_outcome = store.artifact_confirmation_intent(artifact_intent_id)
+                    if artifact_outcome is None or artifact_outcome.get("execution_status") != "succeeded":
+                        current_status = str((artifact_outcome or {}).get("execution_status") or "missing")
+                        outcome_code = str((artifact_outcome or {}).get("outcome_code") or "")
+                        if artifact_outcome is not None and current_status in {"pending", "dispatched", "running"}:
+                            outcome_code = "not_executed" if current_status in {"pending", "dispatched"} else "execution_incomplete"
+                            if current_status in {"pending", "dispatched"}:
+                                store.fail_dispatched_artifact_intent(
+                                    artifact_intent_id, project_id, outcome_code=outcome_code,
+                                    completed_at=time.time(),
+                                )
+                                artifact_outcome = store.artifact_confirmation_intent(artifact_intent_id)
+                                current_status = str((artifact_outcome or {}).get("execution_status") or "missing")
+                        public_error = "已确认的产物操作未成功执行；请检查执行记录后重新确认。"
+                        store.update_message(message_id, status="failed", error=public_error)
+                        store.upsert_agent_session(
+                            project_id, result.get("session_id"), "inactive", time.time(),
+                            backend=main_agent_backend,
+                        )
+                        store.add_message({
+                            "id": uuid.uuid4().hex, "project_id": project_id,
+                            "role": "assistant", "text": "", "status": "failed",
+                            "created_at": time.time(), "error": public_error,
+                        })
+                        store.audit("artifact_action_turn", "failure", project_id, details=json.dumps({
+                            "intent_id": artifact_intent_id, "execution_status": current_status,
+                            "outcome_code": outcome_code or "unknown",
+                        }, sort_keys=True))
+                        return JSONResponse({
+                            "status": "artifact_failed", "detail": public_error,
+                            "artifact_intent_id": artifact_intent_id,
+                            "artifact_status": current_status,
+                            "error_code": outcome_code or "artifact_not_succeeded",
+                        }, status_code=409)
                 if result.get("read_status") == "read":
                     for row in attachment_rows:
                         store.update_file_status(row["id"], read_status="read")
@@ -1736,11 +3152,26 @@ def create_app(
                         store.audit("orchestration_beat", "manual_settle_failure", project_id)
                 return JSONResponse({
                     "message_id": message_id, "reply_id": reply_id, **result,
+                    **({
+                        "artifact_intent_id": artifact_intent_id,
+                        "artifact_status": artifact_outcome["execution_status"],
+                        "artifact_outcome_code": artifact_outcome["outcome_code"],
+                    } if artifact_outcome is not None else {}),
                 }, status_code=201)
             except Exception as exc:
+                if artifact_intent_id is not None:
+                    artifact_outcome = store.artifact_confirmation_intent(artifact_intent_id)
+                    if artifact_outcome is not None and artifact_outcome.get("execution_status") in {"pending", "dispatched"}:
+                        store.fail_dispatched_artifact_intent(
+                            artifact_intent_id, project_id, outcome_code="main_agent_failed",
+                            completed_at=time.time(),
+                        )
                 known_failure = isinstance(exc, MainAgentError)
                 public_error = _public_main_agent_error(exc) if known_failure else "Main Agent 内部错误；请联系管理员。"
-                error_code = getattr(exc, "code", None) if known_failure else None
+                error_code = (
+                    _redact_exact_value(str(getattr(exc, "code", "")), exact_turn_secrets)
+                    if known_failure and getattr(exc, "code", None) is not None else None
+                )
                 provider_retryable = bool(getattr(exc, "retryable", False)) if known_failure else False
                 retryable = bool(getattr(exc, "safe_to_retry", False)) if known_failure else False
                 attempts = max(1, int(getattr(exc, "attempts", 1))) if known_failure else 1
@@ -1758,6 +3189,10 @@ def create_app(
                     getattr(exc, "session_id", None)
                     or (failed_session.get("session_id") if failed_session.get("backend") == main_agent_backend else None)
                 )
+                if failed_session_id is not None:
+                    failed_session_id = str(_redact_exact_value(
+                        str(failed_session_id), exact_turn_secrets,
+                    ))
                 store.upsert_agent_session(
                     project_id, failed_session_id, "inactive", time.time(),
                     backend=main_agent_backend,
@@ -1803,6 +3238,28 @@ def create_app(
                     store.audit("orchestration_beat", "cancelled_inactive_run", project_id)
                     return
                 persisted = store.orchestration_beat_state(project_id)
+                maintenance_reason = store.project_maintenance_reason(project_id)
+                if maintenance_reason is not None:
+                    if not persisted or persisted.get("status") != "blocked_pending_file_conflict":
+                        now = time.time()
+                        store.update_orchestration_beat_state(
+                            project_id,
+                            fingerprint=str((persisted or {}).get("fingerprint") or maintenance_reason),
+                            status="blocked_pending_file_conflict",
+                            reason=maintenance_reason,
+                            last_beat_at=float((persisted or {}).get("last_beat_at") or 0.0),
+                            last_consult_at=float((persisted or {}).get("last_consult_at") or 0.0),
+                            last_summary_at=float((persisted or {}).get("last_summary_at") or 0.0),
+                        )
+                        store.audit(
+                            "orchestration_beat", "blocked_pending_file_conflict",
+                            project_id, details=json.dumps({
+                                "blocked_at": now,
+                                "maintenance_reason": maintenance_reason,
+                            }),
+                        )
+                    beat_coordinator.request(project_id)
+                    return
                 if persisted and persisted.get("status") in {"completed", "manual_activation", "cadence_due_no_change"}:
                     beat_coordinator.seed(
                         project_id, fingerprint=persisted["fingerprint"],
@@ -1853,12 +3310,19 @@ def create_app(
                 session = store.agent_session(project_id) or {}
                 session_id = session.get("session_id") if session.get("backend") == main_agent_backend else None
                 store.upsert_agent_session(project_id, session_id, "active", time.time(), backend=main_agent_backend)
-                result = await asyncio.to_thread(lambda: main_agent.send(
-                    context_dir=runtime.project_context_dir(project["runtime_name"]), session_id=session_id,
-                    message=beat_message, manifest=[metadata(row) for row in store.files(project_id)],
-                    project_state={"project_id": project_id, "name": project["name"], "problem": project["problem"]},
-                    attachments=[], lifecycle_url=lifecycle_url(project_id), lifecycle_token=lifecycle_token(project),
-                ))
+                beat_lifecycle_token = lifecycle_token(project)
+                async with main_agent_broker_window(project_id):
+                    raw_result = await asyncio.to_thread(lambda: main_agent.send(
+                        context_dir=runtime.project_context_dir(project["runtime_name"]), session_id=session_id,
+                        message=beat_message, manifest=[metadata(row) for row in store.files(project_id)],
+                        project_state={"project_id": project_id, "name": project["name"], "problem": project["problem"]},
+                        attachments=[], lifecycle_url=lifecycle_url(project_id), lifecycle_token=beat_lifecycle_token,
+                    ))
+                result = _redact_exact_value(
+                    raw_result, (beat_lifecycle_token,),
+                )
+                if not isinstance(result, dict):
+                    raise RuntimeError("Main Agent returned an invalid response")
                 store.update_message(beat_id, status="completed")
                 store.upsert_agent_session(project_id, result["session_id"], "inactive", time.time(), backend=main_agent_backend)
                 store.add_message({"id": uuid.uuid4().hex, "project_id": project_id, "role": "assistant",
@@ -1903,7 +3367,10 @@ def create_app(
                     last_consult_at=previous.get("last_consult_at", 0.0),
                     last_summary_at=previous.get("last_summary_at", 0.0),
                 )
-            store.audit("orchestration_beat", "failure", project_id, details=json.dumps({"error": str(exc)[:200], "consecutive_failures": failures}))
+            store.audit("orchestration_beat", "failure", project_id, details=json.dumps({
+                "error_code": type(exc).__name__,
+                "consecutive_failures": failures,
+            }))
         finally:
             active_beat_projects.discard(project_id)
 
@@ -1937,4 +3404,6 @@ def create_app(
                     store.audit("run_deadline", "projection_failure", project["id"])
             await asyncio.sleep(interval)
 
+    app.state.execute_orchestration_beat = execute_orchestration_beat
+    app.state.reconcile_external_materials = reconcile_external_materials
     return app

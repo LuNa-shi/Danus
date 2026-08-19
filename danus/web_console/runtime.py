@@ -1,6 +1,8 @@
 """Adapter from the Web Console control plane to Danus runtime APIs."""
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -41,6 +43,96 @@ def validate_runtime_name(name: str) -> str:
     if not isinstance(name, str) or not _PROJECT_RE.fullmatch(name):
         raise ValueError("invalid project name")
     return name
+
+
+def _atomic_write_private(path: Path, text: str) -> None:
+    """Durably replace one journal record without following mutable names."""
+    data = text.encode("utf-8")
+    directory_fd = -1
+    temporary_fd = -1
+    temporary_name: str | None = None
+    try:
+        directory_fd = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        directory_info = os.fstat(directory_fd)
+        if (
+            not stat_module.S_ISDIR(directory_info.st_mode)
+            or directory_info.st_uid != os.geteuid()
+            or stat_module.S_IMODE(directory_info.st_mode) != 0o700
+        ):
+            raise RuntimeSafetyError("unsafe host process-group journal")
+
+        flags = (
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        )
+        for _ in range(128):
+            candidate = f".danus-web-{secrets.token_hex(16)}.tmp"
+            try:
+                temporary_fd = os.open(
+                    candidate, flags, 0o600, dir_fd=directory_fd,
+                )
+            except FileExistsError:
+                continue
+            temporary_name = candidate
+            break
+        else:
+            raise RuntimeSafetyError(
+                "host process-group journal temporary unavailable"
+            )
+
+        os.fchmod(temporary_fd, 0o600)
+        temporary_info = os.fstat(temporary_fd)
+        if (
+            not stat_module.S_ISREG(temporary_info.st_mode)
+            or temporary_info.st_uid != os.geteuid()
+            or stat_module.S_IMODE(temporary_info.st_mode) != 0o600
+        ):
+            raise RuntimeSafetyError("unsafe host process-group journal temporary")
+        remaining = memoryview(data)
+        while remaining:
+            try:
+                written = os.write(temporary_fd, remaining)
+            except InterruptedError:
+                continue
+            if written <= 0:  # pragma: no cover - defensive kernel contract
+                raise OSError("short host process-group journal write")
+            remaining = remaining[written:]
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = -1
+
+        # Replacing the directory entry is safe even when an attacker pre-seeded
+        # a symlink: the referent is never opened or modified.
+        os.replace(
+            temporary_name, path.name,
+            src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
+        )
+        temporary_name = None
+        os.fsync(directory_fd)
+    except RuntimeSafetyError:
+        raise
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeSafetyError("host process-group journal write failed") from exc
+    finally:
+        if temporary_fd >= 0:
+            try:
+                os.close(temporary_fd)
+            except OSError:
+                pass
+        if temporary_name is not None and directory_fd >= 0:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except OSError:
+                pass
+        if directory_fd >= 0:
+            try:
+                os.close(directory_fd)
+            except OSError:
+                pass
 
 
 class DanusRuntimeAdapter:
@@ -92,21 +184,32 @@ class DanusRuntimeAdapter:
         validate_runtime_name(runtime_name)
         if not isinstance(problem, str) or not problem.strip():
             raise ValueError("problem must be non-empty")
-        try:
-            result = cli.do_new(
-                runtime_name,
-                roles=roles,
-                model=model,
-                root=self.agents_root,
-                max_parallel_workers=max_parallel_workers,
-            )
-            project = Path(result["project_dir"]).resolve()
-            if project.parent != self.agents_root:
-                raise RuntimeOperationError("runtime returned project outside configured root")
-            atomic_write(project / "PROBLEM.md", problem if problem.endswith("\n") else problem + "\n")
+        # Serialize name ownership with host-journal writers. In particular, a
+        # duplicate create must fail before the existing Project's launch proof
+        # is touched, while a genuinely new name may discard a crash-stale
+        # journal only after its scaffold is fully initialized.
+        with self._host_journal_lock(runtime_name):
+            try:
+                result = cli.do_new(
+                    runtime_name,
+                    roles=roles,
+                    model=model,
+                    root=self.agents_root,
+                    max_parallel_workers=max_parallel_workers,
+                )
+                project = Path(result["project_dir"]).resolve()
+                if project.parent != self.agents_root:
+                    raise RuntimeOperationError(
+                        "runtime returned project outside configured root"
+                    )
+                atomic_write(
+                    project / "PROBLEM.md",
+                    problem if problem.endswith("\n") else problem + "\n",
+                )
+            except (SystemExit, ValueError, OSError) as exc:
+                raise RuntimeOperationError(str(exc)) from exc
+            self._clear_host_group_identities(runtime_name, lock_held=True)
             return result
-        except (SystemExit, ValueError, OSError) as exc:
-            raise RuntimeOperationError(str(exc)) from exc
 
     def _call(self, fn, *args, **kwargs):
         try:
@@ -125,7 +228,9 @@ class DanusRuntimeAdapter:
 
     def start_project(self, runtime_name: str) -> dict[str, Any]:
         self._project_dir(runtime_name)
-        return {"workers": self._call(cli.do_start, runtime_name)}
+        workers = self._call(cli.do_start, runtime_name)
+        self._record_live_worker_groups(runtime_name)
+        return {"workers": workers}
 
     def stop_project(self, runtime_name: str) -> dict[str, Any]:
         # Terminal graceful stop supersedes any cooperative pause marker.
@@ -173,7 +278,60 @@ class DanusRuntimeAdapter:
             pause.unlink()
             target = f"{runtime_name}/{worker_dir.name}"
             resumed.extend(self._call(cli.do_start, target))
+        self._record_live_worker_groups(runtime_name, worker=worker)
         return {"status": "resume_requested", "workers": resumed}
+
+    def _record_live_worker_groups(
+        self, runtime_name: str, *, worker: str | None = None,
+    ) -> None:
+        for worker_dir in self._target_worker_dirs(runtime_name, worker):
+            wl = L.WorkerLayout(worker_dir)
+            if not self._allow_legacy_process_test_seam:
+                # Managed Workers deliberately have no Project-visible PID
+                # file. Capture the host journal identity from the durable
+                # systemd ledger instead, so a later terminal gate can bind an
+                # exit proof to this exact invocation.
+                try:
+                    ledger = S.read_ledger(wl)
+                    boundary = S.inspect_worker_boundary(wl)
+                except S.SystemdBoundaryError as exc:
+                    raise RuntimeSafetyError(
+                        f"worker {worker_dir.name} supervisor identity unavailable"
+                    ) from exc
+                if ledger is None:
+                    if boundary.state == "absent":
+                        continue
+                    raise RuntimeSafetyError(
+                        f"worker {worker_dir.name} supervisor ledger is missing"
+                    )
+                if boundary.state != "active":
+                    if boundary.state == "absent":
+                        continue
+                    raise RuntimeSafetyError(
+                        f"worker {worker_dir.name} supervisor boundary is {boundary.state}"
+                    )
+                try:
+                    identity = P.WorkerProcessIdentity(
+                        pid=int(ledger["main_pid"]),
+                        boot_id=str(ledger["boot_id"]),
+                        start_time=str(ledger["main_pid_start_time"]),
+                        # The journal's public identity format predates the
+                        # isolated worker_entry argv. Keep its canonical
+                        # Worker cmdline while the ledger remains the source
+                        # of the actual service argv/cgroup proof.
+                        cmdline=P.expected_worker_cmdline(wl),
+                    )
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise RuntimeSafetyError(
+                        f"worker {worker_dir.name} supervisor identity is malformed"
+                    ) from exc
+                self._store_host_group_identity(runtime_name, worker_dir.name, identity)
+                continue
+            pid = P.read_pid(L.WorkerLayout(worker_dir))
+            if P.process_alive(pid) and not self._capture_host_group_identity(worker_dir, pid):
+                raise RuntimeSafetyError(
+                    f"worker {worker_dir.name} launch identity could not be journaled"
+                )
 
     @staticmethod
     def _merge_worker_status(worker_dir: Path, **fields: Any) -> None:
@@ -234,6 +392,797 @@ class DanusRuntimeAdapter:
             "observed_identity": DanusRuntimeAdapter._public_identity(observed),
             "persisted_identity": DanusRuntimeAdapter._public_identity(persisted),
         }
+
+    @staticmethod
+    def _read_worker_control_json(
+        worker_dir: Path, name: str,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Read one Worker control record without following a swapped symlink."""
+        directory_fd = -1
+        file_fd = -1
+        try:
+            directory_fd = os.open(
+                worker_dir,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                file_fd = os.open(
+                    name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                return False, {}
+            info = os.fstat(file_fd)
+            if not stat_module.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+                raise RuntimeSafetyError(f"unsafe Worker control record: {name}")
+            chunks: list[bytes] = []
+            remaining = 65537
+            while remaining > 0:
+                chunk = os.read(file_fd, min(remaining, 16384))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+            if len(raw) > 65536:
+                raise RuntimeSafetyError(f"oversized Worker control record: {name}")
+            value = json.loads(raw.decode("utf-8"))
+            if not isinstance(value, dict):
+                raise RuntimeSafetyError(f"invalid Worker control record: {name}")
+            return True, value
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeSafetyError(f"invalid Worker control record: {name}") from exc
+        except OSError as exc:
+            raise RuntimeSafetyError(f"Worker control record unavailable: {name}") from exc
+        finally:
+            if file_fd >= 0:
+                os.close(file_fd)
+            if directory_fd >= 0:
+                os.close(directory_fd)
+
+    def _host_group_project_dir(
+        self, runtime_name: str, *, create: bool,
+    ) -> Path | None:
+        """Resolve the model-inaccessible host journal for Worker launch groups."""
+        validate_runtime_name(runtime_name)
+        root = self.agents_root / ".danus-web-process-groups"
+        project = root / runtime_name
+        for path in (root, project):
+            if create:
+                try:
+                    os.mkdir(path, 0o700)
+                    path.chmod(0o700)
+                except FileExistsError:
+                    pass
+                except FileNotFoundError:
+                    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    os.mkdir(path, 0o700)
+                    path.chmod(0o700)
+                except OSError as exc:
+                    raise RuntimeSafetyError("host process-group journal unavailable") from exc
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                if not create:
+                    return None
+                raise RuntimeSafetyError("host process-group journal disappeared")
+            except OSError as exc:
+                raise RuntimeSafetyError("host process-group journal unavailable") from exc
+            if (
+                not stat_module.S_ISDIR(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or stat_module.S_IMODE(info.st_mode) != 0o700
+            ):
+                raise RuntimeSafetyError("unsafe host process-group journal")
+        return project
+
+    @contextlib.contextmanager
+    def _host_journal_lock(self, runtime_name: str):
+        """Serialize one Project name across scaffold and journal mutation."""
+        validate_runtime_name(runtime_name)
+        lock_fd = -1
+        try:
+            self.agents_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            root_info = self.agents_root.lstat()
+            if (
+                not stat_module.S_ISDIR(root_info.st_mode)
+                or root_info.st_uid != os.geteuid()
+            ):
+                raise RuntimeSafetyError("unsafe agents root for journal lock")
+            lock_fd = os.open(
+                self.agents_root / f".danus-web-journal-{runtime_name}.lock",
+                os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+            lock_info = os.fstat(lock_fd)
+            if (
+                not stat_module.S_ISREG(lock_info.st_mode)
+                or lock_info.st_uid != os.geteuid()
+                or stat_module.S_IMODE(lock_info.st_mode) != 0o600
+            ):
+                raise RuntimeSafetyError("unsafe host journal lock")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        except RuntimeSafetyError:
+            if lock_fd >= 0:
+                os.close(lock_fd)
+            raise
+        except OSError as exc:
+            if lock_fd >= 0:
+                os.close(lock_fd)
+            raise RuntimeSafetyError("host journal lock unavailable") from exc
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+
+    def _store_host_group_identity(
+        self, runtime_name: str, worker: str, identity: P.WorkerProcessIdentity,
+        *, lock_held: bool = False,
+    ) -> None:
+        if not _PROJECT_RE.fullmatch(worker):
+            raise RuntimeSafetyError("invalid Worker name for process-group journal")
+        scope = (
+            contextlib.nullcontext() if lock_held
+            else self._host_journal_lock(runtime_name)
+        )
+        with scope:
+            project = self._host_group_project_dir(runtime_name, create=True)
+            if project is None:
+                raise RuntimeSafetyError("host process-group journal unavailable")
+            path = project / f"{worker}.json"
+            _atomic_write_private(path, json.dumps({
+                "version": 1, "runtime_name": runtime_name, "worker": worker,
+                "pgid": identity.pid, "identity": identity.as_dict(),
+            }, sort_keys=True))
+
+    def _read_host_group_identity(
+        self, runtime_name: str, worker: str, worker_dir: Path,
+    ) -> tuple[bool, P.WorkerProcessIdentity | None]:
+        if not _PROJECT_RE.fullmatch(worker):
+            raise RuntimeSafetyError("invalid Worker name for process-group journal")
+        project = self._host_group_project_dir(runtime_name, create=False)
+        if project is None:
+            return False, None
+        exists, record = self._read_worker_control_json(project, f"{worker}.json")
+        if not exists:
+            return False, None
+        path = project / f"{worker}.json"
+        try:
+            if stat_module.S_IMODE(path.lstat().st_mode) != 0o600:
+                raise RuntimeSafetyError("unsafe host process-group record mode")
+        except OSError as exc:
+            raise RuntimeSafetyError("host process-group record unavailable") from exc
+        identity = P.WorkerProcessIdentity.from_mapping(record.get("identity"))
+        wl = L.WorkerLayout(worker_dir)
+        if (
+            record.get("version") != 1
+            or record.get("runtime_name") != runtime_name
+            or record.get("worker") != worker
+            or identity is None
+            or record.get("pgid") != identity.pid
+            or identity.cmdline != P.expected_worker_cmdline(wl)
+        ):
+            raise RuntimeSafetyError("invalid host process-group record")
+        return True, identity
+
+    def _capture_host_group_identity(self, worker_dir: Path, pid: Any) -> bool:
+        try:
+            parsed_pid = int(pid)
+        except (TypeError, ValueError):
+            return False
+        wl = L.WorkerLayout(worker_dir)
+        identity = P.capture_worker_identity(wl, parsed_pid)
+        if identity is None:
+            return False
+        try:
+            if os.getpgid(parsed_pid) != parsed_pid:
+                return False
+        except (OSError, ProcessLookupError, PermissionError):
+            return False
+        self._store_host_group_identity(wl.project, wl.name, identity)
+        return True
+
+    def _clear_host_group_identities(
+        self, runtime_name: str, *, lock_held: bool = False,
+    ) -> None:
+        scope = (
+            contextlib.nullcontext() if lock_held
+            else self._host_journal_lock(runtime_name)
+        )
+        with scope:
+            project = self._host_group_project_dir(runtime_name, create=False)
+            if project is None:
+                return
+            try:
+                for path in project.iterdir():
+                    if path.is_symlink() or not path.is_file():
+                        raise RuntimeSafetyError(
+                            "unsafe host process-group journal entry"
+                        )
+                    path.unlink()
+                project.rmdir()
+                root = project.parent
+                try:
+                    root.rmdir()
+                except OSError:
+                    pass
+            except OSError as exc:
+                raise RuntimeSafetyError(
+                    "host process-group journal cleanup failed"
+                ) from exc
+
+    @staticmethod
+    def _path_is_within(raw: str, root: Path) -> bool:
+        """Match procfs path projections without resolving mutable symlinks."""
+        if not raw.startswith("/"):
+            return False
+        if raw.endswith(" (deleted)"):
+            raw = raw[:-10]
+        candidate = os.path.normpath(raw)
+        trusted = os.path.normpath(str(root))
+        try:
+            return os.path.commonpath((candidate, trusted)) == trusted
+        except (OSError, ValueError):
+            return False
+
+    @classmethod
+    def _project_process_projection(
+        cls, root: Path, process_groups: set[int],
+    ) -> list[dict[str, Any]]:
+        """Return the conservative procfs projection relevant to one Project.
+
+        A record is retained when it is a member of a persisted Worker launch
+        group or holds a path association to the Project through argv, cwd,
+        process root, executable, an open fd, or a mapped file. Mandatory
+        PID/PGID/argv inspection is fail-closed. Supplementary path inspection
+        is defense in depth and is not treated as a complete descendant set;
+        worker_exit_projection separately requires an owned supervisor proof.
+        """
+        procfs = P.DEFAULT_PROCFS
+        proc_root = procfs.root
+        try:
+            entries = sorted(
+                (entry for entry in proc_root.iterdir() if entry.name.isdigit()),
+                key=lambda entry: int(entry.name),
+            )
+        except OSError as exc:
+            raise RuntimeSafetyError("process table inspection unavailable") from exc
+
+        projection: list[dict[str, Any]] = []
+        effective_uid = os.geteuid()
+        for entry in entries:
+            pid = int(entry.name)
+            try:
+                record = procfs.process_record(pid)
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError, IndexError, UnicodeError) as exc:
+                if not entry.exists():
+                    continue
+                raise RuntimeSafetyError("process record inspection unavailable") from exc
+            if record.get("state") == "Z":
+                continue
+            try:
+                pgid = int(record["pgid"])
+                start_time = str(record["start_time"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeSafetyError("invalid process record projection") from exc
+
+            references_project = any(
+                isinstance(argument, str) and cls._path_is_within(argument, root)
+                for argument in record.get("cmdline", [])
+            )
+            group_member = pgid in process_groups
+            reused_leader_pid = pid in process_groups and pgid != pid
+
+            # Worker descendants run with the Web Console uid. Different-uid
+            # processes are relevant only when their kernel PGID still matches
+            # a persisted Worker launch group, which was established above.
+            try:
+                status = (entry / "status").read_text(encoding="utf-8")
+                uid_line = next(
+                    line for line in status.splitlines() if line.startswith("Uid:")
+                )
+                uid_fields = uid_line.split()[1:]
+                same_uid = len(uid_fields) >= 2 and int(uid_fields[1]) == effective_uid
+            except FileNotFoundError:
+                continue
+            except (OSError, StopIteration, ValueError) as exc:
+                if not entry.exists():
+                    continue
+                raise RuntimeSafetyError("process ownership inspection unavailable") from exc
+
+            # PGID membership and absolute argv associations are the mandatory
+            # complete projection above. These extra kernel path associations
+            # strengthen detection when procfs permits ptrace-style reads.
+            # An unrelated same-uid process may deliberately be non-dumpable;
+            # its denied cwd/fd/maps cannot invalidate the complete PGID/argv
+            # proof, while a known group member or argv match is already a
+            # blocker without consulting these supplementary entries.
+            if same_uid and not group_member and not references_project:
+                for link_name in ("cwd", "root", "exe"):
+                    try:
+                        target = os.readlink(entry / link_name)
+                    except FileNotFoundError:
+                        if not entry.exists():
+                            break
+                        continue
+                    except PermissionError:
+                        continue
+                    except OSError as exc:
+                        if not entry.exists():
+                            break
+                        raise RuntimeSafetyError("process path inspection unavailable") from exc
+                    references_project = references_project or cls._path_is_within(target, root)
+
+                if entry.exists():
+                    fd_dir = entry / "fd"
+                    try:
+                        descriptors = list(fd_dir.iterdir())
+                    except FileNotFoundError:
+                        descriptors = []
+                    except PermissionError:
+                        descriptors = []
+                    except OSError as exc:
+                        if not entry.exists():
+                            descriptors = []
+                        else:
+                            raise RuntimeSafetyError("process fd inspection unavailable") from exc
+                    for descriptor in descriptors:
+                        try:
+                            target = os.readlink(descriptor)
+                        except FileNotFoundError:
+                            continue
+                        except PermissionError:
+                            continue
+                        except OSError as exc:
+                            if not entry.exists():
+                                break
+                            raise RuntimeSafetyError("process fd inspection unavailable") from exc
+                        references_project = references_project or cls._path_is_within(target, root)
+
+                if entry.exists():
+                    try:
+                        maps = (entry / "maps").read_text(
+                            encoding="utf-8", errors="surrogateescape",
+                        )
+                    except FileNotFoundError:
+                        maps = ""
+                    except PermissionError:
+                        maps = ""
+                    except OSError as exc:
+                        if not entry.exists():
+                            maps = ""
+                        else:
+                            raise RuntimeSafetyError("process map inspection unavailable") from exc
+                    for line in maps.splitlines():
+                        fields = line.split(maxsplit=5)
+                        if len(fields) == 6 and cls._path_is_within(fields[5], root):
+                            references_project = True
+                            break
+
+            # Re-read the stable kernel identity after inspecting mutable procfs
+            # entries. PID reuse or an inspection-time identity change is not a
+            # usable absence proof.
+            try:
+                after = procfs.process_record(pid)
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError, IndexError, UnicodeError) as exc:
+                if not entry.exists():
+                    continue
+                raise RuntimeSafetyError("process identity recheck unavailable") from exc
+            if (
+                str(after.get("start_time")) != start_time
+                or int(after.get("pgid", -1)) != pgid
+            ):
+                raise RuntimeSafetyError("process identity changed during inspection")
+            if group_member or reused_leader_pid or references_project:
+                projection.append({
+                    "pid": pid, "pgid": pgid, "start_time": start_time,
+                    "group_member": group_member,
+                    "reused_leader_pid": reused_leader_pid,
+                    "references_project": references_project,
+                })
+        return projection
+
+    def _descendant_membership_projection(
+        self, runtime_name: str, worker: str,
+        identity: P.WorkerProcessIdentity,
+    ) -> dict[str, Any]:
+        """Return an exact, host-owned empty-membership proof for one Worker.
+
+        The Web gate must never infer that a Worker is dead from a missing
+        leader, an empty PGID scan, or a model-writable status file. The
+        systemd boundary is the authority: an active/orphaned/error/reused
+        invocation is always unavailable, and only ``inspect_worker_boundary``
+        followed by a matching durable ``exit_proof`` can return ``empty``.
+        """
+
+        def unavailable(reason: str, **fields: Any) -> dict[str, Any]:
+            result: dict[str, Any] = {
+                "status": "unavailable", "inspection_complete": False,
+                "source": "systemd_scope", "reason": reason,
+            }
+            result.update(fields)
+            return result
+
+        # Resolve the exact Project/Worker directory independently of every
+        # caller-provided identity. This also rejects a symlinked Worker root.
+        try:
+            root = self._project_dir(runtime_name)
+            worker_dir = self._worker_dir(root, worker)
+            if worker_dir is None:
+                return unavailable("worker_identity_mismatch")
+            wl = L.WorkerLayout(worker_dir)
+        except (RuntimeErrorBase, ValueError, OSError):
+            return unavailable("project_identity_mismatch")
+
+        if not isinstance(identity, P.WorkerProcessIdentity):
+            return unavailable("worker_identity_mismatch")
+        if (
+            identity.pid <= 1
+            or not identity.boot_id
+            or not identity.start_time
+            or identity.cmdline != P.expected_worker_cmdline(wl)
+        ):
+            return unavailable("worker_identity_mismatch")
+
+        # Read the ledger before reconciliation: inspect_worker_boundary may
+        # retire it after proving the exact pinned cgroup empty and publish the
+        # terminal proof that we need to bind below.
+        try:
+            ledger = S.read_ledger(wl)
+        except S.SystemdBoundaryError:
+            return unavailable("ledger_error")
+
+        try:
+            boundary = S.inspect_worker_boundary(wl)
+        except S.SystemdBoundaryError:
+            # A stale/reused unit, cgroup replacement, manager mismatch, or
+            # any inspection race is evidence loss—not an empty proof.
+            return unavailable("boundary_error")
+
+        state = getattr(boundary, "state", None)
+        if state != "absent" or getattr(boundary, "populated", True) is not False:
+            return unavailable(
+                "boundary_active" if state == "active"
+                else "boundary_orphaned" if state == "orphaned"
+                else "boundary_not_empty",
+                boundary_state=state,
+            )
+
+        try:
+            proof = S.read_exit_proof(wl)
+        except S.SystemdBoundaryError:
+            return unavailable("exit_proof_error", boundary_state=state)
+        if proof is None:
+            return unavailable("exit_proof_missing", boundary_state=state)
+
+        expected_unit = S.worker_unit(wl)
+        expected_slice = S.worker_slice(wl)
+        if (
+            proof.get("worker_dir") != str(wl.dir.resolve())
+            or proof.get("unit") != expected_unit
+            or proof.get("slice") != expected_slice
+        ):
+            return unavailable("exit_proof_identity_mismatch", boundary_state=state)
+
+        # A ledger captured before reconciliation is the strongest identity
+        # source. Bind every process field that the Web host journal carries;
+        # never compare against a PID alone.
+        if ledger is not None:
+            try:
+                ledger_identity = (
+                    int(ledger["main_pid"]), str(ledger["boot_id"]),
+                    str(ledger["main_pid_start_time"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                return unavailable("ledger_identity_mismatch", boundary_state=state)
+            if ledger_identity != (identity.pid, identity.boot_id, identity.start_time):
+                return unavailable("identity_mismatch", boundary_state=state)
+            # The terminal proof may outlive the live ledger.  When both are
+            # still available, bind every optional launch-identity field too;
+            # otherwise a proof from a different PID/start/argv could be
+            # accepted merely because its invocation/cgroup labels happened
+            # to match.
+            for key in ("main_pid", "main_pid_start_time", "worker_argv"):
+                if key in proof and proof.get(key) != ledger.get(key):
+                    return unavailable("identity_mismatch", boundary_state=state)
+            for key in ("invocation_id", "slice_invocation_id", "boot_id"):
+                if proof.get(key) != ledger.get(key):
+                    return unavailable("exit_proof_identity_mismatch", boundary_state=state)
+            # If the proof carries cgroup identity, it must be byte-for-byte
+            # identical to the ledger's pinned directory/events identity.
+            for prefix in ("unit", "slice"):
+                for suffix in (
+                    "cgroup", "cgroup_dev", "cgroup_ino",
+                    "events_dev", "events_ino",
+                ):
+                    key = f"{prefix}_{suffix}"
+                    if key in proof and proof.get(key) != ledger.get(key):
+                        return unavailable("exit_proof_cgroup_mismatch", boundary_state=state)
+        else:
+            # Once the ledger has been retired, the terminal proof must carry
+            # the complete launch identity itself; a legacy proof without it is
+            # deliberately not enough to authorize a destructive gate.
+            try:
+                proof_identity = (
+                    int(proof["main_pid"]), str(proof["boot_id"]),
+                    str(proof["main_pid_start_time"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                return unavailable("exit_proof_identity_missing", boundary_state=state)
+            if proof_identity != (identity.pid, identity.boot_id, identity.start_time):
+                return unavailable("identity_mismatch", boundary_state=state)
+            argv = proof.get("worker_argv")
+            if not isinstance(argv, list) or not argv:
+                return unavailable("exit_proof_identity_missing", boundary_state=state)
+
+        return {
+            "status": "empty", "inspection_complete": True,
+            "source": "systemd_scope", "reason": None,
+            "boundary_state": state, "populated": False,
+        }
+
+    def worker_exit_projection(self, runtime_name: str) -> dict[str, Any]:
+        """Return status plus the strongest available fail-closed exit proof.
+
+        The host journal pins the exact launch PGID outside model-writable
+        Project state. PGID and Project-path scans find ordinary orphans and
+        reuse, but do not by themselves constitute a complete descendant proof;
+        an ever-started Worker additionally requires the host-supervisor seam
+        above to prove its owned membership set empty.
+        """
+        root = self._project_dir(runtime_name)
+        projection = self.status_project(runtime_name)
+        workers = projection.get("workers")
+        if not isinstance(workers, list):
+            raise RuntimeSafetyError("invalid Worker status roster")
+
+        prepared: dict[str, dict[str, Any]] = {}
+        process_groups: set[int] = set()
+        for worker in workers:
+            if not isinstance(worker, dict) or not isinstance(worker.get("worker"), str):
+                raise RuntimeSafetyError("invalid Worker status entry")
+            name = str(worker["worker"])
+            worker_dir = self._worker_dir(root, name)
+            if worker_dir is None or name in prepared:
+                raise RuntimeSafetyError("invalid Worker status roster")
+            wl = L.WorkerLayout(worker_dir)
+            try:
+                identity_exists, identity_record = self._read_worker_control_json(
+                    worker_dir, L.PROCESS_IDENTITY_FILE,
+                )
+                status_exists, status_record = self._read_worker_control_json(
+                    worker_dir, L.STATUS_FILE,
+                )
+                host_exists, host_identity = self._read_host_group_identity(
+                    runtime_name, name, worker_dir,
+                )
+            except RuntimeSafetyError:
+                prepared[name] = {
+                    "worker": worker, "reason": "control_record_inspection_failed",
+                }
+                continue
+            persisted = P.WorkerProcessIdentity.from_mapping(identity_record)
+            if identity_exists and persisted is None:
+                prepared[name] = {
+                    "worker": worker, "reason": "invalid_persisted_identity",
+                }
+                continue
+            if persisted is not None and persisted.cmdline != P.expected_worker_cmdline(wl):
+                prepared[name] = {
+                    "worker": worker, "reason": "invalid_persisted_identity",
+                }
+                continue
+
+            state = str(worker.get("state") or "").lower()
+            status_state = str(status_record.get("state") or "").lower()
+            if not status_exists or not status_state:
+                prepared[name] = {
+                    "worker": worker, "reason": "missing_status_record",
+                }
+                continue
+            if status_state != state:
+                prepared[name] = {
+                    "worker": worker, "reason": "status_projection_changed",
+                }
+                continue
+            status_pid = status_record.get("pid") if status_exists else None
+            if isinstance(status_pid, bool):
+                status_pid = None
+            try:
+                status_pid = int(status_pid) if status_pid is not None else None
+            except (TypeError, ValueError):
+                status_pid = None
+            if status_exists and status_record.get("pid") is not None and (
+                status_pid is None or status_pid <= 0
+            ):
+                prepared[name] = {
+                    "worker": worker, "reason": "invalid_persisted_process_group",
+                }
+                continue
+
+            if not host_exists:
+                # A Worker can reach a terminal boundary before the caller
+                # records its live journal (for example a short max-rounds
+                # run). The supervisor's durable exit proof is an equivalent
+                # host identity source, but only when it carries the complete
+                # launch identity; never_started remains the sole no-proof
+                # success case.
+                if not self._allow_legacy_process_test_seam:
+                    try:
+                        exit_proof = S.read_exit_proof(wl)
+                    except S.SystemdBoundaryError:
+                        prepared[name] = {
+                            "worker": worker,
+                            "reason": "exit_proof_inspection_failed",
+                        }
+                        continue
+                    if exit_proof is not None:
+                        try:
+                            proof_identity = P.WorkerProcessIdentity(
+                                pid=int(exit_proof["main_pid"]),
+                                boot_id=str(exit_proof["boot_id"]),
+                                start_time=str(exit_proof["main_pid_start_time"]),
+                                cmdline=P.expected_worker_cmdline(wl),
+                            )
+                        except (KeyError, TypeError, ValueError):
+                            prepared[name] = {
+                                "worker": worker,
+                                "reason": "exit_proof_identity_missing",
+                            }
+                            continue
+                        status_pid = status_record.get("pid")
+                        if status_pid is not None:
+                            try:
+                                if int(status_pid) != proof_identity.pid:
+                                    prepared[name] = {
+                                        "worker": worker,
+                                        "reason": "host_process_group_mismatch",
+                                    }
+                                    continue
+                            except (TypeError, ValueError):
+                                prepared[name] = {
+                                    "worker": worker,
+                                    "reason": "invalid_persisted_process_group",
+                                }
+                                continue
+                        prepared[name] = {
+                            "worker": worker, "source": "systemd_exit_proof",
+                            "pgid": proof_identity.pid,
+                            "host_identity": proof_identity,
+                        }
+                        process_groups.add(proof_identity.pid)
+                        continue
+                never_started = (
+                    state == "created" and status_state == "created"
+                    and worker.get("pid") is None
+                    and not identity_exists
+                    and status_pid is None
+                    and not any(key in status_record for key in ("started_at", "round_started_at"))
+                    and int(status_record.get("round", 0) or 0) == 0
+                )
+                if not never_started:
+                    prepared[name] = {
+                        "worker": worker, "reason": "missing_host_process_group",
+                    }
+                    continue
+                prepared[name] = {
+                    "worker": worker, "source": "never_started", "pgid": None,
+                }
+                continue
+            if host_identity is None:
+                prepared[name] = {
+                    "worker": worker, "reason": "invalid_host_process_group",
+                }
+                continue
+            pgid = host_identity.pid
+            if status_pid != pgid:
+                prepared[name] = {
+                    "worker": worker, "reason": "host_process_group_mismatch",
+                }
+                continue
+            if persisted is not None and persisted != host_identity:
+                prepared[name] = {
+                    "worker": worker, "reason": "worker_identity_record_mismatch",
+                }
+                continue
+            process_groups.add(pgid)
+            prepared[name] = {
+                "worker": worker, "source": "host_process_group",
+                "pgid": pgid, "host_identity": host_identity,
+            }
+
+        by_group: dict[int, list[str]] = {}
+        for name, item in prepared.items():
+            pgid = item.get("pgid")
+            if isinstance(pgid, int):
+                by_group.setdefault(pgid, []).append(name)
+        for names in by_group.values():
+            if len(names) > 1:
+                for name in names:
+                    prepared[name]["reason"] = "duplicate_host_process_group"
+
+        try:
+            processes = self._project_process_projection(root, process_groups)
+        except RuntimeSafetyError:
+            processes = None
+
+        for name, item in prepared.items():
+            worker = item["worker"]
+            reason = item.get("reason")
+            pgid = item.get("pgid")
+            proof: dict[str, Any] = {
+                "status": "unknown", "reason": reason or "process_inspection_failed",
+                "inspection_complete": False, "source": item.get("source"),
+                "pgid": pgid, "live_process_count": 0,
+                "project_reference_count": 0,
+                "descendant_membership_verified": False,
+            }
+            if reason is not None:
+                worker["process_exit_proof"] = proof
+                continue
+            if processes is None:
+                worker["process_exit_proof"] = proof
+                continue
+
+            group_members = [row for row in processes if row["pgid"] == pgid] if pgid else []
+            project_references = [row for row in processes if row["references_project"]]
+            proof.update({
+                "inspection_complete": True,
+                "live_process_count": len(group_members),
+                "project_reference_count": len(project_references),
+            })
+            if pgid is not None:
+                reused_leader = next(
+                    (row for row in processes if row["pid"] == pgid and row["reused_leader_pid"]),
+                    None,
+                )
+                if reused_leader is not None:
+                    proof.update(status="blocked", reason="leader_pid_reused")
+                elif group_members:
+                    proof.update(status="blocked", reason="process_group_live_or_reused")
+                elif project_references:
+                    proof.update(status="blocked", reason="project_process_reference")
+                else:
+                    identity = item.get("host_identity")
+                    try:
+                        membership = self._descendant_membership_projection(
+                            runtime_name, name, identity,
+                        ) if isinstance(identity, P.WorkerProcessIdentity) else {}
+                    except Exception:
+                        membership = {}
+                    if (
+                        isinstance(membership, dict)
+                        and membership.get("status") == "empty"
+                        and membership.get("inspection_complete") is True
+                    ):
+                        proof.update(
+                            status="verified_dead", reason=None,
+                            descendant_membership_verified=True,
+                        )
+                    else:
+                        proof.update(
+                            status="unknown",
+                            reason="descendant_membership_unavailable",
+                        )
+            elif project_references:
+                proof.update(status="blocked", reason="project_process_reference")
+            else:
+                proof.update(
+                    status="verified_dead", reason=None,
+                    descendant_membership_verified=True,
+                )
+            worker["process_exit_proof"] = proof
+        return projection
 
     def force_stop_project(
         self, runtime_name: str, *, worker: str | None = None, term_timeout: float = 5.0,
@@ -622,6 +1571,13 @@ class DanusRuntimeAdapter:
                 identity = self._process_identity(worker_dir, legacy_pid)
                 worker["alive"] = identity == "matched"
             worker["process_identity"] = identity
+            if identity == "matched" and worker_dir is not None:
+                try:
+                    worker["host_process_group_recorded"] = self._capture_host_group_identity(
+                        worker_dir, worker.get("pid"),
+                    )
+                except RuntimeSafetyError:
+                    worker["host_process_group_recorded"] = False
             process_record = worker_dir / L.PROCESS_IDENTITY_FILE if worker_dir is not None else None
             worker["reclaim_candidate"] = bool(
                 (boundary is not None and boundary.state == "orphaned")
@@ -995,6 +1951,7 @@ class DanusRuntimeAdapter:
             shutil.rmtree(root)
         except OSError as exc:
             raise RuntimeOperationError("project deletion failed") from exc
+        self._clear_host_group_identities(runtime_name)
         return {"deleted": runtime_name}
 
     def outputs_projection(self, runtime_name: str) -> dict[str, Any]:

@@ -15,9 +15,15 @@ def strip_ansi(text: str) -> str:
 
 def redact_text(
     text: str, *, limit: int = 16_384, replacement: str = "[REDACTED]",
+    exact_secrets: tuple[str, ...] | list[str] = (),
 ) -> str:
     """Strip controls and redact shared secret shapes before projection."""
     value = strip_ansi(text)
+    for secret in sorted(
+        {item for item in exact_secrets if isinstance(item, str) and item},
+        key=len, reverse=True,
+    ):
+        value = value.replace(secret, replacement)
     value = re.sub(
         r"(?is)-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?-----END [^-\r\n]*PRIVATE KEY-----",
         replacement, value,

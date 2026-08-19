@@ -1,59 +1,312 @@
 #!/usr/bin/env bash
 set -euo pipefail
+set +a
+
+# Copy capabilities out of the exported environment before invoking any child
+# process. The broker capability is delivered to curl through an unlinked,
+# mode-0600 config file; artifact confirmation is delivered in the JSON body
+# over stdin. Neither secret is ever part of a process argument.
+lifecycle_url=${DANUS_WEB_LIFECYCLE_URL:-}
+lifecycle_token=${DANUS_WEB_LIFECYCLE_TOKEN:-}
+confirmation_token=${DANUS_WEB_ARTIFACT_CONFIRMATION_TOKEN:-}
+unset DANUS_WEB_LIFECYCLE_URL DANUS_WEB_LIFECYCLE_TOKEN
+unset DANUS_WEB_ARTIFACT_CONFIRMATION_TOKEN
 
 usage() {
-  cat <<'EOF'
-usage: danus-web-agent {status|assign|start|pause|resume|stop} ...
-  status
-  assign WORKER --task TEXT
-  start
-  pause [WORKER]
-  resume [WORKER]
-  stop
-EOF
+  printf '%s\n' \
+    'usage: danus-web-agent COMMAND [ARGUMENTS]' \
+    '' \
+    'Project lifecycle:' \
+    '  status' \
+    '  assign WORKER --task TEXT' \
+    '  start' \
+    '  pause [WORKER]' \
+    '  resume [WORKER]' \
+    '  stop' \
+    '' \
+    'Project artifacts:' \
+    '  finalize suggestion' \
+    '  finalize target --fact-id FACT_ID [--fact-id FACT_ID ...] [--paper-id PAPER_ID]' \
+    '  human-summary [--language LANGUAGE]' \
+    '  write-paper [--paper-id PAPER_ID] [--fact-id FACT_ID ...] [--instructions TEXT] (--stop-workers | --keep-workers)' \
+    '' \
+    'Artifact mutations require a one-use confirmation capability supplied by' \
+    'the operator UI through DANUS_WEB_ARTIFACT_CONFIRMATION_TOKEN.'
 }
 
-if [[ ${1:-} == "--help" || ${1:-} == "-h" ]]; then usage; exit 0; fi
-command=${1:-}; shift || true
-url=${DANUS_WEB_LIFECYCLE_URL:-}
-token=${DANUS_WEB_LIFECYCLE_TOKEN:-}
-[[ -n "$url" && -n "$token" ]] || { echo "Main Agent lifecycle broker is not configured" >&2; exit 2; }
+usage_error() {
+  printf 'invalid arguments for danus-web-agent\n\n' >&2
+  usage >&2
+  exit 2
+}
 
+configuration_error() {
+  printf '%s\n' "$1" >&2
+  exit 2
+}
+
+valid_scoped_name() {
+  [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]]
+}
+
+valid_fact_id() {
+  [[ -n $1 && ${#1} -le 200 && $1 =~ ^[A-Za-z0-9][A-Za-z0-9._:-]*$ ]]
+}
+
+valid_paper_id() {
+  valid_scoped_name "$1"
+}
+
+valid_confirmation_token() {
+  [[ -n $1 && ${#1} -le 512 && $1 =~ ^[A-Za-z0-9_-]+$ ]]
+}
+
+valid_loopback_url() {
+  local candidate=$1 port=''
+  [[ -n $candidate && ${#candidate} -le 2048 ]] || return 1
+  if [[ $candidate =~ ^http://127\.0\.0\.1(:([0-9]{1,5}))?(/[^[:space:]]*)$ ]]; then
+    port=${BASH_REMATCH[2]:-}
+  elif [[ $candidate =~ ^http://\[::1\](:([0-9]{1,5}))?(/[^[:space:]]*)$ ]]; then
+    port=${BASH_REMATCH[2]:-}
+  else
+    return 1
+  fi
+  [[ -z $port ]] || (( 10#$port >= 1 && 10#$port <= 65535 ))
+}
+
+require_confirmation() {
+  valid_confirmation_token "$confirmation_token" ||
+    configuration_error 'Artifact confirmation capability is not configured or invalid'
+}
+
+if [[ ${1:-} == '--help' || ${1:-} == '-h' ]]; then
+  [[ $# -eq 1 ]] || usage_error
+  usage
+  exit 0
+fi
+
+command=${1:-}
+[[ -n $command ]] || usage_error
+shift
+
+command -v jq >/dev/null 2>&1 || configuration_error 'danus-web-agent requires jq'
+command -v curl >/dev/null 2>&1 || configuration_error 'danus-web-agent requires curl'
+
+payload=''
+request_timeout=30
 case "$command" in
   status|start|stop)
-    [[ $# -eq 0 ]] || { usage >&2; exit 2; }
+    [[ $# -eq 0 ]] || usage_error
     payload=$(jq -cn --arg action "$command" '{action:$action}')
     ;;
   pause|resume)
-    [[ $# -le 1 ]] || { usage >&2; exit 2; }
+    [[ $# -le 1 ]] || usage_error
     if [[ $# -eq 1 ]]; then
-      payload=$(jq -cn --arg action "$command" --arg worker "$1" '{action:$action,worker:$worker}')
+      valid_scoped_name "$1" || usage_error
+      payload=$(jq -cn --arg action "$command" --arg worker "$1" \
+        '{action:$action,worker:$worker}')
     else
       payload=$(jq -cn --arg action "$command" '{action:$action}')
     fi
     ;;
   assign)
-    [[ $# -eq 3 && $2 == "--task" ]] || { usage >&2; exit 2; }
-    payload=$(jq -cn --arg action assign --arg worker "$1" --arg task "$3" '{action:$action,worker:$worker,task:$task}')
+    [[ $# -eq 3 && $2 == '--task' ]] || usage_error
+    valid_scoped_name "$1" || usage_error
+    [[ -n $3 && ${#3} -le 12000 && $3 =~ [^[:space:]] ]] || usage_error
+    payload=$(jq -cn --arg worker "$1" --arg task "$3" \
+      '{action:"assign",worker:$worker,task:$task}')
     ;;
-  *) usage >&2; exit 2 ;;
+  finalize)
+    request_timeout=840
+    mode=${1:-}
+    [[ -n $mode ]] || usage_error
+    shift
+    case "$mode" in
+      suggestion)
+        [[ $# -eq 0 ]] || usage_error
+        payload=$(jq -cn '{action:"finalize-suggest",fact_ids:[]}')
+        ;;
+      target)
+        fact_ids=()
+        paper_id=''
+        paper_id_seen=0
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --fact-id)
+              [[ $# -ge 2 ]] || usage_error
+              valid_fact_id "$2" || usage_error
+              ((${#fact_ids[@]} < 128)) || usage_error
+              fact_ids+=("$2")
+              shift 2
+              ;;
+            --paper-id)
+              [[ $# -ge 2 && $paper_id_seen -eq 0 ]] || usage_error
+              valid_paper_id "$2" || usage_error
+              paper_id=$2
+              paper_id_seen=1
+              shift 2
+              ;;
+            *) usage_error ;;
+          esac
+        done
+        ((${#fact_ids[@]} > 0)) || usage_error
+        require_confirmation
+        fact_ids_json=$(jq -cn --args '$ARGS.positional' -- "${fact_ids[@]}")
+        if (( paper_id_seen )); then
+          payload=$(printf '%s' "$confirmation_token" | jq -Rsc \
+            --argjson fact_ids "$fact_ids_json" --arg paper_id "$paper_id" \
+            '{action:"finalize",fact_ids:$fact_ids,paper_id:$paper_id,confirmation_token:.}')
+        else
+          payload=$(printf '%s' "$confirmation_token" | jq -Rsc \
+            --argjson fact_ids "$fact_ids_json" \
+            '{action:"finalize",fact_ids:$fact_ids,confirmation_token:.}')
+        fi
+        ;;
+      *) usage_error ;;
+    esac
+    ;;
+  human-summary)
+    request_timeout=840
+    language=''
+    language_seen=0
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --language)
+          [[ $# -ge 2 && $language_seen -eq 0 ]] || usage_error
+          [[ -n $2 && ${#2} -le 80 && ! $2 =~ [[:cntrl:]] ]] || usage_error
+          language=$2
+          language_seen=1
+          shift 2
+          ;;
+        *) usage_error ;;
+      esac
+    done
+    require_confirmation
+    if (( language_seen )); then
+      payload=$(printf '%s' "$confirmation_token" | jq -Rsc --arg language "$language" \
+        '{action:"human-summary",language:$language,confirmation_token:.}')
+    else
+      payload=$(printf '%s' "$confirmation_token" | jq -Rsc \
+        '{action:"human-summary",confirmation_token:.}')
+    fi
+    ;;
+  write-paper)
+    request_timeout=840
+    paper_id=''
+    paper_id_seen=0
+    fact_ids=()
+    instructions=''
+    instructions_seen=0
+    worker_fork=''
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --paper-id)
+          [[ $# -ge 2 && $paper_id_seen -eq 0 ]] || usage_error
+          valid_paper_id "$2" || usage_error
+          paper_id=$2
+          paper_id_seen=1
+          shift 2
+          ;;
+        --fact-id)
+          [[ $# -ge 2 ]] || usage_error
+          valid_fact_id "$2" || usage_error
+          ((${#fact_ids[@]} < 128)) || usage_error
+          fact_ids+=("$2")
+          shift 2
+          ;;
+        --instructions)
+          [[ $# -ge 2 && $instructions_seen -eq 0 ]] || usage_error
+          [[ -n $2 && ${#2} -le 12000 && $2 =~ [^[:space:]] && ! $2 =~ [[:cntrl:]] ]] || usage_error
+          instructions=$2
+          instructions_seen=1
+          shift 2
+          ;;
+        --stop-workers)
+          [[ -z $worker_fork ]] || usage_error
+          worker_fork=true
+          shift
+          ;;
+        --keep-workers)
+          [[ -z $worker_fork ]] || usage_error
+          worker_fork=false
+          shift
+          ;;
+        *) usage_error ;;
+      esac
+    done
+    [[ -n $worker_fork ]] || usage_error
+    require_confirmation
+    fact_ids_json=$(jq -cn --args '$ARGS.positional' -- "${fact_ids[@]}")
+    payload=$(printf '%s' "$confirmation_token" | jq -Rsc \
+      --argjson fact_ids "$fact_ids_json" --argjson stop_workers "$worker_fork" \
+      --arg paper_id "$paper_id" --argjson paper_id_seen "$paper_id_seen" \
+      --arg instructions "$instructions" --argjson instructions_seen "$instructions_seen" \
+      '{action:"write-paper",fact_ids:$fact_ids,stop_workers:$stop_workers,confirmation_token:.}
+       + (if $paper_id_seen == 1 then {paper_id:$paper_id} else {} end)
+       + (if $instructions_seen == 1 then {instructions:$instructions} else {} end)')
+    ;;
+  *) usage_error ;;
 esac
 
-response_file=$(mktemp)
-trap 'rm -f "$response_file"' EXIT
-# Feed the capability through curl's config stdin so it never appears in the
-# process argv exposed by /proc/<pid>/cmdline.
-status=$(printf 'header = "Authorization: Bearer %s"\n' "$token" | \
-  curl --config - --silent --show-error --max-time 30 \
-    --output "$response_file" --write-out '%{http_code}' \
-    --request POST --header 'Accept: application/json' \
-    --header 'Content-Type: application/json' \
-    --data "$payload" "$url")
-if [[ $status =~ ^2 ]]; then
-  cat "$response_file"
-  printf '\n'
-  exit 0
+valid_loopback_url "$lifecycle_url" ||
+  configuration_error 'Main Agent lifecycle broker must use a loopback HTTP URL'
+[[ -n $lifecycle_token && ${#lifecycle_token} -le 512 && $lifecycle_token =~ ^[A-Za-z0-9_-]+$ ]] ||
+  configuration_error 'Main Agent lifecycle broker is not configured or invalid'
+
+umask 077
+response_file=$(mktemp "${TMPDIR:-/tmp}/danus-web-agent-response.XXXXXX") ||
+  configuration_error 'danus-web-agent could not create a secure response file'
+config_file=$(mktemp "${TMPDIR:-/tmp}/danus-web-agent-curl.XXXXXX") || {
+  rm -f -- "$response_file"
+  configuration_error 'danus-web-agent could not create a secure curl config'
+}
+cleanup() {
+  [[ -z ${config_file:-} ]] || rm -f -- "$config_file"
+  [[ -z ${response_file:-} ]] || rm -f -- "$response_file"
+}
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
+
+printf 'header = "Authorization: Bearer %s"\n' "$lifecycle_token" >"$config_file"
+exec 3<"$config_file"
+rm -f -- "$config_file"
+config_file=''
+
+# The former `curl --config -` transport consumed stdin; stdin is now reserved
+# for the secret-bearing JSON body, so curl reads the unlinked config via fd 3.
+set +e
+http_status=$(printf '%s' "$payload" | curl --config /dev/fd/3 \
+  --silent --show-error --noproxy '*' --proto '=http' \
+  --connect-timeout 5 --max-time "$request_timeout" \
+  --output "$response_file" --write-out '%{http_code}' \
+  --request POST --header 'Accept: application/json' \
+  --header 'Content-Type: application/json' \
+  --data-binary @- "$lifecycle_url" 2>/dev/null)
+curl_status=$?
+set -e
+exec 3<&-
+
+if (( curl_status != 0 )); then
+  printf 'lifecycle broker unavailable for %s\n' "$command" >&2
+  exit 1
 fi
-detail=$(jq -r '.detail // "request rejected"' < "$response_file" 2>/dev/null || echo 'request rejected')
-echo "lifecycle broker rejected $command: $detail" >&2
-exit 1
+if [[ ! $http_status =~ ^[0-9]{3}$ ]]; then
+  printf 'lifecycle broker returned an invalid HTTP status for %s\n' "$command" >&2
+  exit 1
+fi
+if [[ ! $http_status =~ ^2[0-9]{2}$ ]]; then
+  printf 'lifecycle broker rejected %s (HTTP %s)\n' "$command" "$http_status" >&2
+  exit 1
+fi
+
+if ! result=$(jq -ce 'if type == "object" then . else error("not an object") end' \
+  <"$response_file" 2>/dev/null); then
+  printf 'lifecycle broker returned an invalid response for %s\n' "$command" >&2
+  exit 1
+fi
+if [[ $result == *"$lifecycle_token"* ]] ||
+   [[ -n $confirmation_token && $result == *"$confirmation_token"* ]]; then
+  printf 'lifecycle broker returned an unsafe response for %s\n' "$command" >&2
+  exit 1
+fi
+printf '%s\n' "$result"
