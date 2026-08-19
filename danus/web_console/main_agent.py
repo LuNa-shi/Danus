@@ -479,7 +479,7 @@ class MainAgentAdapter:
     def _codex_progress_events(cls, line: str) -> list[dict[str, Any]]:
         from .protocol import parse_provider_line
         raw_item = parse_provider_line(line)
-        if raw_item is None or str(raw_item.get("type") or "") not in {"thread.started", "turn.started", "session_meta", "response_item", "item.started", "item.completed", "event_msg"}:
+        if raw_item is None or str(raw_item.get("type") or "") not in {"thread.started", "turn.started", "turn.completed", "turn.failed", "session_meta", "response_item", "item.started", "item.completed", "event_msg"}:
             return []
         normalized = normalize_provider_line(line)
         if normalized and any(event.kind in {EventKind.SESSION_STARTED, EventKind.TURN_STARTED} for event in normalized):

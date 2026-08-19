@@ -96,6 +96,7 @@ def normalize_trace(stdout: str) -> NormalizedTrace:
                 content = obj.get("content")
                 if isinstance(content, list): reply = "".join(str(part.get("text") or "") for part in content if isinstance(part, dict)) or reply
                 elif isinstance(content, str): reply = content
+                else: reply = str(obj.get("text") or obj.get("message") or obj.get("output_text") or reply)
             elif typ not in {"reasoning", ""}: uncertain = True
         elif kind == "response.completed":
             response = item.get("response") if isinstance(item.get("response"), dict) else payload.get("response") if isinstance(payload.get("response"), dict) else {}
@@ -104,8 +105,13 @@ def normalize_trace(stdout: str) -> NormalizedTrace:
                 typ = str(obj.get("type") or "") if isinstance(obj, dict) else ""
                 if typ in {"function_call", "function_call_output", "mcp_tool_call", "tool_call", "tool_search_call", "tool_search_output"}: tool = True
                 elif typ not in {"message", "reasoning", ""}: uncertain = True
+        elif kind == "turn.completed":
+            terminal = "completed"; failure = None
+            if item.get("last_agent_message"): reply = str(item["last_agent_message"])
         elif kind in {"turn.failed", "response.failed", "error"}:
-            error = item.get("error") or payload.get("error") or payload
-            if isinstance(error, dict): failure = (str(error.get("codex_error_info") or error.get("code") or "") or None, str(error.get("message") or error)); terminal = "failed"
-        elif kind not in passive and kind not in {"turn.completed", "response.completed", "response.output_text.done"}: uncertain = True
+            error = item.get("error") or item.get("message") or payload.get("error") or payload.get("message") or payload
+            if isinstance(error, dict): failure = (str(error.get("codex_error_info") or error.get("code") or "") or None, str(error.get("message") or error))
+            else: failure = (None, str(error or "provider error"))
+            terminal = "failed"
+        elif kind not in passive and kind not in {"response.completed", "response.output_text.done"}: uncertain = True
     return NormalizedTrace(session_id, reply, terminal, failure, tool, uncertain)

@@ -679,6 +679,34 @@ def test_codex_streams_safe_agent_and_tool_events_before_final_reply(tmp_path: P
     assert "private reasoning" not in json.dumps(events, ensure_ascii=False)
 
 
+def test_codex_0148_jsonl_transient_error_then_completed_is_success(tmp_path: Path):
+    events = []
+    lines = [
+        json.dumps({"type": "thread.started", "thread_id": "sid-0148"}),
+        json.dumps({"type": "turn.started"}),
+        json.dumps({"type": "error", "message": "Reconnecting... 1/5"}),
+        json.dumps({"type": "item.completed", "item": {
+            "id": "item-1", "type": "agent_message", "text": "DANUS_MAIN_AGENT_OK",
+        }}),
+        json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}}),
+    ]
+
+    def runner(cmd, **kwargs):
+        for line in lines:
+            kwargs["on_stdout_line"](line)
+        return SimpleNamespace(returncode=0, stdout="\n".join(lines), stderr="")
+
+    adapter = MainAgentAdapter(backend="codex", runner=runner, codex_bin="codex")
+    result = adapter.send(**_args(tmp_path), on_progress=events.append)
+
+    assert result["session_id"] == "sid-0148"
+    assert result["reply"] == "DANUS_MAIN_AGENT_OK"
+    assert result["status"] == "completed"
+    assert [event["type"] for event in events] == [
+        "process.started", "session.started", "turn.started", "agent.message", "turn.completed",
+    ]
+
+
 def test_codex_resume_keeps_resume_options_before_session(tmp_path: Path):
     calls = []
     def runner(cmd, **kwargs):
