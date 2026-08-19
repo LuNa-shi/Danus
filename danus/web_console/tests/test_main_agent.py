@@ -711,7 +711,7 @@ def test_codex_resume_keeps_resume_options_before_session(tmp_path: Path):
     calls = []
     def runner(cmd, **kwargs):
         calls.append(cmd)
-        return SimpleNamespace(returncode=0, stdout=_codex_success(session_id="sid-2"), stderr="")
+        return SimpleNamespace(returncode=0, stdout=_codex_success(session_id="sid-1"), stderr="")
 
     adapter = MainAgentAdapter(backend="codex", runner=runner, codex_bin="codex")
     adapter.send(**(_args(tmp_path) | {"session_id": "sid-1"}))
@@ -933,3 +933,533 @@ def test_normalized_trace_handles_duplicate_and_reordered_envelopes():
     ]
     trace = normalize_trace("\n".join(lines))
     assert trace.session_id == "sid" and trace.reply == "done" and trace.terminal_state == "completed"
+
+
+def test_codex_normalizes_each_provider_envelope_exactly_once(monkeypatch):
+    from danus.web_console import protocol
+
+    lines = [
+        json.dumps({"type": "thread.started", "thread_id": "sid-once"}),
+        json.dumps({"type": "turn.started"}),
+        json.dumps({"type": "mystery.event", "value": 1}),
+        "not-json",
+        json.dumps({"type": "turn.completed"}),
+    ]
+    real_loads = protocol.json.loads
+    parsed = []
+
+    def counted_loads(value):
+        parsed.append(value)
+        return real_loads(value)
+
+    monkeypatch.setattr(protocol.json, "loads", counted_loads)
+    envelopes, trace = protocol.normalize_envelopes(lines)
+
+    assert len(parsed) == len(lines)
+    assert len(envelopes) == len(lines) - 1
+    assert trace.session_id == "sid-once"
+    assert trace.terminal_state == "completed"
+    assert trace.parse_uncertain is True
+
+
+def test_codex_two_turns_preserve_session_process_and_turn_event_semantics(tmp_path: Path):
+    calls = []
+
+    def runner(cmd, **kwargs):
+        calls.append(cmd)
+        message = "first" if len(calls) == 1 else "second"
+        lines = [
+            json.dumps({"type": "thread.started", "thread_id": "sid-resume"}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps({"type": "item.completed", "item": {
+                "type": "agent_message", "text": message,
+            }}),
+            json.dumps({"type": "turn.completed"}),
+        ]
+        for line in lines:
+            kwargs["on_stdout_line"](line)
+        return SimpleNamespace(returncode=0, stdout="\n".join(lines), stderr="")
+
+    adapter = MainAgentAdapter(backend="codex", runner=runner, codex_bin="codex")
+    first_events = []
+    first = adapter.send(**_args(tmp_path), on_progress=first_events.append)
+    second_events = []
+    second = adapter.send(
+        **(_args(tmp_path) | {"session_id": first["session_id"]}),
+        on_progress=second_events.append,
+    )
+
+    assert first["session_id"] == second["session_id"] == "sid-resume"
+    assert first["reply"] == "first" and second["reply"] == "second"
+    assert [event["type"] for event in first_events] == [
+        "process.started", "session.started", "turn.started",
+        "agent.message", "turn.completed",
+    ]
+    assert [event["type"] for event in second_events] == [
+        "process.started", "turn.started", "agent.message", "turn.completed",
+    ]
+    assert second_events[0]["session_id"] == "sid-resume"
+    assert second_events[1]["session_id"] == "sid-resume"
+    assert calls[1][-3:] == ["resume", "sid-resume", "-"]
+
+
+def test_codex_terminal_failure_is_not_cleared_by_reordered_completion():
+    from danus.web_console.protocol import normalize_trace
+
+    trace = normalize_trace("\n".join([
+        json.dumps({"type": "turn.failed", "error": {
+            "code": "terminal", "message": "failed",
+        }}),
+        json.dumps({"type": "turn.completed"}),
+    ]))
+
+    assert trace.terminal_state == "failed"
+    assert trace.failure == ("terminal", "failed")
+
+
+def test_codex_resume_rejects_a_different_provider_session_identity(tmp_path: Path):
+    adapter = MainAgentAdapter(
+        backend="codex", codex_bin="codex",
+        runner=lambda *args, **kwargs: SimpleNamespace(
+            returncode=0, stdout=_codex_success(session_id="sid-other"), stderr="",
+        ),
+    )
+
+    with pytest.raises(MainAgentError, match="different session identity") as raised:
+        adapter.send(**(_args(tmp_path) | {"session_id": "sid-known"}))
+
+    assert raised.value.code == "session_identity_mismatch"
+    assert raised.value.session_id == "sid-known"
+
+
+@pytest.mark.parametrize("malformed", [
+    {"type": "event_msg", "payload": []},
+    {"type": "response_item", "payload": {"text": "missing type"}},
+    {"type": "item.started", "item": "not-an-object"},
+    {"type": "item.completed", "item": {}},
+    {"type": "response.completed", "response": {"output": {}}},
+])
+def test_known_malformed_codex_envelopes_make_retry_unsafe(malformed):
+    from danus.web_console.protocol import normalize_trace
+
+    trace = normalize_trace("\n".join([
+        json.dumps({"type": "thread.started", "thread_id": "sid-malformed"}),
+        json.dumps(malformed),
+        json.dumps({"type": "event_msg", "payload": {
+            "type": "task_complete",
+            "error": {"codex_error_info": "server_overloaded", "message": "retryable"},
+        }}),
+    ]))
+
+    assert trace.failure == ("server_overloaded", "retryable")
+    assert trace.parse_uncertain is True
+
+
+def test_malformed_known_envelope_blocks_automatic_adapter_retry(tmp_path: Path):
+    calls = []
+    stream = "\n".join([
+        json.dumps({"type": "thread.started", "thread_id": "sid-malformed"}),
+        json.dumps({"type": "item.completed", "item": {}}),
+        json.dumps({"type": "event_msg", "payload": {
+            "type": "task_complete",
+            "error": {"codex_error_info": "server_overloaded", "message": "retryable"},
+        }}),
+    ])
+
+    def runner(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=1, stdout=stream, stderr="")
+
+    adapter = MainAgentAdapter(
+        backend="codex", codex_bin="codex", runner=runner,
+        max_attempts=3, retry_base_seconds=0,
+    )
+    with pytest.raises(MainAgentError) as raised:
+        adapter.send(**_args(tmp_path))
+
+    assert len(calls) == 1
+    assert raised.value.retryable is True
+    assert raised.value.safe_to_retry is False
+
+
+@pytest.mark.parametrize("terminal", [
+    {"type": "turn.completed"},
+    {"type": "turn.failed", "error": {"code": "failed", "message": "failed"}},
+])
+def test_new_stream_session_conflict_wins_over_terminal_and_stops_progress(
+    tmp_path: Path, terminal,
+):
+    events = []
+    lines = [
+        json.dumps({"type": "thread.started", "thread_id": "sid-a"}),
+        json.dumps({"type": "turn.started"}),
+        json.dumps({"type": "thread.started", "thread_id": "sid-b"}),
+        json.dumps({"type": "item.completed", "item": {
+            "type": "agent_message", "text": "must-not-persist",
+        }}),
+        json.dumps(terminal),
+    ]
+
+    def runner(cmd, **kwargs):
+        for line in lines:
+            kwargs["on_stdout_line"](line)
+        return SimpleNamespace(returncode=0, stdout="\n".join(lines), stderr="")
+
+    adapter = MainAgentAdapter(backend="codex", codex_bin="codex", runner=runner)
+    with pytest.raises(MainAgentError) as raised:
+        adapter.send(**_args(tmp_path), on_progress=events.append)
+
+    assert raised.value.code == "session_identity_mismatch"
+    assert raised.value.session_id == "sid-a"
+    assert [event["type"] for event in events] == [
+        "process.started", "session.started", "turn.started",
+    ]
+    assert "sid-b" not in json.dumps(events)
+    assert "must-not-persist" not in json.dumps(events)
+
+
+def test_session_conflict_wins_over_timeout_and_uses_canonical_identity(tmp_path: Path):
+    events = []
+    lines = [
+        json.dumps({"type": "thread.started", "thread_id": "sid-a"}),
+        json.dumps({"type": "thread.started", "thread_id": "sid-b"}),
+        json.dumps({"type": "item.completed", "item": {
+            "type": "agent_message", "text": "must-not-persist",
+        }}),
+    ]
+
+    def runner(cmd, **kwargs):
+        for line in lines:
+            kwargs["on_stdout_line"](line)
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=1, output="\n".join(lines))
+
+    adapter = MainAgentAdapter(backend="codex", codex_bin="codex", runner=runner)
+    with pytest.raises(MainAgentError) as raised:
+        adapter.send(**_args(tmp_path), on_progress=events.append)
+
+    assert raised.value.code == "session_identity_mismatch"
+    assert raised.value.session_id == "sid-a"
+    assert [event["type"] for event in events] == ["process.started", "session.started"]
+
+
+def test_resume_conflict_never_publishes_the_mismatching_envelope(tmp_path: Path):
+    events = []
+    lines = [
+        json.dumps({"type": "thread.started", "thread_id": "sid-other"}),
+        json.dumps({"type": "turn.started"}),
+        json.dumps({"type": "turn.completed"}),
+    ]
+
+    def runner(cmd, **kwargs):
+        for line in lines:
+            kwargs["on_stdout_line"](line)
+        return SimpleNamespace(returncode=0, stdout="\n".join(lines), stderr="")
+
+    adapter = MainAgentAdapter(backend="codex", codex_bin="codex", runner=runner)
+    with pytest.raises(MainAgentError) as raised:
+        adapter.send(
+            **(_args(tmp_path) | {"session_id": "sid-known"}),
+            on_progress=events.append,
+        )
+
+    assert raised.value.code == "session_identity_mismatch"
+    assert raised.value.session_id == "sid-known"
+    assert events == [{
+        "type": "process.started", "status": "active",
+        "detail": "Main Agent Process activated", "session_id": "sid-known",
+    }]
+
+
+def test_failed_turn_stops_all_later_stream_publication_and_reduction(tmp_path: Path):
+    events = []
+    lines = [
+        json.dumps({"type": "thread.started", "thread_id": "sid-failed"}),
+        json.dumps({"type": "turn.started"}),
+        json.dumps({"type": "turn.failed", "error": {
+            "code": "terminal", "message": "failed",
+        }}),
+        json.dumps({"type": "item.completed", "item": {
+            "type": "agent_message", "text": "post-terminal-message",
+        }}),
+        json.dumps({"type": "item.started", "item": {
+            "type": "command_execution", "command": "echo post-terminal-tool",
+        }}),
+        json.dumps({"type": "turn.completed"}),
+    ]
+
+    def runner(cmd, **kwargs):
+        for line in lines:
+            kwargs["on_stdout_line"](line)
+        return SimpleNamespace(returncode=1, stdout="\n".join(lines), stderr="")
+
+    adapter = MainAgentAdapter(backend="codex", codex_bin="codex", runner=runner)
+    with pytest.raises(MainAgentError) as raised:
+        adapter.send(**_args(tmp_path), on_progress=events.append)
+
+    assert raised.value.code == "terminal"
+    assert [event["type"] for event in events] == [
+        "process.started", "session.started", "turn.started", "turn.failed",
+    ]
+    assert "post-terminal" not in json.dumps(events)
+
+
+def test_new_legacy_session_meta_emits_session_once_and_resume_emits_none(tmp_path: Path):
+    calls = []
+
+    def runner(cmd, **kwargs):
+        calls.append(cmd)
+        lines = [
+            json.dumps({"type": "session_meta", "payload": {"session_id": "sid-legacy"}}),
+            json.dumps({"type": "thread.started", "thread_id": "sid-legacy"}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps({"type": "event_msg", "payload": {
+                "type": "agent_message", "content": [{"type": "text", "text": "ok"}],
+            }}),
+            json.dumps({"type": "turn.completed"}),
+        ]
+        for line in lines:
+            kwargs["on_stdout_line"](line)
+        return SimpleNamespace(returncode=0, stdout="\n".join(lines), stderr="")
+
+    adapter = MainAgentAdapter(backend="codex", codex_bin="codex", runner=runner)
+    first_events = []
+    first = adapter.send(**_args(tmp_path), on_progress=first_events.append)
+    resumed_events = []
+    adapter.send(
+        **(_args(tmp_path) | {"session_id": first["session_id"]}),
+        on_progress=resumed_events.append,
+    )
+
+    assert [event["type"] for event in first_events].count("session.started") == 1
+    assert [event["type"] for event in resumed_events].count("session.started") == 0
+    assert first["reply"] == "ok"
+
+
+def test_response_failed_nested_error_preserves_retry_classification(tmp_path: Path):
+    calls = []
+    failed = "\n".join([
+        json.dumps({"type": "thread.started", "thread_id": "sid-response-failed"}),
+        json.dumps({"type": "response.failed", "response": {"error": {
+            "code": "server_overloaded", "message": "capacity",
+        }}}),
+    ])
+    completed = "\n".join([
+        json.dumps({"type": "thread.started", "thread_id": "sid-response-failed"}),
+        json.dumps({"type": "item.completed", "item": {
+            "type": "agent_message", "text": "recovered",
+        }}),
+        json.dumps({"type": "turn.completed"}),
+    ])
+
+    def runner(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(
+            returncode=1 if len(calls) == 1 else 0,
+            stdout=failed if len(calls) == 1 else completed, stderr="",
+        )
+
+    adapter = MainAgentAdapter(
+        backend="codex", codex_bin="codex", runner=runner,
+        max_attempts=2, retry_base_seconds=0, sleeper=lambda _: None,
+    )
+    result = adapter.send(**_args(tmp_path))
+
+    assert result["reply"] == "recovered"
+    assert result["attempts"] == 2
+    assert calls[1][-3:] == ["resume", "sid-response-failed", "-"]
+
+
+def test_item_tool_phase_status_and_legacy_response_item_compatibility():
+    started = MainAgentAdapter._codex_progress_events(json.dumps({
+        "type": "item.started", "item": {
+            "type": "mcp_tool_call", "name": "danus.fact_search", "id": "call-1",
+        },
+    }))[0]
+    failed = MainAgentAdapter._codex_progress_events(json.dumps({
+        "type": "item.completed", "item": {
+            "type": "mcp_tool_call", "name": "danus.fact_search", "id": "call-1",
+            "status": "failed", "error": {"message": "tool rejected"},
+        },
+    }))[0]
+    web_completed = MainAgentAdapter._codex_progress_events(json.dumps({
+        "type": "item.completed", "item": {
+            "type": "web_search_call", "id": "call-2", "status": "completed",
+            "result": {"status": "ok"},
+        },
+    }))[0]
+    legacy = MainAgentAdapter._codex_progress_events(json.dumps({
+        "type": "response_item", "payload": {
+            "type": "function_call", "name": "exec_command", "call_id": "call-3",
+            "arguments": "{}",
+        },
+    }))[0]
+
+    assert (started["type"], started["status"]) == ("tool.started", "started")
+    assert (failed["type"], failed["status"]) == ("tool.completed", "failed")
+    assert "content hidden by safety policy" in failed["detail"]
+    assert (web_completed["type"], web_completed["status"]) == ("tool.completed", "completed")
+    assert (legacy["type"], legacy["status"]) == ("tool.started", "started")
+
+
+@pytest.mark.parametrize(("field", "value", "expected"), [
+    ("message", "message-shape", "message-shape"),
+    ("text", "text-shape", "text-shape"),
+    ("output_text", "output-shape", "output-shape"),
+    ("content", [{"type": "output_text", "text": "content-shape"}], "content-shape"),
+])
+def test_legacy_event_message_text_shapes_share_one_decoder(field, value, expected):
+    from danus.web_console.protocol import normalize_trace
+
+    trace = normalize_trace("\n".join([
+        json.dumps({"type": "thread.started", "thread_id": "sid-message"}),
+        json.dumps({"type": "event_msg", "payload": {
+            "type": "agent_message", field: value,
+        }}),
+        json.dumps({"type": "turn.completed"}),
+    ]))
+
+    assert trace.reply == expected
+
+
+def test_streaming_adapter_decodes_each_provider_line_once(tmp_path: Path, monkeypatch):
+    from danus.web_console import protocol
+
+    lines = [
+        json.dumps({"type": "thread.started", "thread_id": "sid-stream-once"}),
+        json.dumps({"type": "turn.started"}),
+        json.dumps({"type": "item.completed", "item": {
+            "type": "agent_message", "text": "once",
+        }}),
+        "not-json",
+        json.dumps({"type": "turn.completed"}),
+    ]
+    real_loads = protocol.json.loads
+    decoded = []
+
+    def counted_loads(value):
+        decoded.append(value)
+        return real_loads(value)
+
+    monkeypatch.setattr(protocol.json, "loads", counted_loads)
+
+    def runner(cmd, **kwargs):
+        for line in lines:
+            kwargs["on_stdout_line"](line)
+        return SimpleNamespace(returncode=0, stdout="\n".join(lines), stderr="")
+
+    result = MainAgentAdapter(
+        backend="codex", codex_bin="codex", runner=runner,
+    ).send(**_args(tmp_path), on_progress=lambda _: None)
+
+    assert result["reply"] == "once"
+    assert decoded == lines
+
+
+def test_streaming_and_batch_protocol_reduction_are_identical():
+    from danus.web_console.protocol import NormalizedTraceBuilder, normalize_trace
+
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {"session_id": "sid-equal"}}),
+        json.dumps({"type": "turn.started"}),
+        json.dumps({"type": "error", "message": "Reconnecting... 1/5"}),
+        json.dumps({"type": "item.completed", "item": {
+            "type": "agent_message", "content": [{"text": "equal"}],
+        }}),
+        json.dumps({"type": "turn.completed"}),
+    ]
+    streaming = NormalizedTraceBuilder()
+    for line in lines:
+        streaming.consume_line(line)
+
+    assert streaming.trace() == normalize_trace("\n".join(lines))
+
+
+def test_post_terminal_tool_activity_blocks_retry_without_being_published(tmp_path: Path):
+    calls = []
+    events = []
+    lines = [
+        json.dumps({"type": "thread.started", "thread_id": "sid-post-terminal-tool"}),
+        json.dumps({"type": "event_msg", "payload": {
+            "type": "task_complete",
+            "error": {"codex_error_info": "server_overloaded", "message": "capacity"},
+        }}),
+        json.dumps({"type": "item.completed", "item": {
+            "type": "command_execution", "command": "danus-web-agent status",
+            "exit_code": 0,
+        }}),
+    ]
+
+    def runner(cmd, **kwargs):
+        calls.append(cmd)
+        for line in lines:
+            kwargs["on_stdout_line"](line)
+        return SimpleNamespace(returncode=1, stdout="\n".join(lines), stderr="")
+
+    adapter = MainAgentAdapter(
+        backend="codex", codex_bin="codex", runner=runner,
+        max_attempts=3, retry_base_seconds=0,
+    )
+    with pytest.raises(MainAgentError) as raised:
+        adapter.send(**_args(tmp_path), on_progress=events.append)
+
+    assert len(calls) == 1
+    assert raised.value.retryable is True
+    assert raised.value.safe_to_retry is False
+    assert raised.value.observed_tool_activity is True
+    assert [event["type"] for event in events] == [
+        "process.started", "session.started", "turn.failed",
+    ]
+
+
+@pytest.mark.parametrize("empty_error", [None, False, "", {}])
+def test_legacy_task_complete_empty_error_is_success(empty_error):
+    from danus.web_console.protocol import normalize_trace
+
+    trace = normalize_trace("\n".join([
+        json.dumps({"type": "thread.started", "thread_id": "sid-empty-error"}),
+        json.dumps({"type": "event_msg", "payload": {
+            "type": "agent_message", "message": "ok",
+        }}),
+        json.dumps({"type": "event_msg", "payload": {
+            "type": "task_complete", "error": empty_error,
+        }}),
+    ]))
+
+    assert trace.terminal_state == "completed"
+    assert trace.failure is None
+    assert trace.reply == "ok"
+
+
+def test_malformed_thread_without_id_does_not_consume_session_started():
+    from danus.web_console.protocol import EventKind, NormalizedTraceBuilder
+
+    builder = NormalizedTraceBuilder()
+    malformed = builder.consume_line(json.dumps({"type": "thread.started"}))
+    valid = builder.consume_line(json.dumps({
+        "type": "thread.started", "thread_id": "sid-valid",
+    }))
+
+    assert malformed is not None and malformed.events == ()
+    assert valid is not None
+    assert [event.kind for event in valid.events] == [EventKind.SESSION_STARTED]
+    assert valid.events[0].session_id == "sid-valid"
+    assert builder.trace().session_id == "sid-valid"
+    assert builder.trace().parse_uncertain is True
+
+
+@pytest.mark.parametrize("item", [
+    {"type": "function_call_output", "call_id": "call-1", "error": "failed"},
+    {"type": "custom_tool_call_output", "call_id": "call-2",
+     "output": '{"status":"rejected"}'},
+    {"type": "tool_search_output", "call_id": "call-3",
+     "result": {"accepted": False}},
+])
+def test_tool_output_failure_status_is_normalized_in_typed_protocol(item):
+    from danus.web_console.protocol import EventKind, normalize_provider_line
+
+    event = normalize_provider_line(json.dumps({
+        "type": "item.completed", "item": item,
+    }))[0]
+
+    assert event.kind == EventKind.TOOL_COMPLETED
+    assert event.status == "failed"
