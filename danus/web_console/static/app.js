@@ -2485,7 +2485,12 @@ bindRailResizer("project-rail-resizer", "project");
     state.csrf = session.csrf_token;
     showConsole();
     await loadConfiguration();
-    await refreshProjects();
+    try {
+      await refreshProjects();
+    } catch (error) {
+      $("project-list").innerHTML = '<div class="project-list-empty error">项目记录暂时无法读取<br><span>数据仍保留在服务器，请稍后重试</span></div>';
+      notify(error.message || "项目记录暂时无法读取", "error");
+    }
     bindEmptyState();
   } catch {
     // The login screen is the expected initial state for a new session.
