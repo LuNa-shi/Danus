@@ -227,7 +227,7 @@ def test_production_provider_rejects_arbitrary_owned_executable(tmp_path: Path):
     with _env(DANUS_CODEX_JS=str(entry), DANUS_CODEX_BIN=str(arbitrary)):
         with pytest.raises(
             launcher.VerifierProviderConfigurationError,
-            match="selector is unsafe",
+            match="unsafe",
         ):
             launcher._provider_codex_bin()
 
@@ -261,7 +261,7 @@ def test_production_provider_rejects_spoofed_nurouter_marker(
     with _env(DANUS_CODEX_JS=str(entry), DANUS_CODEX_BIN=str(launcher_path)):
         with pytest.raises(
             launcher.VerifierProviderConfigurationError,
-            match="launcher is unsafe",
+            match="unsafe",
         ):
             launcher._provider_codex_bin()
 

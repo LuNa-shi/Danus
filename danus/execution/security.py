@@ -508,6 +508,17 @@ def _official_codex_runtime() -> tuple[Path, Path, Path]:
     return native, entrypoint, bwrap
 
 
+def trusted_codex_runtime() -> tuple[Path, Path, Path]:
+    """Return the bootstrap-pinned upstream Codex runtime triple.
+
+    Verifier code uses the same fixed-root/package validation as Worker code;
+    keeping this as the single public seam prevents a second selector from
+    accidentally accepting a look-alike ``@openai/codex`` tree.
+    """
+
+    return _official_codex_runtime()
+
+
 def _validated_nurouter_launcher(candidate: Path) -> bool:
     """Recognize the host launcher only as a selector, never execute it."""
 
@@ -962,6 +973,7 @@ __all__ = [
     "provider_writable_paths",
     "record_provider_pid",
     "resolve_trusted_codex_bin",
+    "trusted_codex_runtime",
     "resolve_worker_codex_bin",
     "start_host_gateway",
     "trusted_venv_python",

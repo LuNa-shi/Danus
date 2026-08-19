@@ -27,6 +27,8 @@ from urllib.parse import urlsplit
 
 _HERE = Path(__file__).resolve().parent
 _WIRE_PATH = (_HERE / "wire.py").resolve()
+_CODEX_INSTALL_ROOT = _HERE.parents[1] / "runtime" / "codex-npm"
+_CODEX_PACKAGE = _CODEX_INSTALL_ROOT / "lib" / "node_modules" / "@openai" / "codex"
 _ENV_KEYS = {
     "CODEX_HOME", "HOME", "PATH", "LANG", "TMPDIR",
     "PYTHONDONTWRITEBYTECODE", "PYTHONSAFEPATH",
@@ -44,6 +46,93 @@ _SHELL_SET_RE = re.compile(
     r'HOME=(?P<home>"(?:\\.|[^"\\])*"),LANG="C\.UTF-8",'
     r'TMPDIR=(?P<tmp>"(?:\\.|[^"\\])*")\}$'
 )
+
+
+def _reject_symlink_components(path: Path, label: str) -> None:
+    if not path.is_absolute():
+        raise ValueError(f"{label} must be absolute")
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        try:
+            if stat.S_ISLNK(current.lstat().st_mode):
+                raise ValueError(f"{label} contains a symbolic link")
+        except OSError as exc:
+            raise ValueError(f"{label} is unavailable") from exc
+
+
+def _safe_metadata(path: Path, label: str) -> dict[str, object]:
+    _reject_symlink_components(path, label)
+    try:
+        info = path.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid not in {0, os.getuid()}
+                or info.st_mode & 0o002 or info.st_size > (1 << 20)):
+            raise ValueError(f"{label} is unsafe")
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            value = json.loads(os.read(fd, (1 << 20) + 1))
+        finally:
+            os.close(fd)
+    except ValueError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} is unavailable") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} is unsafe")
+    return value
+
+
+def _official_native_binary() -> Path:
+    """Derive the native CLI from the code-relative, fixed bootstrap root."""
+    package = _CODEX_PACKAGE
+    _reject_symlink_components(package, "Codex package")
+    try:
+        package_info = package.lstat()
+        if (not stat.S_ISDIR(package_info.st_mode)
+                or package_info.st_uid not in {0, os.getuid()}
+                or package_info.st_mode & 0o002):
+            raise ValueError("Codex package is unsafe")
+    except OSError as exc:
+        raise ValueError("Codex package is unavailable") from exc
+    metadata = _safe_metadata(package / "package.json", "Codex package metadata")
+    version = metadata.get("version")
+    if (metadata.get("name") != "@openai/codex"
+            or not isinstance(version, str)
+            or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9._-]+)?", version)
+            or metadata.get("bin") != {"codex": "bin/codex.js"}):
+        raise ValueError("Codex package metadata is unsafe")
+    targets = {
+        "x86_64": ("codex-linux-x64", "x86_64-unknown-linux-musl", "linux-x64", "x64"),
+        "aarch64": ("codex-linux-arm64", "aarch64-unknown-linux-musl", "linux-arm64", "arm64"),
+    }
+    try:
+        package_name, target, suffix, cpu = targets[os.uname().machine]
+    except KeyError as exc:
+        raise ValueError("Codex native package is unsupported") from exc
+    native_package = package / "node_modules" / "@openai" / package_name
+    _reject_symlink_components(native_package, "Codex native package")
+    native_metadata = _safe_metadata(native_package / "package.json", "Codex native metadata")
+    if (native_metadata.get("name") != "@openai/codex"
+            or native_metadata.get("version") != f"{version}-{suffix}"
+            or native_metadata.get("os") != ["linux"]
+            or native_metadata.get("cpu") != [cpu]):
+        raise ValueError("Codex native metadata is unsafe")
+    native_root = native_package / "vendor" / target
+    entry = package / "bin" / "codex.js"
+    bwrap = native_root / "codex-resources" / "bwrap"
+    for path, label, executable in (
+        (entry, "Codex entry", True), (native_root / "bin" / "codex", "Codex native", True),
+        (bwrap, "Codex bubblewrap", True),
+    ):
+        _reject_symlink_components(path, label)
+        try:
+            info = path.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid not in {0, os.getuid()}
+                    or info.st_mode & 0o002 or (executable and not info.st_mode & 0o111)):
+                raise ValueError(f"{label} is unsafe")
+        except OSError as exc:
+            raise ValueError(f"{label} is unavailable") from exc
+    return native_root / "bin" / "codex"
 
 
 def _load_wire():
@@ -65,15 +154,11 @@ def _nondumpable() -> None:
 def _safe_provider_binary(value: str) -> str:
     if not value or not os.path.isabs(value):
         raise ValueError("provider binary must be absolute")
-    path = Path(value).resolve(strict=True)
-    info = path.stat()
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or info.st_uid not in {0, os.getuid()}
-        or info.st_mode & 0o002
-    ):
-        raise ValueError("provider binary is unsafe")
-    return str(path)
+    path = Path(value)
+    expected = _official_native_binary()
+    if path != expected:
+        raise ValueError("provider binary is not the official native Codex")
+    return str(expected)
 
 
 def _safe_endpoint(value: str) -> str:

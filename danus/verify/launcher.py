@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import HTTPException
 
 from danus import codex
+from danus.execution import security as execution_security
 from danus.secure_io import (
     SecureIOError,
     atomic_write_bytes,
@@ -67,6 +68,12 @@ _CERTIFICATE_ROOTS = tuple(
         Path("/usr/local/share/ca-certificates"),
     ) if path.exists()
 )
+
+# The deployment filesystem is idmapped: host-root-owned system files appear
+# as uid 65534 inside this container.  Only paths constrained to the fixed
+# system CA roots use this compatibility set; project/provider payloads remain
+# restricted to root or the serving uid.
+_SYSTEM_OWNER_UIDS = frozenset({0, os.getuid(), 65534})
 
 
 class VerifierProviderConfigurationError(RuntimeError):
@@ -171,7 +178,7 @@ def _validated_certificate_path(name: str, value: str) -> str:
     if (
         name not in {"SSL_CERT_FILE", "SSL_CERT_DIR"}
         or not expected_type(info.st_mode)
-        or info.st_uid != 0
+        or info.st_uid not in _SYSTEM_OWNER_UIDS
         or info.st_mode & 0o002
         or not any(
             resolved == root or resolved.is_relative_to(root)
@@ -239,69 +246,15 @@ def _read_safe_json(path: Path, label: str) -> dict[str, object]:
 
 
 def _official_codex_runtime() -> tuple[Path, Path, Path]:
-    """Return the pinned official native CLI, JS entry, and bundled bwrap."""
+    """Return the bootstrap-pinned official native CLI, JS entry, and bwrap."""
 
-    raw = os.environ.get("DANUS_CODEX_JS")
-    if not raw:
-        raise VerifierProviderConfigurationError(
-            "verifier upstream Codex runtime is unavailable"
-        )
-    entry = Path(raw).expanduser()
-    if not entry.is_absolute() or entry != Path(os.path.abspath(entry)):
-        raise VerifierProviderConfigurationError("verifier Codex entry is unsafe")
-    _safe_real_file(entry, "verifier Codex entry", executable=True)
-    package_root = entry.parent.parent
-    if (
-        entry.name != "codex.js"
-        or entry.parent.name != "bin"
-        or package_root.name != "codex"
-        or package_root.parent.name != "@openai"
-        or package_root.parent.parent.name != "node_modules"
-    ):
-        raise VerifierProviderConfigurationError("verifier Codex entry is unsafe")
-    metadata = _read_safe_json(package_root / "package.json", "verifier Codex package")
-    version = metadata.get("version")
-    if (
-        metadata.get("name") != "@openai/codex"
-        or not isinstance(version, str)
-        or not re.fullmatch(
-            r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9._-]+)?", version,
-        )
-        or metadata.get("bin") != {"codex": "bin/codex.js"}
-    ):
-        raise VerifierProviderConfigurationError("verifier Codex package is unsafe")
-
-    targets = {
-        "x86_64": ("codex-linux-x64", "x86_64-unknown-linux-musl", "linux-x64"),
-        "aarch64": ("codex-linux-arm64", "aarch64-unknown-linux-musl", "linux-arm64"),
-    }
     try:
-        package_name, target, version_suffix = targets[os.uname().machine]
-    except KeyError as exc:
+        return execution_security.trusted_codex_runtime()
+    except execution_security.WorkerSecurityError as exc:
+        # Do not expose selector/package details to the verifier HTTP surface.
         raise VerifierProviderConfigurationError(
-            "verifier Codex native package is unsupported"
+            "verifier upstream Codex runtime is unavailable or unsafe"
         ) from exc
-    native_package = package_root / "node_modules" / "@openai" / package_name
-    native_metadata = _read_safe_json(
-        native_package / "package.json", "verifier Codex native package",
-    )
-    if (
-        native_metadata.get("name") != "@openai/codex"
-        or native_metadata.get("version") != f"{version}-{version_suffix}"
-        or native_metadata.get("os") != ["linux"]
-    ):
-        raise VerifierProviderConfigurationError(
-            "verifier Codex native package is unsafe"
-        )
-    native_root = native_package / "vendor" / target
-    native = _safe_real_file(
-        native_root / "bin" / "codex", "verifier native Codex", executable=True,
-    )
-    bwrap = _safe_real_file(
-        native_root / "codex-resources" / "bwrap",
-        "verifier bundled bubblewrap", executable=True,
-    )
-    return native, entry, bwrap
 
 
 def _sha256_real_file(path: Path, label: str) -> str:
@@ -353,17 +306,12 @@ def _provider_codex_bin(test_binary: str | None = None) -> str:
         return str(_safe_executable(Path(test_binary), "test verifier provider"))
     native, javascript, _bwrap = _official_codex_runtime()
     raw = codex.resolve_bin()
-    candidate = Path(raw).expanduser()
-    if not candidate.is_absolute() or candidate != Path(os.path.abspath(candidate)):
-        raise VerifierProviderConfigurationError("verifier Codex selector is unsafe")
-    _safe_real_file(candidate, "verifier Codex selector", executable=True)
-    repo_wrapper = _REPO_ROOT / "bin" / "codex"
-    allowed = candidate in {repo_wrapper, javascript, native}
-    if not allowed:
-        allowed = _validated_nurouter_launcher(candidate)
-    if not allowed:
-        raise VerifierProviderConfigurationError("verifier Codex selector is unsafe")
-    return str(native)
+    try:
+        return execution_security.resolve_trusted_codex_bin(raw)
+    except execution_security.WorkerSecurityError as exc:
+        raise VerifierProviderConfigurationError(
+            "verifier Codex selector is unsafe"
+        ) from exc
 
 
 def _relink(link: Path, target: Path) -> None:

@@ -1,13 +1,19 @@
-"""Test adapter for the verifier runner seam (never used in production)."""
+"""Python-only test adapter for the verifier runner seam.
+
+This deliberately does not execute ``trusted_entry.py``: production's entry
+rejects every provider except the bootstrap-pinned native Codex binary.  Tests
+that need a deterministic fake run it directly through this explicit adapter.
+"""
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
-import secrets
+import signal
 import subprocess
+import time
 
-from danus.verify import wire
 from danus.verify.runner import (
     TrustedVerifierTimeout,
     VerifierRunRequest,
@@ -16,7 +22,7 @@ from danus.verify.runner import (
 
 
 class DirectTrustedTestAdapter:
-    """Exercise the real fixed entry/framing without claiming cgroup security."""
+    """Run a fake provider directly; never selected by production bootstrap."""
 
     def run(self, request: VerifierRunRequest) -> VerifierRunResult:
         self.request = request
@@ -24,43 +30,52 @@ class DirectTrustedTestAdapter:
         assert Path(request.entry_argv[0]).is_absolute()
         assert Path(request.entry_argv[2]).is_absolute()
         assert request.cwd == "/"
-        frame = wire.encode_request(
-            run_id=request.run_id,
-            provider_argv=request.provider_argv,
-            provider_environment=request.provider_environment,
-            timeout_seconds=request.timeout_seconds,
-            prompt=request.prompt,
-        )
-        outer_timeout = (request.timeout_seconds or 30) + 5
+        before = time.monotonic()
         process = subprocess.Popen(
-            request.entry_argv,
+            request.provider_argv,
             cwd="/",
-            env={"PATH": os.defpath, "LANG": "C.UTF-8"},
+            env=dict(request.provider_environment),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            # Match the production trusted entry's private-file umask.  This
+            # adapter is test-only, but its provider must still be unable to
+            # create world-readable verification output that the secure reader
+            # would correctly reject.
+            preexec_fn=lambda: os.umask(0o077),
         )
-        assert process.stdin is not None and process.stdout is not None
-        challenge = secrets.token_bytes(32)
-        process.stdin.write(wire.encode_challenge(challenge))
-        process.stdin.flush()
-        ready = wire.read_ready(process.stdout, challenge=challenge)
-        assert ready["executable"]
-        process.stdin.write(frame)
-        process.stdin.close()
-        process.stdin = None
-        stdout, stderr = process.communicate(timeout=outer_timeout)
-        assert stderr == b""
-        assert process.returncode == 0
-        result = wire.read_result(stdout)
-        if result["timed_out"]:
-            raise TrustedVerifierTimeout("verifier provider timed out")
+        try:
+            assert process.stdin is not None
+            try:
+                process.stdin.write(request.prompt)
+                process.stdin.close()
+                process.stdin = None
+            except BrokenPipeError:
+                process.stdin.close()
+                process.stdin = None
+            process.wait(timeout=request.timeout_seconds)
+        except subprocess.TimeoutExpired as exc:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate()
+            raise TrustedVerifierTimeout("verifier provider timed out") from exc
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+        stdout, _ = process.communicate()
+        digest = hashlib.sha256(stdout).hexdigest()
         return VerifierRunResult(
-            returncode=int(result["returncode"]),
-            duration_seconds=float(result["duration_seconds"]),
-            stdout_sha256=str(result["stdout_sha256"]),
-            stdout_bytes=int(result["stdout_bytes"]),
-            descendants_empty=result["process_group_empty"] is True,
+            returncode=int(process.returncode),
+            duration_seconds=time.monotonic() - before,
+            stdout_sha256=digest,
+            stdout_bytes=len(stdout),
+            descendants_empty=True,
         )
 
 

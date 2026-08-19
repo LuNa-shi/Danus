@@ -14,6 +14,18 @@ class TrustedPythonError(RuntimeError):
     """The serving interpreter path is absent or has unsafe provenance."""
 
 
+def _trusted_directory_owner(uid: int) -> bool:
+    """Accept idmapped host-root ancestors without relaxing file checks.
+
+    This deployment runs on an idmapped ZFS mount, where host-root-owned
+    system directories appear as uid 65534 (``nobody``) in the container.
+    These ancestors are immutable to the serving uid; executable and regular
+    file payloads remain restricted to root or the serving uid.
+    """
+
+    return uid in {0, os.getuid(), 65534}
+
+
 def _safe_regular(path: Path, label: str) -> None:
     info = path.lstat()
     if (
@@ -28,7 +40,7 @@ def _safe_directory(path: Path, label: str) -> None:
     fd = open_directory(path)
     try:
         info = os.fstat(fd)
-        if info.st_uid not in {0, os.getuid()} or info.st_mode & 0o002:
+        if not _trusted_directory_owner(info.st_uid) or info.st_mode & 0o002:
             raise TrustedPythonError(f"{label} is unsafe")
     finally:
         os.close(fd)
@@ -37,7 +49,7 @@ def _safe_directory(path: Path, label: str) -> None:
 def _safe_directory_info(info: os.stat_result, label: str) -> None:
     if (
         not stat.S_ISDIR(info.st_mode)
-        or info.st_uid not in {0, os.getuid()}
+        or not _trusted_directory_owner(info.st_uid)
         or info.st_mode & 0o002
     ):
         raise TrustedPythonError(f"{label} is unsafe")

@@ -23,6 +23,7 @@ import subprocess
 import time
 from typing import Iterable
 
+from danus.execution import security as execution_security
 from . import wire
 from .runner import (
     TrustedVerifierTimeout,
@@ -670,6 +671,20 @@ class SystemdTrustedVerifierRunner:
         fixed_argv = trusted_entry_argv()
         if request.entry_argv != fixed_argv or request.cwd != "/":
             raise _BoundaryError("verifier trusted entry does not match")
+        # Revalidate the provider at the privileged sink.  The launcher is not
+        # a trust boundary: callers can construct VerifierRunRequest directly,
+        # and a fake/metadata-lookalike executable must never reach
+        # systemd-run (which would place provider credentials in its frame).
+        if not request.provider_argv:
+            raise _BoundaryError("verifier provider command is empty")
+        try:
+            expected_provider = Path(
+                execution_security.resolve_trusted_codex_bin(request.provider_argv[0])
+            )
+        except execution_security.WorkerSecurityError as exc:
+            raise _BoundaryError("verifier provider executable is unsafe") from exc
+        if request.provider_argv[0] != str(expected_provider):
+            raise _BoundaryError("verifier provider executable is not the official native CLI")
         policy = _mount_policy(request)
         provider_limit = request.timeout_seconds or 900
         if (
