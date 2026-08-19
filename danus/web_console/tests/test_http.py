@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -2028,3 +2029,15 @@ def test_main_agent_event_store_rejects_unknown_and_unbounded_payloads(tmp_path:
         store.add_main_agent_event(project_id="p", message_id="m", event_type="provider.unknown", payload={})
     with pytest.raises(ValueError, match="too large"):
         store.add_main_agent_event(project_id="p", message_id="m", event_type="agent.message", payload={"detail": "x" * 13000})
+
+
+def test_project_list_reports_storage_failure_instead_of_empty_records(tmp_path: Path, monkeypatch):
+    app, _runtime = _app(tmp_path)
+    with TestClient(app, base_url="https://testserver", raise_server_exceptions=False) as client:
+        _login(client)
+        def unavailable():
+            raise sqlite3.OperationalError("unable to open database file")
+        monkeypatch.setattr(app.state.console_store, "projects", unavailable)
+        response = client.get("/api/projects")
+        assert response.status_code == 503
+        assert response.json() == {"detail": "project storage unavailable"}

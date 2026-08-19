@@ -738,7 +738,11 @@ def create_app(
         if isinstance((auth := auth_required(request)), JSONResponse):
             return auth
         rows = []
-        for project in store.projects():
+        try:
+            projects = store.projects()
+        except sqlite3.Error:
+            return _error(503, "project storage unavailable")
+        for project in projects:
             try:
                 projection = runtime.status_project(project["runtime_name"])
             except RuntimeErrorBase:
